@@ -1,0 +1,949 @@
+//! The version 1 method catalogue: names, parameters and results (ADR-0009).
+//!
+//! `docs/protocol/README.md` documents every type here with a JSON example; a test parses
+//! each example into these types (WP-005 AC1). The JSON is kept plain for adapters written in
+//! Python, shell and Lua: snake_case field names, strings for enums, no tagged-enum shapes.
+//!
+//! Item state uses the `mydrive-core` types directly (WP-005 AC4), so the wire strings are
+//! the ones `mydrive-core` defines and the display status is the one its single derivation
+//! function computes (ADR-0008 R2, R3).
+
+use mydrive_core::ids::{AccountId, DriveId, MountId, TenantId};
+use mydrive_core::names;
+use mydrive_core::state::{
+    DisplayStatus, EffectivePin, Hydration, ItemState, Modifiers, Pin, Sync as SyncState,
+    display_status, effective_pin,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::envelope::{Id, Request};
+use crate::error::{ErrorCode, RpcError};
+use crate::path::ProtocolPath;
+
+/// The protocol major version this build speaks.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Every protocol major version this build supports, oldest first.
+pub const SUPPORTED_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
+
+/// Method and notification names.
+pub mod method {
+    /// Handshake; the first request on every connection.
+    pub const HELLO: &str = "hello";
+    /// Daemon version and readiness.
+    pub const DAEMON_STATUS: &str = "daemon.status";
+    /// Signed-in accounts.
+    pub const ACCOUNT_LIST: &str = "account.list";
+    /// Mounts.
+    pub const MOUNT_LIST: &str = "mount.list";
+    /// State of a batch of paths, or of one directory and its children.
+    pub const ITEM_STATUS: &str = "item.status";
+    /// Always keep on this device.
+    pub const ITEM_PIN: &str = "item.pin";
+    /// Clear the pin (back to `inherit`).
+    pub const ITEM_UNPIN: &str = "item.unpin";
+    /// Download now without pinning.
+    pub const ITEM_HYDRATE: &str = "item.hydrate";
+    /// Free up space.
+    pub const ITEM_DEHYDRATE: &str = "item.dehydrate";
+    /// Turn this connection into a change stream.
+    pub const STATUS_SUBSCRIBE: &str = "status.subscribe";
+    /// Notification sent on a subscribed connection when item state changes.
+    pub const STATUS_CHANGED: &str = "status.changed";
+
+    /// Every request method in protocol version 1.
+    pub const ALL: &[&str] = &[
+        HELLO,
+        DAEMON_STATUS,
+        ACCOUNT_LIST,
+        MOUNT_LIST,
+        ITEM_STATUS,
+        ITEM_PIN,
+        ITEM_UNPIN,
+        ITEM_HYDRATE,
+        ITEM_DEHYDRATE,
+        STATUS_SUBSCRIBE,
+    ];
+
+    /// Every notification method in protocol version 1.
+    pub const NOTIFICATIONS: &[&str] = &[STATUS_CHANGED];
+}
+
+/// Parameters for methods that take none. Accepts `{}`, an absent `params`, or an object
+/// with fields this version does not know.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoParams {}
+
+/// `hello` parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloParams {
+    /// A short name for the client, for logs (for example `mydrive-cli`).
+    pub client_name: String,
+    /// Protocol major versions the client supports.
+    pub protocol_versions: Vec<u32>,
+}
+
+/// `hello` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloResult {
+    /// The chosen protocol major version.
+    pub protocol_version: u32,
+    /// Optional features the daemon offers. Clients ignore capabilities they do not know
+    /// (ADR-0009 R5). Version 1 defines none.
+    pub capabilities: Vec<String>,
+}
+
+/// Chooses the highest protocol major version both sides support (ADR-0009 R4).
+///
+/// # Errors
+///
+/// `unsupported-version`, listing `daemon_supported`, if there is none in common.
+pub fn negotiate(daemon_supported: &[u32], client_supported: &[u32]) -> Result<u32, RpcError> {
+    daemon_supported
+        .iter()
+        .copied()
+        .filter(|v| client_supported.contains(v))
+        .max()
+        .ok_or_else(|| RpcError::unsupported_version(client_supported, daemon_supported))
+}
+
+/// `daemon.status` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStatusResult {
+    /// The daemon's release version.
+    pub daemon_version: String,
+    /// Protocol major versions the daemon supports.
+    pub protocol_versions: Vec<u32>,
+    /// False while the daemon is starting; other requests then get `not-ready`.
+    pub ready: bool,
+}
+
+/// The kind of account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccountKind {
+    /// A personal Microsoft account.
+    Personal,
+    /// A work or school account.
+    Work,
+}
+
+impl From<names::AccountKind> for AccountKind {
+    fn from(kind: names::AccountKind) -> Self {
+        match kind {
+            names::AccountKind::Personal => Self::Personal,
+            names::AccountKind::Work => Self::Work,
+        }
+    }
+}
+
+impl From<AccountKind> for names::AccountKind {
+    fn from(kind: AccountKind) -> Self {
+        match kind {
+            AccountKind::Personal => Self::Personal,
+            AccountKind::Work => Self::Work,
+        }
+    }
+}
+
+/// Account state (overview, "Account and mount states").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccountState {
+    /// Tokens are valid.
+    SignedIn,
+    /// The refresh token was rejected; the account's mounts stop syncing.
+    NeedsSignIn,
+}
+
+/// One account in `account.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountInfo {
+    /// The account's ID.
+    pub account_id: AccountId,
+    /// Personal or work.
+    pub kind: AccountKind,
+    /// The tenant, for a work account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<TenantId>,
+    /// Signed in, or needing sign-in.
+    pub state: AccountState,
+}
+
+/// `account.list` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountListResult {
+    /// Every account the daemon knows.
+    pub accounts: Vec<AccountInfo>,
+}
+
+/// Mount state (overview, "Account and mount states").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MountState {
+    /// Syncing normally.
+    Active,
+    /// Paused by the user.
+    Paused,
+    /// Refused by organisation policy; `blocked_reason` says why.
+    Blocked,
+    /// Enumerating; the mount point is not mounted until the first full delta is applied.
+    Resyncing,
+}
+
+/// One mount in `mount.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountInfo {
+    /// The mount's ID.
+    pub mount_id: MountId,
+    /// The account it belongs to.
+    pub account_id: AccountId,
+    /// The drive it mounts.
+    pub drive_id: DriveId,
+    /// Where the user sees it. Never the backing directory (ADR-0009 R8).
+    pub mount_point: ProtocolPath,
+    /// Its state.
+    pub state: MountState,
+    /// Why it is blocked, when `state` is `blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    /// True for a read-only library.
+    pub read_only: bool,
+}
+
+/// `mount.list` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountListResult {
+    /// Every mount the daemon knows.
+    pub mounts: Vec<MountInfo>,
+}
+
+/// What `item.status` asks about: a batch of paths, or one directory.
+///
+/// On the wire this is an object with exactly one of `paths` or `directory`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ItemStatusWire", into = "ItemStatusWire")]
+pub enum ItemStatusParams {
+    /// The state of each path.
+    Paths(Vec<ProtocolPath>),
+    /// The state of a directory and every child, in one response (ADR-0009 R7).
+    Directory(ProtocolPath),
+}
+
+#[derive(Serialize, Deserialize)]
+struct ItemStatusWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paths: Option<Vec<ProtocolPath>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory: Option<ProtocolPath>,
+}
+
+impl TryFrom<ItemStatusWire> for ItemStatusParams {
+    type Error = String;
+
+    fn try_from(wire: ItemStatusWire) -> Result<Self, String> {
+        match (wire.paths, wire.directory) {
+            (Some(paths), None) => Ok(Self::Paths(paths)),
+            (None, Some(directory)) => Ok(Self::Directory(directory)),
+            _ => Err("give exactly one of \"paths\" or \"directory\"".into()),
+        }
+    }
+}
+
+impl From<ItemStatusParams> for ItemStatusWire {
+    fn from(params: ItemStatusParams) -> Self {
+        match params {
+            ItemStatusParams::Paths(paths) => Self {
+                paths: Some(paths),
+                directory: None,
+            },
+            ItemStatusParams::Directory(directory) => Self {
+                paths: None,
+                directory: Some(directory),
+            },
+        }
+    }
+}
+
+/// One item's state, as the daemon reports it (WP-005 AC4).
+///
+/// Clients draw from `status` and `modifiers` and never derive a status from the axes
+/// (ADR-0014 R5); the axes are included for clients that want detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemInfo {
+    /// The display status, from `mydrive_core::state::display_status`.
+    pub status: DisplayStatus,
+    /// The `read-only` and `shortcut` indicators.
+    pub modifiers: Modifiers,
+    /// Hydration axis.
+    pub hydration: Hydration,
+    /// Pin axis, as set on the item itself.
+    pub pin: Pin,
+    /// The pin after inheritance.
+    pub effective_pin: EffectivePin,
+    /// Sync axis.
+    pub sync: SyncState,
+}
+
+impl ItemInfo {
+    /// Builds the report for an item, deriving the display status with `mydrive-core`'s one
+    /// derivation function.
+    ///
+    /// `inherited` is the item's resolved pin. As in `mydrive-core`, the item's own explicit
+    /// pin wins over it, so `effective_pin` and `status` always agree with `pin`.
+    #[must_use]
+    pub fn new(state: ItemState, inherited: EffectivePin, modifiers: Modifiers) -> Self {
+        let inherited_pin = match inherited {
+            EffectivePin::Pinned => Pin::Pinned,
+            EffectivePin::Unpinned => Pin::Unpinned,
+        };
+        let effective = effective_pin(state.pin, [inherited_pin]);
+        Self {
+            status: display_status(&state, effective),
+            modifiers,
+            hydration: state.hydration,
+            pin: state.pin,
+            effective_pin: effective,
+            sync: state.sync,
+        }
+    }
+
+    /// The three axes.
+    #[must_use]
+    pub const fn state(&self) -> ItemState {
+        ItemState {
+            hydration: self.hydration,
+            pin: self.pin,
+            sync: self.sync,
+        }
+    }
+}
+
+/// The state of one path: either `item` or `error` is present.
+///
+/// A path outside every mount gets `error` with code `not-in-a-mount`; a path in a mount that
+/// names no known item gets `unknown-path`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemStatusEntry {
+    /// The path asked about, or the child's path for a directory listing.
+    pub path: ProtocolPath,
+    /// The item's state, when the path names a known item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<ItemInfo>,
+    /// Why there is no state for this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcError>,
+}
+
+impl ItemStatusEntry {
+    /// An entry for a known item.
+    #[must_use]
+    pub fn known(path: ProtocolPath, item: ItemInfo) -> Self {
+        Self {
+            path,
+            item: Some(item),
+            error: None,
+        }
+    }
+
+    /// An entry for a path with no state.
+    #[must_use]
+    pub fn failed(path: ProtocolPath, error: RpcError) -> Self {
+        Self {
+            path,
+            item: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// `item.status` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemStatusResult {
+    /// For a `directory` request, the directory itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<ItemStatusEntry>,
+    /// For a `paths` request, one entry per path in request order; for a `directory`
+    /// request, one entry per child.
+    pub entries: Vec<ItemStatusEntry>,
+}
+
+/// Parameters of `item.pin`, `item.unpin`, `item.hydrate` and `item.dehydrate`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemPathsParams {
+    /// The items to act on.
+    pub paths: Vec<ProtocolPath>,
+}
+
+/// The outcome for one path of an item action: accepted when `error` is absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemActionEntry {
+    /// The path acted on.
+    pub path: ProtocolPath,
+    /// Why the action was not accepted for this path. A refused action changed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcError>,
+}
+
+/// Result of `item.pin`, `item.unpin`, `item.hydrate` and `item.dehydrate`: one entry per
+/// requested path, in request order.
+///
+/// Acceptance means the request was recorded. Downloads that follow happen asynchronously and
+/// are reported through `status.changed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemActionResult {
+    /// Per-path outcomes.
+    pub entries: Vec<ItemActionEntry>,
+}
+
+/// `status.subscribe` parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSubscribeParams {
+    /// Mount points or folders to watch. Empty or absent means every mount.
+    #[serde(default)]
+    pub paths: Vec<ProtocolPath>,
+}
+
+/// `status.subscribe` result: an empty object. From then on the connection carries
+/// notifications only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSubscribeResult {}
+
+/// `status.changed` notification parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusChangedParams {
+    /// The new state of each changed item. An entry with `error` `unknown-path` means the
+    /// item is gone.
+    pub entries: Vec<ItemStatusEntry>,
+}
+
+/// A request decoded into its typed parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MethodCall {
+    /// `hello`.
+    Hello(HelloParams),
+    /// `daemon.status`.
+    DaemonStatus,
+    /// `account.list`.
+    AccountList,
+    /// `mount.list`.
+    MountList,
+    /// `item.status`.
+    ItemStatus(ItemStatusParams),
+    /// `item.pin`.
+    ItemPin(ItemPathsParams),
+    /// `item.unpin`.
+    ItemUnpin(ItemPathsParams),
+    /// `item.hydrate`.
+    ItemHydrate(ItemPathsParams),
+    /// `item.dehydrate`: free up space. As the user-facing action, it sets the pin to
+    /// `unpinned` and then dehydrates, and refuses anything not `in-sync` before changing the
+    /// pin (overview, "Rulings on details"; F06).
+    ItemDehydrate(ItemPathsParams),
+    /// `status.subscribe`.
+    StatusSubscribe(StatusSubscribeParams),
+}
+
+impl MethodCall {
+    /// Decodes a method name and parameters.
+    ///
+    /// # Errors
+    ///
+    /// `method-not-found` for a method not in this version (WP-005 AC5), `invalid-params` for
+    /// parameters of the wrong shape, including any relative path (AC6) and positional
+    /// (array) parameters. Unknown parameter fields are ignored.
+    pub fn parse(method: &str, params: Option<&Value>) -> Result<Self, RpcError> {
+        let call = match method {
+            method::HELLO => Self::Hello(decode(method, params)?),
+            method::DAEMON_STATUS => {
+                decode::<NoParams>(method, params).map(|_| Self::DaemonStatus)?
+            }
+            method::ACCOUNT_LIST => {
+                decode::<NoParams>(method, params).map(|_| Self::AccountList)?
+            }
+            method::MOUNT_LIST => decode::<NoParams>(method, params).map(|_| Self::MountList)?,
+            method::ITEM_STATUS => Self::ItemStatus(decode(method, params)?),
+            method::ITEM_PIN => Self::ItemPin(decode(method, params)?),
+            method::ITEM_UNPIN => Self::ItemUnpin(decode(method, params)?),
+            method::ITEM_HYDRATE => Self::ItemHydrate(decode(method, params)?),
+            method::ITEM_DEHYDRATE => Self::ItemDehydrate(decode(method, params)?),
+            method::STATUS_SUBSCRIBE => Self::StatusSubscribe(decode(method, params)?),
+            other => return Err(RpcError::method_not_found(other)),
+        };
+        Ok(call)
+    }
+
+    /// Decodes a request's method and parameters; see [`MethodCall::parse`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`MethodCall::parse`].
+    pub fn from_request(request: &Request) -> Result<Self, RpcError> {
+        Self::parse(&request.method, request.params.as_ref())
+    }
+
+    /// The method name.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::Hello(_) => method::HELLO,
+            Self::DaemonStatus => method::DAEMON_STATUS,
+            Self::AccountList => method::ACCOUNT_LIST,
+            Self::MountList => method::MOUNT_LIST,
+            Self::ItemStatus(_) => method::ITEM_STATUS,
+            Self::ItemPin(_) => method::ITEM_PIN,
+            Self::ItemUnpin(_) => method::ITEM_UNPIN,
+            Self::ItemHydrate(_) => method::ITEM_HYDRATE,
+            Self::ItemDehydrate(_) => method::ITEM_DEHYDRATE,
+            Self::StatusSubscribe(_) => method::STATUS_SUBSCRIBE,
+        }
+    }
+
+    /// The parameters as JSON; `None` for methods that take none.
+    ///
+    /// # Errors
+    ///
+    /// The `serde_json` error if serialisation fails.
+    pub fn params(&self) -> Result<Option<Value>, serde_json::Error> {
+        let value = match self {
+            Self::Hello(p) => serde_json::to_value(p)?,
+            Self::DaemonStatus | Self::AccountList | Self::MountList => return Ok(None),
+            Self::ItemStatus(p) => serde_json::to_value(p)?,
+            Self::ItemPin(p)
+            | Self::ItemUnpin(p)
+            | Self::ItemHydrate(p)
+            | Self::ItemDehydrate(p) => serde_json::to_value(p)?,
+            Self::StatusSubscribe(p) => serde_json::to_value(p)?,
+        };
+        Ok(Some(value))
+    }
+
+    /// A request carrying this call.
+    ///
+    /// # Errors
+    ///
+    /// The `serde_json` error if serialisation fails.
+    pub fn to_request(&self, id: impl Into<Id>) -> Result<Request, serde_json::Error> {
+        Ok(Request {
+            jsonrpc: crate::envelope::JsonRpcVersion,
+            id: id.into(),
+            method: self.method().to_owned(),
+            params: self.params()?,
+        })
+    }
+}
+
+fn decode<P: DeserializeOwned>(method: &str, params: Option<&Value>) -> Result<P, RpcError> {
+    let empty = Value::Object(serde_json::Map::new());
+    let params = match params {
+        None | Some(Value::Null) => &empty,
+        Some(Value::Array(_)) => {
+            return Err(RpcError::invalid_params(
+                method,
+                "parameters must be passed by name, as an object",
+            ));
+        }
+        Some(other) => other,
+    };
+    P::deserialize(params).map_err(|e| RpcError::invalid_params(method, e))
+}
+
+/// Where a connection is in its life (ADR-0009 R3, overview "Change stream").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Nothing but `hello` is accepted.
+    AwaitingHello,
+    /// `hello` succeeded with this protocol version.
+    Ready(u32),
+    /// `status.subscribe` succeeded; the connection carries notifications only.
+    Subscribed(u32),
+}
+
+/// Per-connection gatekeeping that a server applies before dispatching a request.
+///
+/// Pure state: it decides whether a call may run and records the outcome of `hello` and
+/// `status.subscribe`. A refused call does not change the phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Session {
+    phase: Phase,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Session {
+    /// A new connection, awaiting `hello`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            phase: Phase::AwaitingHello,
+        }
+    }
+
+    /// The current phase.
+    #[must_use]
+    pub const fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Whether `call` may run now.
+    ///
+    /// # Errors
+    ///
+    /// `not-ready` for anything but `hello` before `hello` has succeeded (ADR-0009 R3);
+    /// `invalid-request` for a second `hello`, and for any request on a subscribed
+    /// connection.
+    pub fn admit(&self, call: &MethodCall) -> Result<(), RpcError> {
+        match (self.phase, call) {
+            (Phase::AwaitingHello, MethodCall::Hello(_)) => Ok(()),
+            (Phase::AwaitingHello, other) => Err(RpcError::new(
+                ErrorCode::NotReady,
+                format!(
+                    "{} refused: the first request on a connection must be hello",
+                    other.method()
+                ),
+            )),
+            (Phase::Ready(_), MethodCall::Hello(_)) => Err(RpcError::new(
+                ErrorCode::InvalidRequest,
+                "hello refused: this connection has already completed hello",
+            )),
+            (Phase::Ready(_), _) => Ok(()),
+            (Phase::Subscribed(_), other) => Err(RpcError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "{} refused: this connection is subscribed and carries notifications only; \
+                     open a second connection for requests",
+                    other.method()
+                ),
+            )),
+        }
+    }
+
+    /// Runs `hello` for this connection: negotiates a version against `daemon_supported` and,
+    /// on success, moves to [`Phase::Ready`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::admit`] for a repeated `hello`, or `unsupported-version` (ADR-0009 R4);
+    /// on error the phase is unchanged.
+    pub fn hello(
+        &mut self,
+        params: &HelloParams,
+        daemon_supported: &[u32],
+        capabilities: &[&str],
+    ) -> Result<HelloResult, RpcError> {
+        self.admit(&MethodCall::Hello(params.clone()))?;
+        let version = negotiate(daemon_supported, &params.protocol_versions)?;
+        self.phase = Phase::Ready(version);
+        Ok(HelloResult {
+            protocol_version: version,
+            capabilities: capabilities.iter().map(|&c| c.to_owned()).collect(),
+        })
+    }
+
+    /// Records a successful `status.subscribe`. Has no effect unless the phase is
+    /// [`Phase::Ready`].
+    pub fn subscribed(&mut self) {
+        if let Phase::Ready(version) = self.phase {
+            self.phase = Phase::Subscribed(version);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn p(s: &str) -> ProtocolPath {
+        ProtocolPath::new(s).unwrap()
+    }
+
+    fn hello(versions: &[u32]) -> HelloParams {
+        HelloParams {
+            client_name: "test".into(),
+            protocol_versions: versions.to_vec(),
+        }
+    }
+
+    /// WP-005 AC5: an unknown method gets JSON-RPC "method not found".
+    #[test]
+    fn unknown_method_is_method_not_found() {
+        for m in ["item.delete", "activity.list", "", "HELLO"] {
+            let err = MethodCall::parse(m, None).unwrap_err();
+            assert_eq!(err.code, -32601, "{m}");
+            assert_eq!(err.kind(), Some(ErrorCode::MethodNotFound));
+        }
+    }
+
+    /// WP-005 AC5: unknown parameter fields are ignored.
+    #[test]
+    fn unknown_param_fields_are_ignored() {
+        let call = MethodCall::parse(
+            method::ITEM_PIN,
+            Some(&json!({"paths": ["/home/u/OneDrive/a"], "recursive": true})),
+        )
+        .unwrap();
+        assert_eq!(
+            call,
+            MethodCall::ItemPin(ItemPathsParams {
+                paths: vec![p("/home/u/OneDrive/a")]
+            })
+        );
+        let call = MethodCall::parse(method::DAEMON_STATUS, Some(&json!({"verbose": 1}))).unwrap();
+        assert_eq!(call, MethodCall::DaemonStatus);
+    }
+
+    /// WP-005 AC6 and ADR-0009 R8: a relative path anywhere in the parameters is rejected
+    /// with invalid-params.
+    #[test]
+    fn relative_paths_are_invalid_params() {
+        let cases = [
+            (
+                method::ITEM_STATUS,
+                json!({"paths": ["/ok", "OneDrive/a.txt"]}),
+            ),
+            (method::ITEM_STATUS, json!({"directory": "OneDrive"})),
+            (method::ITEM_PIN, json!({"paths": ["a.txt"]})),
+            (method::ITEM_UNPIN, json!({"paths": ["./a"]})),
+            (method::ITEM_HYDRATE, json!({"paths": [""]})),
+            (method::ITEM_DEHYDRATE, json!({"paths": ["~/OneDrive/a"]})),
+            (method::STATUS_SUBSCRIBE, json!({"paths": ["OneDrive"]})),
+            (
+                method::ITEM_PIN,
+                json!({"paths": ["/home/u/OneDrive/../.local/share/x"]}),
+            ),
+        ];
+        for (m, params) in cases {
+            let err = MethodCall::parse(m, Some(&params)).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{m} {params}");
+            assert!(err.message.contains(m), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn malformed_params_are_invalid_params() {
+        let cases = [
+            (method::HELLO, None),
+            (
+                method::HELLO,
+                Some(json!({"client_name": "x", "protocol_versions": [-1]})),
+            ),
+            (method::ITEM_STATUS, Some(json!({}))),
+            (
+                method::ITEM_STATUS,
+                Some(json!({"paths": ["/a"], "directory": "/a"})),
+            ),
+            (method::ITEM_PIN, Some(json!(["/a"]))),
+            (method::ITEM_PIN, Some(json!({"paths": "/a"}))),
+        ];
+        for (m, params) in cases {
+            let err = MethodCall::parse(m, params.as_ref()).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{m} {params:?}");
+        }
+    }
+
+    #[test]
+    fn calls_round_trip_through_requests() {
+        let calls = [
+            MethodCall::Hello(hello(&[1])),
+            MethodCall::DaemonStatus,
+            MethodCall::AccountList,
+            MethodCall::MountList,
+            MethodCall::ItemStatus(ItemStatusParams::Paths(vec![p("/a"), p("/b")])),
+            MethodCall::ItemStatus(ItemStatusParams::Directory(p("/a"))),
+            MethodCall::ItemPin(ItemPathsParams {
+                paths: vec![p("/a")],
+            }),
+            MethodCall::ItemUnpin(ItemPathsParams {
+                paths: vec![p("/a")],
+            }),
+            MethodCall::ItemHydrate(ItemPathsParams {
+                paths: vec![p("/a")],
+            }),
+            MethodCall::ItemDehydrate(ItemPathsParams {
+                paths: vec![p("/a")],
+            }),
+            MethodCall::StatusSubscribe(StatusSubscribeParams::default()),
+        ];
+        let mut seen = Vec::new();
+        for call in calls {
+            let req = call.to_request(1).unwrap();
+            assert_eq!(MethodCall::from_request(&req).unwrap(), call);
+            seen.push(call.method());
+        }
+        seen.dedup();
+        assert_eq!(seen, method::ALL);
+    }
+
+    /// ADR-0009 R4: no version in common gets an error listing the daemon's versions.
+    #[test]
+    fn hello_with_no_common_version_lists_supported_versions() {
+        assert_eq!(negotiate(&[1, 2], &[2, 1, 7]), Ok(2));
+        assert_eq!(negotiate(SUPPORTED_VERSIONS, &[1]), Ok(PROTOCOL_VERSION));
+        let err = negotiate(SUPPORTED_VERSIONS, &[2, 3]).unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::UnsupportedVersion));
+        assert_eq!(err.data.unwrap().supported_versions, Some(vec![1]));
+        let mut session = Session::new();
+        let err = session
+            .hello(&hello(&[]), SUPPORTED_VERSIONS, &[])
+            .unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::UnsupportedVersion));
+        assert_eq!(session.phase(), Phase::AwaitingHello);
+    }
+
+    /// ADR-0009 R3: a request other than hello before hello gets an error and has no effect.
+    #[test]
+    fn requests_before_hello_are_refused_without_effect() {
+        let mut session = Session::new();
+        let calls = [
+            MethodCall::DaemonStatus,
+            MethodCall::ItemPin(ItemPathsParams {
+                paths: vec![p("/a")],
+            }),
+            MethodCall::StatusSubscribe(StatusSubscribeParams::default()),
+        ];
+        for call in &calls {
+            let err = session.admit(call).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::NotReady));
+            assert_eq!(session.phase(), Phase::AwaitingHello);
+        }
+        // A subscribe recorded before hello is ignored too.
+        session.subscribed();
+        assert_eq!(session.phase(), Phase::AwaitingHello);
+
+        let result = session
+            .hello(&hello(&[1]), SUPPORTED_VERSIONS, &[])
+            .unwrap();
+        assert_eq!(result.protocol_version, 1);
+        assert_eq!(session.phase(), Phase::Ready(1));
+        for call in &calls {
+            assert!(session.admit(call).is_ok());
+        }
+        let err = session
+            .hello(&hello(&[1]), SUPPORTED_VERSIONS, &[])
+            .unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidRequest));
+    }
+
+    /// Overview "Change stream": a subscribed connection carries notifications only.
+    #[test]
+    fn subscribed_connection_refuses_requests() {
+        let mut session = Session::new();
+        session
+            .hello(&hello(&[1]), SUPPORTED_VERSIONS, &[])
+            .unwrap();
+        session.subscribed();
+        assert_eq!(session.phase(), Phase::Subscribed(1));
+        let err = session.admit(&MethodCall::MountList).unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidRequest));
+    }
+
+    /// WP-005 AC4: item state uses the core axes, effective pin and display status with the
+    /// core wire strings, and the status comes from core's derivation.
+    #[test]
+    fn item_info_uses_core_state_and_wire_forms() {
+        for &hydration in Hydration::ALL {
+            for &pin in Pin::ALL {
+                for &sync in SyncState::ALL {
+                    for &inherited in EffectivePin::ALL {
+                        let state = ItemState {
+                            hydration,
+                            pin,
+                            sync,
+                        };
+                        let modifiers = Modifiers {
+                            read_only: true,
+                            shortcut: false,
+                        };
+                        let info = ItemInfo::new(state, inherited, modifiers);
+                        let effective = effective_pin(
+                            pin,
+                            [match inherited {
+                                EffectivePin::Pinned => Pin::Pinned,
+                                EffectivePin::Unpinned => Pin::Unpinned,
+                            }],
+                        );
+                        assert_eq!(info.status, display_status(&state, effective));
+                        assert_eq!(info.effective_pin, effective);
+                        assert_eq!(info.state(), state);
+                        let v = serde_json::to_value(info).unwrap();
+                        assert_eq!(v["status"], info.status.as_str());
+                        assert_eq!(v["hydration"], hydration.as_str());
+                        assert_eq!(v["pin"], pin.as_str());
+                        assert_eq!(v["effective_pin"], effective.as_str());
+                        assert_eq!(v["sync"], sync.as_str());
+                        assert_eq!(
+                            v["modifiers"],
+                            json!({"read_only": true, "shortcut": false})
+                        );
+                        let back: ItemInfo = serde_json::from_value(v).unwrap();
+                        assert_eq!(back, info);
+                    }
+                }
+            }
+        }
+    }
+
+    /// ADR-0009 R5: clients ignore unknown result fields and capabilities.
+    #[test]
+    fn results_with_extra_fields_still_decode() {
+        let hello: HelloResult = serde_json::from_value(json!({
+            "protocol_version": 1, "capabilities": ["future-thing"], "motd": "hi"
+        }))
+        .unwrap();
+        assert_eq!(hello.capabilities, ["future-thing"]);
+        let status: ItemStatusResult = serde_json::from_value(json!({
+            "entries": [{
+                "path": "/home/u/OneDrive/a.txt",
+                "item": {
+                    "status": "local", "modifiers": {"read_only": false, "shortcut": false, "new": 1},
+                    "hydration": "full", "pin": "inherit", "effective_pin": "unpinned",
+                    "sync": "in-sync", "size_on_disk": 12
+                },
+                "etag": "x"
+            }],
+            "cursor": null
+        }))
+        .unwrap();
+        assert_eq!(status.entries.len(), 1);
+    }
+
+    /// ADR-0009 R7: one directory request yields one entry per child in a single result.
+    #[test]
+    fn directory_status_is_one_result_with_every_child() {
+        let info = ItemInfo::new(
+            ItemState {
+                hydration: Hydration::Placeholder,
+                pin: Pin::Inherit,
+                sync: SyncState::InSync,
+            },
+            EffectivePin::Unpinned,
+            Modifiers::default(),
+        );
+        let children: Vec<_> = (0..200)
+            .map(|i| ItemStatusEntry::known(p(&format!("/m/dir/f{i}")), info))
+            .collect();
+        let result = ItemStatusResult {
+            directory: Some(ItemStatusEntry::known(p("/m/dir"), info)),
+            entries: children,
+        };
+        let back: ItemStatusResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(back.entries.len(), 200);
+        assert_eq!(back, result);
+    }
+
+    #[test]
+    fn account_kind_converts_with_core() {
+        for kind in [AccountKind::Personal, AccountKind::Work] {
+            assert_eq!(AccountKind::from(names::AccountKind::from(kind)), kind);
+        }
+    }
+}
