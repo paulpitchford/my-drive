@@ -360,6 +360,16 @@ impl<S: TokenStore + ?Sized + 'static> RefreshingTokenProvider<S> {
     /// made, and later calls get [`TokenError::Closed`]. Call it, and wait for it, before
     /// signing the account in again or out, so a late write cannot overwrite the new
     /// token or restore a removed one.
+    ///
+    /// When this returns, no store write of this provider is running: a write that was
+    /// running has stopped, and `close` waited for it to stop. A write the store had
+    /// already carried out before it was stopped (for example one the keyring accepted
+    /// without a prompt) has landed by then, so a later write by a new sign-in replaces it.
+    ///
+    /// A refresh already in flight is not cancelled: callers already waiting for it still
+    /// receive its access token. The refresh token it rolls is not stored, because no
+    /// store write starts once the provider is closed; it is lost with the provider, and
+    /// the stored refresh token is whatever the store held when `close` returned.
     pub async fn close(&self) {
         let abort = {
             let mut st = self.inner.lock();

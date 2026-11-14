@@ -1,5 +1,6 @@
-//! Shared helpers for the auth tests: a fake authority on 127.0.0.1, a fake browser, and
-//! a token store whose writes can be made to fail, hang or be "dismissed".
+//! Shared helpers for the auth tests: a fake authority on 127.0.0.1, a fake browser, a
+//! token store whose writes can be made to fail, hang or be "dismissed", and a watchdog
+//! that turns a stuck test into a failing one.
 //!
 //! Included by the `auth_*` test files with `#[path = "auth_support.rs"] mod support;`.
 //! Cargo also builds it as a test binary of its own, with no tests; each including file
@@ -7,8 +8,10 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::time::Duration;
 
 use axum::extract::State as AxState;
 use axum::http::StatusCode;
@@ -23,13 +26,38 @@ use mydrive_graph::auth::{
 use serde_json::json;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore, oneshot};
 use url::Url;
 
 pub(crate) type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub(crate) const CLIENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 pub(crate) const PASTE_REDIRECT: &str = "https://auth.example.invalid/nativeclient";
+
+/// The longest a test may take, in real time, before [`bounded`] fails it. Passing tests
+/// take a few seconds at most; this only decides how soon a stuck one is reported.
+pub(crate) const TEST_BOUND: Duration = Duration::from_secs(30);
+
+/// Runs `test`, failing it if it has not finished within [`TEST_BOUND`] of real time, so a
+/// regression that leaves an `.await` waiting forever fails instead of stalling CI.
+///
+/// The bound is kept by a plain thread, not by the tokio clock, so it is unaffected by
+/// tests that pause or advance that clock, and it never fires while a test runs normally.
+pub(crate) async fn bounded<T>(test: impl Future<Output = T>) -> T {
+    let (fire, fired) = oneshot::channel::<()>();
+    // Dropped when this function returns, which wakes the watchdog and lets it end.
+    let (_done, done) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(mpsc::RecvTimeoutError::Timeout) = done.recv_timeout(TEST_BOUND) {
+            let _ = fire.send(());
+        }
+    });
+    tokio::select! {
+        biased;
+        out = test => out,
+        _ = fired => panic!("the test did not finish within {TEST_BOUND:?}: something it awaits never completes"),
+    }
+}
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -300,8 +328,23 @@ pub(crate) struct FlakyStore {
     mode: Mutex<SaveMode>,
     load_mode: Mutex<LoadMode>,
     gate: Mutex<Option<Arc<Semaphore>>>,
+    /// When set, the next write blocks its thread (not just its task) until released.
+    block: Mutex<Option<mpsc::Receiver<()>>>,
     saves: AtomicUsize,
     loads: AtomicUsize,
+    /// Writes whose future has started and not yet finished or been dropped.
+    in_save: Arc<AtomicUsize>,
+    /// Notified each time a write starts.
+    entered: Notify,
+}
+
+/// Counts a write as in progress until its future finishes or is dropped.
+struct InSave(Arc<AtomicUsize>);
+
+impl Drop for InSave {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FlakyStore {
@@ -311,8 +354,11 @@ impl FlakyStore {
             mode: Mutex::new(SaveMode::Succeed),
             load_mode: Mutex::new(LoadMode::Normal),
             gate: Mutex::new(None),
+            block: Mutex::new(None),
             saves: AtomicUsize::new(0),
             loads: AtomicUsize::new(0),
+            in_save: Arc::new(AtomicUsize::new(0)),
+            entered: Notify::new(),
         });
         store
             .inner
@@ -340,6 +386,27 @@ impl FlakyStore {
         let gate = Arc::new(Semaphore::new(0));
         *lock(&self.gate) = Some(gate.clone());
         gate
+    }
+
+    /// Makes the next write block the thread it runs on, inside one poll, until the
+    /// returned sender sends or is dropped. Unlike [`FlakyStore::hold`], such a write
+    /// cannot be stopped part-way: aborting its task takes effect only once it returns.
+    /// Needs a multi-threaded runtime.
+    pub(crate) fn block_next_save(&self) -> mpsc::Sender<()> {
+        let (release, wait) = mpsc::channel();
+        *lock(&self.block) = Some(wait);
+        release
+    }
+
+    /// Waits until a write has started (stores a permit, so a write that started before
+    /// the call counts).
+    pub(crate) async fn save_started(&self) {
+        self.entered.notified().await;
+    }
+
+    /// How many writes are running: started, and neither finished nor dropped.
+    pub(crate) fn saves_in_progress(&self) -> usize {
+        self.in_save.load(Ordering::SeqCst)
     }
 
     /// How many writes were attempted.
@@ -382,7 +449,14 @@ impl TokenStore for FlakyStore {
         token: &'a RefreshToken,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         Box::pin(async move {
+            self.in_save.fetch_add(1, Ordering::SeqCst);
+            let _in_save = InSave(Arc::clone(&self.in_save));
             self.saves.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            let block = lock(&self.block).take();
+            if let Some(wait) = block {
+                let _ = wait.recv();
+            }
             let gate = lock(&self.gate).clone();
             if let Some(gate) = gate
                 && let Ok(permit) = gate.acquire().await

@@ -11,7 +11,7 @@ mod support;
 use std::time::Duration;
 
 use mydrive_graph::auth::{LoopbackSignIn, Scopes};
-use support::{FakeAuthority, TestResult, browser_get, query};
+use support::{FakeAuthority, TEST_BOUND, TestResult, bounded, browser_get, query};
 
 const CHILD: &str = "MYDRIVE_TEST_FD_CHILD";
 
@@ -21,14 +21,28 @@ fn accept_errors_do_not_end_the_sign_in() -> TestResult {
         return child();
     }
     let exe = std::env::current_exe()?;
-    let status = std::process::Command::new("sh")
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg(
             "ulimit -n 128 && exec \"$0\" --exact accept_errors_do_not_end_the_sign_in --nocapture",
         )
         .arg(exe)
         .env(CHILD, "1")
-        .status()?;
+        .spawn()?;
+    // The child bounds itself; this bound is for a child that hangs before or after its
+    // runtime. The polling only decides how soon a stuck child is reported.
+    let deadline = std::time::Instant::now() + 2 * TEST_BOUND;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("the child run did not finish within {:?}", 2 * TEST_BOUND).into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(status.success(), "the child run failed: {status}");
     Ok(())
 }
@@ -37,7 +51,7 @@ fn child() -> TestResult {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async {
+    runtime.block_on(bounded(async {
         let fake = FakeAuthority::start().await?;
         let sign_in = LoopbackSignIn::start(&fake.config(), Scopes::initial_sign_in()).await?;
         let port = sign_in.local_addr().port();
@@ -72,5 +86,5 @@ fn child() -> TestResult {
         assert!(page.starts_with("HTTP/1.1 200"), "{page}");
         attempt.await??;
         Ok(())
-    })
+    }))
 }
