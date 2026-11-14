@@ -597,6 +597,166 @@ fn refresh_is_documented_as_covering_the_subtree() {
     );
 }
 
+/// The text of the catalogue's bullet that starts with `start`, up to the next bullet.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn bullet(text: &str, start: &str) -> String {
+    let from = text
+        .find(&format!("- {start}"))
+        .unwrap_or_else(|| panic!("no bullet starting {start:?}"));
+    let rest = &text[from + 2..];
+    let end = rest.find("\n- ").unwrap_or(rest.len());
+    rest[..end].split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Decodes one raw line the way the daemon does: framing, then the envelope.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn decode_raw(line: &str) -> Result<Result<Message, ErrorResponse>, String> {
+    let mut decoder = mydrive_ipc::codec::LineDecoder::new();
+    decoder.push(line.as_bytes());
+    decoder.push(b"\n");
+    let value = decoder
+        .next_message()
+        .expect("one line")
+        .map_err(|e| e.to_string())?;
+    Ok(Message::from_value(value).map_err(|e| e.to_response()))
+}
+
+/// The catalogue lists the refused numeric forms of a request `id`, and each one it lists is
+/// refused as documented: `invalid-request` with `"id": null`, or a parse error for forms
+/// that are not JSON numbers.
+#[test]
+fn documented_refused_id_forms_are_refused() {
+    let ids = bullet(&catalogue_text(), "**Request IDs**");
+    let refused = [
+        "1.5",
+        "1.0",
+        "0.0",
+        "1e3",
+        "1E0",
+        "-0",
+        "9223372036854775808",
+        "-9223372036854775809",
+    ];
+    let not_json = ["01", "+1", "0x1", "NaN"];
+    for form in refused.iter().chain(&not_json) {
+        assert!(
+            ids.contains(&format!("`{form}`")),
+            "the Request IDs bullet does not list `{form}`"
+        );
+    }
+    let line = |id: &str| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"daemon.status"}}"#);
+    for form in refused {
+        let response = decode_raw(&line(form))
+            .unwrap_or_else(|e| panic!("{form}: not even JSON: {e}"))
+            .expect_err(form);
+        assert_eq!(response.id, None, "{form}");
+        assert_eq!(
+            response.error.kind(),
+            Some(ErrorCode::InvalidRequest),
+            "{form}"
+        );
+    }
+    for form in not_json {
+        assert!(decode_raw(&line(form)).is_err(), "{form}: parsed as JSON");
+    }
+    for ok in ["-9223372036854775808", "9223372036854775807"] {
+        assert!(ids.contains(ok), "the bullet states the range ({ok})");
+        assert!(matches!(decode_raw(&line(ok)), Ok(Ok(Message::Request(_)))));
+    }
+}
+
+/// The catalogue documents duplicate keys in a request, and the daemon's decoding does what
+/// it says: the last occurrence wins, at every level.
+#[test]
+fn duplicate_keys_are_documented_and_the_last_wins() {
+    let text = bullet(&catalogue_text(), "**Duplicate keys.**");
+    assert!(
+        text.contains("the daemon reads the last occurrence"),
+        "{text}"
+    );
+    let line = r#"{"jsonrpc":"2.0","id":1,"id":2,"method":"item.pin","params":{"paths":["/m/a"],"paths":["/m/b"]}}"#;
+    let Ok(Ok(Message::Request(request))) = decode_raw(line) else {
+        panic!("a request with repeated keys was not read as a request");
+    };
+    assert_eq!(request.id, mydrive_ipc::envelope::Id::Number(2));
+    assert_eq!(
+        MethodCall::from_request(&request).unwrap(),
+        MethodCall::ItemPin(ItemPathsParams {
+            paths: vec![mydrive_ipc::path::ProtocolPath::new("/m/b").unwrap()],
+        })
+    );
+}
+
+/// `seq`, `skipped_count` and `bytes_freed` are documented as integers a client may receive
+/// above 2^53, and the types carry such values exactly. `seq` is documented as optional, with
+/// the tie rule stated, and the types accept its absence.
+#[test]
+fn large_integers_and_optional_seq_are_documented() {
+    let text = catalogue_text();
+    let large = bullet(&text, "**Large integers.**");
+    for needle in [
+        "`seq`, `skipped_count` and `bytes_freed` are unsigned 64-bit",
+        "above 2^53",
+    ] {
+        assert!(large.contains(needle), "{needle:?} missing from: {large}");
+    }
+    let changed = text
+        .split("\n### status.changed")
+        .nth(1)
+        .and_then(|s| s.split("\n## ").next())
+        .expect("a status.changed section");
+    let changed = changed.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "`seq` (optional)",
+        "On equal `seq`, a notification's state wins over a page's.",
+        "`seq` is optional on both pages and notifications.",
+    ] {
+        assert!(
+            changed.contains(needle),
+            "status.changed must say {needle:?}"
+        );
+    }
+
+    // Above 2^53, through text, without loss.
+    let big = u64::MAX;
+    let page: ItemStatusResult =
+        serde_json::from_str(&format!(r#"{{"seq":{big},"entries":[]}}"#)).unwrap();
+    assert_eq!(page.seq, Some(big));
+    let note: StatusChangedParams =
+        serde_json::from_str(&format!(r#"{{"seq":{big},"entries":[],"refresh":[]}}"#)).unwrap();
+    assert_eq!(note.seq, Some(big));
+    let action: ItemActionResult = serde_json::from_str(&format!(
+        r#"{{"entries":[{{"path":"/m/a","skipped_count":{big},"bytes_freed":{big}}}]}}"#
+    ))
+    .unwrap();
+    assert!(
+        serde_json::to_string(&action)
+            .unwrap()
+            .contains(&big.to_string())
+    );
+    // `seq` may be absent from a page and from a notification.
+    let page: ItemStatusResult = serde_json::from_str(r#"{"entries":[]}"#).unwrap();
+    assert_eq!(page.seq, None);
+    let note: StatusChangedParams = serde_json::from_str(r#"{"entries":[],"refresh":[]}"#).unwrap();
+    assert_eq!(note.seq, None);
+}
+
+/// The catalogue says the shell loop streams entries, so a consumer must check its exit
+/// status (`readme_examples.rs` shows that it does print a partial listing before failing).
+#[test]
+fn shell_loop_is_documented_as_streaming() {
+    let text = catalogue_text();
+    let intro = text
+        .split("A cursor loop in shell")
+        .nth(1)
+        .and_then(|s| s.split("```sh").next())
+        .expect("the shell loop's introduction");
+    let intro = intro.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in ["It streams", "must check its exit status"] {
+        assert!(intro.contains(needle), "{needle:?} missing from: {intro}");
+    }
+}
+
 const UNKNOWN: &str = "zz-unknown-value";
 
 /// Sets `field` of `base` to `value` and reports whether the containing type still parses

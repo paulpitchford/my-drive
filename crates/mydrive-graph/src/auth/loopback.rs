@@ -107,7 +107,7 @@ pub(crate) async fn bind_loopback(
             }
         };
         let port = v4.local_addr()?.port();
-        match TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await {
+        match bind_ipv6(port).await {
             Ok(v6) => return Ok((v4, Some(v6))),
             Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
                 tracing::debug!(port, "port taken on ::1; trying another");
@@ -125,6 +125,20 @@ pub(crate) async fn bind_loopback(
             "no port is free on both 127.0.0.1 and ::1",
         )
     }))
+}
+
+/// Binds `[::1]` on `port`.
+async fn bind_ipv6(port: u16) -> io::Result<TcpListener> {
+    // Test builds only: lets a unit test act as a machine without IPv6 loopback. The hook
+    // does not exist outside `cfg(test)`, so it cannot change a release build.
+    #[cfg(test)]
+    if tests::ipv6_disabled() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "IPv6 loopback disabled by a test",
+        ));
+    }
+    TcpListener::bind((Ipv6Addr::LOCALHOST, port)).await
 }
 
 impl LoopbackSignIn {
@@ -393,7 +407,98 @@ async fn respond(mut stream: TcpStream, status: &'static str, body: &'static str
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    thread_local! {
+        /// Set by a test to make `bind_ipv6` fail as on a machine without IPv6 loopback.
+        /// Thread-local, so only the (current-thread) test that sets it is affected.
+        static IPV6_DISABLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn ipv6_disabled() -> bool {
+        IPV6_DISABLED.with(Cell::get)
+    }
+
+    /// Clears the hook when the test ends, even if it fails.
+    struct DisableIpv6;
+
+    impl DisableIpv6 {
+        fn new() -> Self {
+            IPV6_DISABLED.with(|d| d.set(true));
+            Self
+        }
+    }
+
+    impl Drop for DisableIpv6 {
+        fn drop(&mut self) {
+            IPV6_DISABLED.with(|d| d.set(false));
+        }
+    }
+
+    fn config(host: &str) -> Result<AuthConfig, Box<dyn std::error::Error>> {
+        let client_id =
+            crate::auth::ClientId::from_config(Some("11111111-2222-3333-4444-555555555555"));
+        Ok(
+            AuthConfig::with_authority(client_id, "http://127.0.0.1:9/tenant/")?
+                .with_loopback_host(host)?,
+        )
+    }
+
+    /// WP-013, ADR-0010 R2: on a machine where IPv6 loopback cannot be bound,
+    /// `LoopbackSignIn::start` refuses a `[::1]` redirect host (whoever else listens on
+    /// `[::1]` could receive the redirect), while `localhost` and `127.0.0.1` still work
+    /// on IPv4 alone. Binding only, so it cannot hang; bounded all the same.
+    #[tokio::test]
+    async fn start_refuses_ipv6_host_without_ipv6_listener()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bound = Duration::from_secs(30);
+        let no_ipv6 = DisableIpv6::new();
+        let refused = tokio::time::timeout(
+            bound,
+            LoopbackSignIn::start(&config("[::1]")?, Scopes::initial_sign_in()),
+        )
+        .await?;
+        match refused {
+            Err(SignInError::Bind { source }) => {
+                assert_eq!(source.kind(), io::ErrorKind::AddrNotAvailable, "{source}");
+            }
+            other => panic!(
+                "a [::1] redirect host without an IPv6 listener must be refused, got {other:?}"
+            ),
+        }
+        for host in ["localhost", "127.0.0.1"] {
+            let sign_in = tokio::time::timeout(
+                bound,
+                LoopbackSignIn::start(&config(host)?, Scopes::initial_sign_in()),
+            )
+            .await??;
+            assert_eq!(
+                sign_in.local_addrs().len(),
+                1,
+                "{host}: {:?}",
+                sign_in.local_addrs()
+            );
+            assert_eq!(sign_in.local_addr().ip(), Ipv4Addr::LOCALHOST);
+        }
+        drop(no_ipv6);
+        // Where this machine has IPv6 loopback, the same host is accepted without the hook.
+        if TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await.is_ok() {
+            let sign_in = tokio::time::timeout(
+                bound,
+                LoopbackSignIn::start(&config("[::1]")?, Scopes::initial_sign_in()),
+            )
+            .await??;
+            assert_eq!(
+                sign_in.local_addrs().len(),
+                2,
+                "{:?}",
+                sign_in.local_addrs()
+            );
+        }
+        Ok(())
+    }
 
     /// Review item 8: `[::1]` is refused as the redirect host without an IPv6 listener.
     #[test]

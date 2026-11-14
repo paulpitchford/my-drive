@@ -5,6 +5,9 @@
 //! that JSON must escape, and listings far larger than one line. A method or notification
 //! added without a case here fails the test, so nothing can be added without a bound.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+
 use mydrive_core::ids::{AccountId, DriveId, MountId, TenantId};
 use mydrive_core::state::{EffectivePin, Hydration, ItemState, Modifiers, Pin, Sync};
 use mydrive_ipc::codec::{MAX_LINE_BYTES, encode_line};
@@ -14,7 +17,8 @@ use mydrive_ipc::methods::{
     AccountInfo, ActionOutcome, DaemonStatusResult, HelloParams, ItemInfo, ItemPathsParams,
     ItemStatusEntry, ItemStatusParams, ItemStatusTarget, ListParams, MAX_ACTION_PATH_BYTES,
     MAX_ACTION_PATHS, MAX_STATUS_PATH_BYTES, MAX_STATUS_PATHS, MethodCall, MountInfo,
-    SUPPORTED_VERSIONS, Session, SkippedItem, StatusSubscribeResult, encoded_path_bytes, method,
+    SUPPORTED_VERSIONS, Session, SkippedItem, StatusSubscribeParams, StatusSubscribeResult,
+    encoded_path_bytes, method,
 };
 use mydrive_ipc::paging::{
     ActionReport, KeysetSource, account_page, action_result, batch_page, directory_page,
@@ -368,10 +372,103 @@ fn worst_status_changed() {
     }
 }
 
+/// The name of a request variant. The match has no wildcard, so adding a variant to
+/// `MethodCall` does not compile until it is named here and given a sample below.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn variant_name(call: &MethodCall) -> &'static str {
+    match call {
+        MethodCall::Hello(_) => "Hello",
+        MethodCall::DaemonStatus => "DaemonStatus",
+        MethodCall::AccountList(_) => "AccountList",
+        MethodCall::MountList(_) => "MountList",
+        MethodCall::ItemStatus(_) => "ItemStatus",
+        MethodCall::ItemPin(_) => "ItemPin",
+        MethodCall::ItemUnpin(_) => "ItemUnpin",
+        MethodCall::ItemHydrate(_) => "ItemHydrate",
+        MethodCall::ItemDehydrate(_) => "ItemDehydrate",
+        MethodCall::StatusSubscribe(_) => "StatusSubscribe",
+    }
+}
+
+/// One call of each request variant.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn one_call_per_variant() -> Vec<MethodCall> {
+    let paths = || ItemPathsParams {
+        paths: vec![ProtocolPath::new("/m/a").unwrap()],
+    };
+    vec![
+        MethodCall::Hello(HelloParams {
+            client_name: "c".into(),
+            protocol_versions: vec![1],
+        }),
+        MethodCall::DaemonStatus,
+        MethodCall::AccountList(ListParams::default()),
+        MethodCall::MountList(ListParams::default()),
+        MethodCall::ItemStatus(ItemStatusParams {
+            target: ItemStatusTarget::Directory(ProtocolPath::new("/m").unwrap()),
+            cursor: None,
+        }),
+        MethodCall::ItemPin(paths()),
+        MethodCall::ItemUnpin(paths()),
+        MethodCall::ItemHydrate(paths()),
+        MethodCall::ItemDehydrate(paths()),
+        MethodCall::StatusSubscribe(StatusSubscribeParams::default()),
+    ]
+}
+
+/// The variants `pub enum MethodCall` declares, read from its source, so a variant with no
+/// sample in [`one_call_per_variant`] is noticed even if [`variant_name`] was updated.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn declared_variants() -> BTreeSet<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/methods.rs");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let body = text
+        .split_once("pub enum MethodCall {\n")
+        .map(|(_, rest)| rest)
+        .expect("src/methods.rs declares pub enum MethodCall");
+    let body = &body[..body.find("\n}\n").expect("the enum is closed")];
+    body.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with('#'))
+        .map(|l| {
+            l.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>()
+        })
+        .filter(|name| name.starts_with(|c: char| c.is_ascii_uppercase()))
+        .collect()
+}
+
+/// Every request variant is in `method::ALL`, so the bound loop below reaches it: a variant
+/// added to `MethodCall` but left out of the method list fails here.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn every_variant_is_in_the_method_list() {
+    let calls = one_call_per_variant();
+    let sampled: BTreeSet<String> = calls.iter().map(|c| variant_name(c).to_owned()).collect();
+    let declared = declared_variants();
+    assert!(declared.contains("Hello") && declared.contains("StatusSubscribe"));
+    assert_eq!(
+        sampled, declared,
+        "every MethodCall variant needs a sample in one_call_per_variant"
+    );
+    for call in &calls {
+        assert!(
+            method::ALL.contains(&call.method()),
+            "MethodCall::{} ({}) is missing from method::ALL, so it has no bound",
+            variant_name(call),
+            call.method()
+        );
+        let back = MethodCall::from_request(&call.to_request(1).unwrap()).unwrap();
+        assert_eq!(variant_name(&back), variant_name(call));
+    }
+}
+
 /// ADR-0020 R4: a worst-case instance of every method's request and response, and of every
-/// notification, fits one line. Adding a method or notification without a case here fails.
+/// notification, fits one line. Adding a method or notification without a case here fails,
+/// and so does adding a request variant that is not in the method list.
 #[test]
 fn every_method_and_notification_is_bounded() {
+    every_variant_is_in_the_method_list();
     for name in method::ALL.iter().chain(method::NOTIFICATIONS) {
         match *name {
             method::HELLO => worst_hello(),

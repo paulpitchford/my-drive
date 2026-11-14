@@ -159,10 +159,21 @@ pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
     // copy, drop, rename); `migrate` checks every key before it commits.
     conn.pragma_update(None, "foreign_keys", "OFF")
         .ctx(|| "disable foreign keys for migration")?;
-    migrate(&mut conn, path, MIGRATIONS)?;
+    migrate(&mut conn, path, migrations())?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .ctx(|| "enable foreign keys")?;
     Ok(conn)
+}
+
+/// The migrations [`open`] applies: always [`MIGRATIONS`], except in this crate's unit
+/// tests, which may substitute a longer list on their own thread to run a later
+/// migration through the real `Store::open` path (see `tests::MigrationsOverride`).
+fn migrations() -> &'static [Migration] {
+    #[cfg(test)]
+    if let Some(list) = tests::MIGRATIONS_OVERRIDE.with(std::cell::Cell::get) {
+        return list;
+    }
+    MIGRATIONS
 }
 
 fn check_openable(conn: &Connection, path: &Path) -> Result<i64, StoreError> {
@@ -420,6 +431,86 @@ mod tests {
             .unwrap();
         assert_eq!(violations, 0);
         // The cascade still works after the rebuild.
+        conn.execute("UPDATE items SET item_id = 'j' WHERE item_id = 'i'", [])
+            .unwrap();
+        let moved: String = conn
+            .query_row("SELECT item_id FROM hydrated_ranges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moved, "j");
+    }
+
+    thread_local! {
+        /// Read by [`migrations`]; set only through [`MigrationsOverride`].
+        pub(super) static MIGRATIONS_OVERRIDE: std::cell::Cell<Option<&'static [Migration]>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// While alive, [`open`] on this thread applies `list` instead of [`MIGRATIONS`].
+    struct MigrationsOverride;
+
+    impl MigrationsOverride {
+        fn set(list: Vec<Migration>) -> Self {
+            let list: &'static [Migration] = Box::leak(list.into_boxed_slice());
+            MIGRATIONS_OVERRIDE.with(|c| c.set(Some(list)));
+            Self
+        }
+    }
+
+    impl Drop for MigrationsOverride {
+        fn drop(&mut self) {
+            MIGRATIONS_OVERRIDE.with(|c| c.set(None));
+        }
+    }
+
+    /// WP-013: the table-rebuild migration run through the real `Store::open` path, so
+    /// the step that turns foreign keys off before migrating (and on again after) is
+    /// covered before any version 2 migration exists. With foreign keys on, the rebuild's
+    /// `DROP TABLE items` would fail on the hydrated range that references it; with them
+    /// left off afterwards, the cascade check at the end would fail.
+    #[test]
+    fn a_table_rebuild_migration_runs_through_store_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        v1_store_with_an_item(&path);
+
+        let _override = MigrationsOverride::set(vec![
+            Migration {
+                version: 1,
+                sql: V1,
+            },
+            Migration {
+                version: 2,
+                sql: rebuild_items_migration(),
+            },
+        ]);
+        let store = crate::Store::open(&path).unwrap();
+        let conn = &store.conn;
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let extra: Option<String> = conn
+            .query_row("SELECT extra FROM items WHERE item_id = 'i'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(extra, None);
+        let key = mydrive_core::ids::ItemKey::new(
+            mydrive_core::ids::DriveId::new("d").unwrap(),
+            mydrive_core::ids::ItemId::new("i").unwrap(),
+        );
+        assert_eq!(
+            crate::Queries::hydrated_ranges(&store, &key).unwrap(),
+            [crate::ByteRange::new(0, 5).unwrap()]
+        );
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        // Foreign keys are on again on the store's connection: the cascade works.
         conn.execute("UPDATE items SET item_id = 'j' WHERE item_id = 'i'", [])
             .unwrap();
         let moved: String = conn

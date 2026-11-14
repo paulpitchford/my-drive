@@ -1040,6 +1040,187 @@ fn complete_upload_refuses_when_the_server_item_is_already_stored() {
     assert!(!store.item(&key("srv-1")).unwrap().unwrap().local_dirty);
 }
 
+/// A provisional folder `tmp-dir` under the root holding a provisional file `tmp-child`
+/// with one hydrated range, both stored, and the upload response for the folder naming
+/// the server item `srv-dir`.
+fn provisional_folder_with_child(store: &Store) -> (Item, Item, RemoteMetadata) {
+    let mut dir = provisional("tmp-dir", Some(ROOT), "new folder", 0);
+    dir.kind = ItemKind::Folder;
+    store.insert_item(&dir).unwrap();
+    let child = provisional("tmp-child", Some("tmp-dir"), "a.txt", 10);
+    store.insert_item(&child).unwrap();
+    assert_eq!(store.hydrated_ranges(&child.key).unwrap(), [r(0, 10)]);
+    let response = RemoteMetadata {
+        key: key("srv-dir"),
+        ..upload_response(&dir, "etag-dir", 3, 0)
+    };
+    (dir, child, response)
+}
+
+/// Every row of `items` and `hydrated_ranges`, read through a second connection, so a
+/// test can show that a refused operation left the committed database exactly as it was.
+fn snapshot(path: &std::path::Path) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = raw(path);
+    let mut rows = Vec::new();
+    for sql in [
+        "SELECT * FROM items ORDER BY drive_id, item_id",
+        "SELECT * FROM hydrated_ranges ORDER BY drive_id, item_id, range_start",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let width = stmt.column_count();
+        let table: Vec<Vec<rusqlite::types::Value>> = stmt
+            .query_map([], |row| {
+                (0..width)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect()
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.extend(table);
+        rows.push(Vec::new()); // separates the two tables
+    }
+    rows
+}
+
+/// The responses `complete_upload` refuses only after it has re-keyed the item: one
+/// naming another item, one with an invalid name, one with a size SQLite cannot store.
+fn refused_after_rekey(response: &RemoteMetadata) -> [(RemoteMetadata, &'static str); 3] {
+    [
+        (
+            RemoteMetadata {
+                key: key("someone-else"),
+                ..response.clone()
+            },
+            "UploadMismatch",
+        ),
+        (
+            RemoteMetadata {
+                name: "a/b".to_owned(),
+                ..response.clone()
+            },
+            "InvalidName",
+        ),
+        (
+            RemoteMetadata {
+                size: u64::MAX,
+                ..response.clone()
+            },
+            "SizeTooLarge",
+        ),
+    ]
+}
+
+fn assert_refusal(err: &StoreError, expected: &str) {
+    let ok = match expected {
+        "UploadMismatch" => matches!(err, StoreError::UploadMismatch { .. }),
+        "InvalidName" => matches!(err, StoreError::InvalidName { .. }),
+        "SizeTooLarge" => matches!(err, StoreError::SizeTooLarge { .. }),
+        _ => false,
+    };
+    assert!(ok, "expected {expected}, got {err}");
+}
+
+/// WP-013: `complete_upload` is atomic. A refusal that comes after the re-key step (the
+/// response names another item, has an invalid name, or a size too large to store)
+/// leaves nothing changed: the provisional item keeps its key, its child keeps its
+/// parent link and ranges, and no server row appears.
+#[test]
+fn complete_upload_refused_after_the_rekey_changes_nothing() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let (dir, child, response) = provisional_folder_with_child(&store);
+    let server_id = ItemId::new("srv-dir").unwrap();
+    let before = snapshot(&fx.path());
+
+    for (bad, expected) in refused_after_rekey(&response) {
+        let err = store
+            .complete_upload(&dir.key, 1, hash(3).unwrap(), &bad, Some(&server_id))
+            .unwrap_err();
+        assert_refusal(&err, expected);
+        assert_eq!(snapshot(&fx.path()), before, "after {expected}");
+        assert_eq!(store.item(&dir.key).unwrap(), Some(dir.clone()));
+        assert_eq!(store.item(&child.key).unwrap(), Some(child.clone()));
+        assert_eq!(store.item(&key("srv-dir")).unwrap(), None);
+        assert_eq!(store.hydrated_ranges(&child.key).unwrap(), [r(0, 10)]);
+    }
+
+    // The same refusals inside a caller's transaction: each is undone on its own, the
+    // transaction stays usable, and committing it applies only what succeeded.
+    let mut store = store;
+    let tx = store.transaction().unwrap();
+    for (bad, expected) in refused_after_rekey(&response) {
+        let err = tx
+            .complete_upload(&dir.key, 1, hash(3).unwrap(), &bad, Some(&server_id))
+            .unwrap_err();
+        assert_refusal(&err, expected);
+        assert_eq!(tx.item(&dir.key).unwrap(), Some(dir.clone()));
+        assert_eq!(tx.item(&child.key).unwrap(), Some(child.clone()));
+        assert_eq!(tx.item(&key("srv-dir")).unwrap(), None);
+    }
+    tx.commit().unwrap();
+    assert_eq!(snapshot(&fx.path()), before);
+
+    // Nothing was left half-done: the valid response still completes.
+    assert_eq!(
+        store
+            .complete_upload(&dir.key, 1, hash(3).unwrap(), &response, Some(&server_id))
+            .unwrap(),
+        UploadCompleted::Synced
+    );
+}
+
+/// WP-013, N1: the re-key inside `complete_upload` moves a child with it. The provisional
+/// folder gets the server ID; its child's parent link follows and the child keeps its
+/// ranges under its own key; no range or parent link names the provisional ID afterwards.
+#[test]
+fn complete_upload_rekey_moves_a_child_and_keeps_its_ranges() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let (dir, child, response) = provisional_folder_with_child(&store);
+    let server_id = ItemId::new("srv-dir").unwrap();
+
+    assert_eq!(
+        store
+            .complete_upload(&dir.key, 1, hash(3).unwrap(), &response, Some(&server_id))
+            .unwrap(),
+        UploadCompleted::Synced
+    );
+    assert_eq!(store.item(&dir.key).unwrap(), None);
+    let new_dir = store.item(&key("srv-dir")).unwrap().unwrap();
+    assert!(!new_dir.is_provisional && !new_dir.local_dirty);
+    assert_eq!(new_dir.kind, ItemKind::Folder);
+
+    let stored_child = store.item(&child.key).unwrap().unwrap();
+    assert_eq!(
+        stored_child.parent_item_id.as_ref().map(ItemId::as_str),
+        Some("srv-dir")
+    );
+    assert_eq!(
+        Item {
+            parent_item_id: Some(server_id.clone()),
+            ..child.clone()
+        },
+        stored_child,
+        "only the child's parent link changes"
+    );
+    assert_eq!(store.hydrated_ranges(&child.key).unwrap(), [r(0, 10)]);
+    assert_eq!(store.children(&key("srv-dir")).unwrap(), [stored_child]);
+    assert!(store.children(&dir.key).unwrap().is_empty());
+    assert_eq!(path_of(&store, "tmp-child"), "new folder/a.txt");
+
+    drop(store);
+    let stale: i64 = raw(&fx.path())
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM items WHERE parent_item_id = 'tmp-dir') + \
+             (SELECT COUNT(*) FROM hydrated_ranges WHERE item_id = 'tmp-dir')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0);
+}
+
 /// Third review F1, the reviewer's sequence: clean V1, local change, uploading; the
 /// server accepts our V2; then a delta reports V3 from another client; then our V2
 /// upload completes. The item must not end clean and in-sync at V2: our bytes reached the

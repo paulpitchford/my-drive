@@ -22,6 +22,7 @@
 
 use std::collections::VecDeque;
 
+use mydrive_core::ids::MountId;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -399,6 +400,13 @@ pub fn mount_page(
     let start = cursor
         .map(|c| keys.decode(method::MOUNT_LIST, c))
         .transpose()?;
+    // A cursor naming a key no mount can have was not issued by this daemon.
+    if start
+        .as_deref()
+        .is_some_and(|key| MountId::new(key).is_err())
+    {
+        return Err(foreign_cursor(method::MOUNT_LIST, cursor.unwrap_or("")));
+    }
     let mut page = MountListResult {
         mounts: Vec::new(),
         next_cursor: None,
@@ -1061,6 +1069,11 @@ mod tests {
         );
         assert_eq!(batch_cursor(&"f".repeat(32), usize::MAX).len(), 56);
         assert_eq!(KeyCursor::mounts().encode(&"m".repeat(64)).len(), 131);
+        // The catalogue's sizing assumptions: a batch of at most 10,000 paths gives cursors of
+        // at most 40 bytes, and an account cursor is 3 + 2 × the account ID's bytes.
+        let last_index = crate::methods::MAX_STATUS_PATHS as usize - 1;
+        assert_eq!(batch_cursor(&"f".repeat(32), last_index).len(), 40);
+        assert_eq!(KeyCursor::accounts().encode(&"é".repeat(100)).len(), 403);
         let keys = KeyCursor::directory(&dir);
         assert_eq!(
             keys.decode(method::ITEM_STATUS, &keys.encode("é x"))
@@ -1467,6 +1480,70 @@ mod tests {
         let err =
             mount_page(&mut MountSource(Vec::new()), Some("m0.6d"), &Id::Number(1)).unwrap_err();
         assert_eq!(err.reason_code().as_deref(), Some("restart-listing"));
+    }
+
+    /// ADR-0020 R3: a forged mount or account cursor naming a key that cannot exist (the
+    /// empty ID, which neither `MountId` nor `AccountId` admits, or a key that breaks a
+    /// `MountId` rule) is refused with `restart-listing`, and the source is never asked for
+    /// rows after it.
+    #[test]
+    fn adr_0020_r3_forged_list_cursors_naming_impossible_keys_are_refused() {
+        struct NeverRead;
+        impl KeysetSource<MountInfo> for NeverRead {
+            fn rows_after(
+                &mut self,
+                after: Option<&str>,
+                _: usize,
+            ) -> Result<Vec<MountInfo>, RpcError> {
+                panic!("source read after a forged mount cursor ({after:?})");
+            }
+        }
+        impl KeysetSource<AccountInfo> for NeverRead {
+            fn rows_after(
+                &mut self,
+                after: Option<&str>,
+                _: usize,
+            ) -> Result<Vec<AccountInfo>, RpcError> {
+                panic!("source read after a forged account cursor ({after:?})");
+            }
+        }
+        let id = Id::Number(1);
+        let check = |err: RpcError, cursor: &str| {
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{cursor:?}");
+            assert_eq!(
+                err.reason_code().as_deref(),
+                Some("restart-listing"),
+                "{cursor:?}"
+            );
+        };
+        for cursor in ["m1.", "m1"] {
+            check(
+                mount_page(&mut NeverRead, Some(cursor), &id).unwrap_err(),
+                cursor,
+            );
+        }
+        // Well-formed cursors whose key breaks a `MountId` rule: uppercase, a leading `-`,
+        // longer than 64 characters, a `/`, a non-ASCII character.
+        let too_long = "z".repeat(65);
+        for key in ["UPPER", "-lead", too_long.as_str(), "a/b", "é"] {
+            assert!(MountId::new(key).is_err(), "{key:?} must be impossible");
+            let cursor = KeyCursor::mounts().encode(key);
+            check(
+                mount_page(&mut NeverRead, Some(&cursor), &id).unwrap_err(),
+                &cursor,
+            );
+        }
+        // The longest valid key still decodes, so the check refuses only impossible keys.
+        let longest = KeyCursor::mounts().encode(&"z".repeat(64));
+        assert!(mount_page(&mut MountSource(Vec::new()), Some(&longest), &id).is_ok());
+        // Every non-empty string is a possible `AccountId`, so the empty key is the only
+        // impossible account cursor key.
+        for cursor in ["a1.", "a1"] {
+            check(
+                account_page(&mut NeverRead, Some(cursor), &id).unwrap_err(),
+                cursor,
+            );
+        }
     }
 
     struct MountSource(Vec<MountInfo>);

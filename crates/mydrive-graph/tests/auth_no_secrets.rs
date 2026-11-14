@@ -20,8 +20,8 @@ use mydrive_graph::auth::{
     AccessToken, LoopbackSignIn, PasteSignIn, RefreshingTokenProvider, Scopes, TokenProvider,
 };
 use support::{
-    FakeAuthority, FlakyStore, PASTE_REDIRECT, SaveMode, TestResult, account, browser_get, lock,
-    paste_url, query,
+    FakeAuthority, FlakyStore, PASTE_REDIRECT, SaveMode, TestResult, account, bounded, browser_get,
+    lock, paste_url, query,
 };
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -74,7 +74,7 @@ fn no_secret_in_logs_debug_or_errors() -> TestResult {
         .worker_threads(4)
         .enable_all()
         .build()?;
-    let (seen, verifiers) = runtime.block_on(scenario())?;
+    let (seen, verifiers) = runtime.block_on(bounded(scenario()))?;
 
     let logs = lock(&capture.0).clone();
     for module in ["loopback", "token", "provider", "secret_service"] {
