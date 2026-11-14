@@ -871,6 +871,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "base64",
+ "futures-core",
  "mydrive-core",
  "rand",
  "reqwest",

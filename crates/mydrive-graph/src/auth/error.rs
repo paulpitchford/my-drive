@@ -157,7 +157,7 @@ pub enum SignInError {
 }
 
 /// The token store failed.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum StoreError {
     /// No Secret Service is reachable (ADR-0010 R7).
     #[error(
@@ -216,8 +216,9 @@ pub enum TokenError {
         #[source]
         source: TokenRequestError,
     },
-    /// The token store failed. When this follows a successful refresh, the old refresh
-    /// token is still the stored one and no new access token was handed out.
+    /// Reading the refresh token from the store failed, so no refresh was attempted.
+    /// (A failed write after a refresh is not an error: see
+    /// [`RefreshingTokenProvider::store_warning`](super::RefreshingTokenProvider::store_warning).)
     #[error("token store failed for account {account}: {source}")]
     Store {
         /// The account.

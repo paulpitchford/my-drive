@@ -29,7 +29,7 @@ pub use config::{
 pub use error::{ConfigError, SignInError, StoreError, TokenError, TokenRequestError};
 pub use loopback::{LOOPBACK_TIMEOUT, LoopbackSignIn};
 pub use pkce::{CODE_CHALLENGE_METHOD, State};
-pub use provider::{REFRESH_MARGIN, RefreshingTokenProvider, TokenProvider};
+pub use provider::{REFRESH_MARGIN, RefreshingTokenProvider, STORE_RETRY_INTERVAL, TokenProvider};
 pub use secret::{AccessToken, AuthorizationCode, IdToken, PkceVerifier, RefreshToken};
 pub use secret_service::SecretServiceStore;
 pub use store::{BoxFuture, MemoryTokenStore, TokenStore};

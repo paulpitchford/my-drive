@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
+futures-core.workspace = true
 mydrive-core.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["rustls", "form"] }

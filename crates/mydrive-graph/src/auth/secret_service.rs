@@ -4,7 +4,8 @@
 //! Each account has one item in the default collection, found by the attributes
 //! `application = mydrive` and `account = <account ID>`. Secrets travel to the service
 //! with the `plain` session algorithm: the session bus is private to the user, and the
-//! encrypted algorithm would need crypto crates outside the workspace stack.
+//! encrypted algorithm would need crypto crates outside the workspace stack. Accepted for
+//! now and recorded as a follow-up.
 //!
 //! A locked collection or item is unlocked through the service's own prompt (J01 V4). A
 //! dismissed prompt is [`StoreError::Dismissed`].
@@ -13,6 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
+use futures_core::Stream as _;
 use mydrive_core::ids::AccountId;
 use serde::{Deserialize, Serialize};
 use zbus::proxy::CacheProperties;
@@ -192,8 +194,6 @@ impl SecretServiceStore {
         prompt: &OwnedObjectPath,
         operation: &'static str,
     ) -> Result<(), StoreError> {
-        use zbus::export::futures_core::Stream;
-
         if prompt.as_str() == NO_PROMPT {
             return Ok(());
         }

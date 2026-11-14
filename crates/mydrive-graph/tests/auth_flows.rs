@@ -749,20 +749,33 @@ impl TokenStore for FlakyStore {
     }
 }
 
-/// AC6: if storing the rolled refresh token fails, the error is returned, no access token
-/// is handed out, and the old refresh token is kept and used next time.
+fn set_failing(store: &FlakyStore, fail: bool) {
+    *store
+        .fail_saves
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = fail;
+}
+
+fn stored(store: &FlakyStore) -> Option<String> {
+    store
+        .inner
+        .get(&account("a"))
+        .map(|t| t.expose_secret().to_owned())
+}
+
+/// AC6 (as reworded), F01 step 9, ADR-0010 R8: if storing the rolled refresh token fails,
+/// the session continues: the access token is handed out, the stored old token is left
+/// untouched, the new token is kept in memory and used for later refreshes, a non-fatal
+/// warning is set, and the next successful write stores the newest token.
 #[tokio::test]
-async fn failed_store_keeps_old_refresh_token() -> TestResult {
+async fn failed_store_write_keeps_session_and_newest_token() -> TestResult {
     let fake = FakeAuthority::start().await?;
     let store = Arc::new(FlakyStore::default());
     store
         .inner
         .save(&account("a"), &RefreshToken::new("old"))
         .await?;
-    *store
-        .fail_saves
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = true;
+    set_failing(&store, true);
     let provider = RefreshingTokenProvider::resume(
         account("a"),
         Scopes::initial_sign_in(),
@@ -770,41 +783,82 @@ async fn failed_store_keeps_old_refresh_token() -> TestResult {
         store.clone(),
     );
 
-    let r = provider.access_token().await;
-    assert!(matches!(r, Err(TokenError::Store { .. })), "{r:?}");
+    // The refresh is granted; the write fails; the session continues.
+    let t1 = provider.access_token().await?;
+    assert_eq!(t1.expose_secret(), "fake-access-1");
     assert!(!provider.needs_sign_in());
-    assert_eq!(
-        store
-            .inner
-            .get(&account("a"))
-            .as_ref()
-            .map(RefreshToken::expose_secret),
-        Some("old")
-    );
+    assert!(matches!(
+        provider.store_warning(),
+        Some(StoreError::Failed { .. })
+    ));
+    assert_eq!(stored(&store).as_deref(), Some("old"));
 
-    *store
-        .fail_saves
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = false;
-    assert_eq!(
-        provider.access_token().await?.expose_secret(),
-        "fake-access-2"
-    );
+    // The next refresh uses the in-memory token, not the stale stored one. The write
+    // still fails; the stored token is still not touched.
+    let t2 = provider.force_refresh(&t1).await?;
+    assert_eq!(t2.expose_secret(), "fake-access-2");
+    assert!(provider.store_warning().is_some());
+    assert_eq!(stored(&store).as_deref(), Some("old"));
+
+    // A refresh that is not granted hands out no access token.
+    fake.push(Reply::Error {
+        status: 503,
+        error: "temporarily_unavailable",
+        description: "try later",
+    });
+    let r = provider.force_refresh(&t2).await;
+    assert!(matches!(r, Err(TokenError::Transient { .. })), "{r:?}");
+
+    // The store recovers: the next refresh stores the newest token and clears the warning.
+    set_failing(&store, false);
+    let t4 = provider.force_refresh(&t2).await?;
+    assert_eq!(t4.expose_secret(), "fake-access-3");
+    assert!(provider.store_warning().is_none());
+    assert_eq!(stored(&store).as_deref(), Some("fake-refresh-3"));
+
     let reqs = fake.requests();
+    let used: Vec<&str> = reqs.iter().map(|r| r["refresh_token"].as_str()).collect();
     assert_eq!(
-        reqs.len(),
-        2,
-        "the failed refresh's access token was not cached"
+        used,
+        ["old", "fake-refresh-1", "fake-refresh-2", "fake-refresh-2"],
+        "each refresh used the newest refresh token held"
     );
-    assert_eq!(reqs[1]["refresh_token"], "old");
-    assert_eq!(
-        store
-            .inner
-            .get(&account("a"))
-            .as_ref()
-            .map(RefreshToken::expose_secret),
-        Some("fake-refresh-2")
+    Ok(())
+}
+
+/// F01 step 9: while a refresh token is unsaved, the write is retried on use (at most every
+/// `STORE_RETRY_INTERVAL`) without a refresh, and succeeds once the store recovers.
+#[tokio::test]
+async fn unsaved_refresh_token_is_retried_on_use() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let store = Arc::new(FlakyStore::default());
+    store
+        .inner
+        .save(&account("a"), &RefreshToken::new("old"))
+        .await?;
+    set_failing(&store, true);
+    let provider = RefreshingTokenProvider::resume(
+        account("a"),
+        Scopes::initial_sign_in(),
+        fake.client(),
+        store.clone(),
     );
+    let t = provider.access_token().await?;
+    assert!(provider.store_warning().is_some());
+
+    set_failing(&store, false);
+    // Within the retry interval the cached token is handed out without a write.
+    assert_eq!(provider.access_token().await?, t);
+    assert_eq!(stored(&store).as_deref(), Some("old"));
+
+    // After the interval the next use retries the write. The clock is paused only now,
+    // with no request in flight; the cached token is valid for an hour, so no network.
+    tokio::time::pause();
+    tokio::time::advance(mydrive_graph::auth::STORE_RETRY_INTERVAL).await;
+    assert_eq!(provider.access_token().await?, t);
+    assert_eq!(stored(&store).as_deref(), Some("fake-refresh-1"));
+    assert!(provider.store_warning().is_none());
+    assert_eq!(fake.count(), 1, "the retry made no refresh request");
     Ok(())
 }
 
