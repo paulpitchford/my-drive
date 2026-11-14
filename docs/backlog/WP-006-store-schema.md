@@ -68,6 +68,12 @@ Use the `bundled` feature of `rusqlite` in this crate's manifest so behaviour do
 depend on the system SQLite. The daemon will be the only process opening the store, with a
 single writer.
 
+## Shared files
+
+This WP may change `Cargo.lock`, and only as a result of dependencies it adds to its own
+crate from `[workspace.dependencies]`. Other wave-2 WPs do the same in parallel; the lead
+resolves `Cargo.lock` conflicts at merge. Do not edit the root `Cargo.toml`.
+
 ## Open questions
 
 None.

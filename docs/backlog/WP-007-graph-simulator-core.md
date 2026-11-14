@@ -68,6 +68,12 @@ JSON shapes should be taken from the Microsoft Graph documentation cited in
 research marks a behaviour as unverified, simulate both possibilities behind a switch rather
 than picking one.
 
+## Shared files
+
+This WP may change `Cargo.lock`, and only as a result of dependencies it adds to its own
+crate from `[workspace.dependencies]`. Other wave-2 WPs do the same in parallel; the lead
+resolves `Cargo.lock` conflicts at merge. Do not edit the root `Cargo.toml`.
+
 ## Open questions
 
 None.
