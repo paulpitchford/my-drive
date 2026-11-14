@@ -15,6 +15,12 @@
 //! `k / 8`. Input byte number `i` (counting from 0 over the whole stream) is XORed into the
 //! state rotated left by `11 * i` bits, wrapping at 160 bits. At the end the total input
 //! length, as a 64-bit little-endian integer, is XORed into the last 8 bytes of the state.
+//!
+//! Microsoft's prose pseudocode ends `XorHash0` with a `reverse(ret)` step that reverses
+//! the byte order of the state. The C# reference sample does not perform that step, and
+//! neither does the hash Graph actually reports. This implementation follows the C#
+//! sample, and both test vector sets (rclone's and those computed with the C# sample)
+//! confirm it. Do not add the reversal: it would make every digest wrong.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -165,6 +171,10 @@ impl QuickXorHasher {
 /// Hashes everything `reader` yields until end of input.
 ///
 /// Reads interrupted by a signal are retried.
+///
+/// The digest means something only if the source does not change while it is read. Hash
+/// a snapshot or a staging copy, never a live backing file that can be written to
+/// concurrently: a concurrent write gives a digest that matches no version of the file.
 ///
 /// # Errors
 ///
