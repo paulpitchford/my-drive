@@ -22,7 +22,6 @@ The owner should know these were choices, not findings.
 |---|---|---|---|
 | Q1 | Does `Range` work on authenticated `/content` (gate G1)? | WP-011, owner signs in | M1 |
 | Q2 | Does device-code sign-in work for personal accounts (gate G5)? | WP-011 | M1 |
-| Q3 | Can FUSE mounts be tested on GitHub-hosted runners? | WP-010 | M0 |
 | Q4 | What did abraunegg's FUSE design conclude and why is it on hold (gate G3)? | Lead | M2 |
 | Q5 | Do FUSE mmap page faults reach the daemon as reads in every case we rely on? | M2 VFS work | M2 |
 | Q6 | What counts as "one operation" for the mass-delete guard (`rm -rf` is many unlinks)? | Lead, in the M2 write-path WP | M2 |
@@ -42,6 +41,8 @@ The owner should know these were choices, not findings.
 | Q20 | Is the crawler deny list workable in practice (pid races, sandboxed apps)? ADR-0013 is an unproven design | Experiment in M2 | M2 |
 | Q21 | Product name | Owner | Before M3 packaging |
 | Q22 | App registration and publisher verification | Owner | Before WP-011 |
+| Q23 | Can Graph return the same item ID in two casings (as it does for drive IDs since June 2025)? `ItemId` compares exactly | Simulator and gate work | Before the M1 delta WP |
+| Q24 | Which tenants refuse `#` and `%` in names, and how the engine learns it (`hash_and_percent_allowed`) | Lead, in the M1 upload WP | M1 |
 
 ## Detail questions in the flows and journeys
 

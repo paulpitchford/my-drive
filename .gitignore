@@ -5,3 +5,4 @@
 # Local experiment credentials and tokens must never be committed.
 *.token
 /tmp
+.claude/worktrees/

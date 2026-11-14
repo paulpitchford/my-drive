@@ -1,6 +1,6 @@
 # WP-005: IPC protocol types and framing
 
-- **Status:** blocked on wave 1
+- **Status:** ready
 - **Milestone:** M0
 - **Wave:** 2
 - **Depends on:** WP-001, WP-002

@@ -61,6 +61,34 @@ evidence.
 3. Record anything learned that changes later WPs, and update them.
 4. Report to the owner: what merged, what did not and why, what was learned, what is next.
 
+## Lessons from wave 1
+
+Wave 1 (five WPs, 2026-11-14) merged in one sitting. What to keep and what to change:
+
+- **The lead's WP text is the weakest link.** Three of five WPs had errors in them: a wrong
+  count, a test dependency the crate did not have, and guidance ("take the stricter reading")
+  that review showed was harmful. Implementers reported each one instead of working around
+  it, which is the process working. Before a wave, re-read each WP's criteria against the
+  crate's actual manifest and the ADRs.
+- **Verifiers earn their place by breaking the code.** Mutation checks found two tests that
+  could not fail (a test looping over the constant it was testing; a documented behaviour
+  with no test) and a CI step that could not pass. Keep "break it and see the test fail" as
+  the core of verification.
+- **Reviewers find design hazards, not just defects.** Both useful fixes (own pin overriding
+  a stale effective pin; ASCII-only lowercasing) were non-blocking findings. Read
+  non-blocking findings; fix the cheap ones before merge.
+- **Re-verify after a ruling changes behaviour.** A fix round that only adds a guard can be
+  read by the lead; one that changes rules goes back to a verifier.
+- **Anything observable only in CI needs a CI run before review ends.** Push the branch and
+  open the pull request as soon as the implementer reports, not after review.
+- **Practicalities.** Reviewers and verifiers cannot check out a branch that is checked out
+  in another worktree: tell verifiers to `git checkout --detach <branch>` and reviewers to
+  use `git diff master...<branch>`. Tell agents to run `mise trust` if asked, to delete
+  `proptest-regressions` files left by deliberate breaks, and to confirm no FUSE mount is
+  left behind. Remove agent worktrees and their branches after the wave.
+- **Cost.** Five WPs used 5 implementers, 5 reviewers and 6 verifiers, plus 5 resumed
+  implementer rounds. Plan on about three agents and one fix round per WP.
+
 ## Scale
 
 Start small. The first wave is the test of this process as much as of the code: run it with

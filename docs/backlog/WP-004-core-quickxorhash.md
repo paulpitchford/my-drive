@@ -1,6 +1,6 @@
 # WP-004: quickXorHash
 
-- **Status:** ready
+- **Status:** done (#5)
 - **Milestone:** M0
 - **Wave:** 1
 - **Depends on:** —

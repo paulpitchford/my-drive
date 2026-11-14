@@ -1,6 +1,6 @@
 # WP-010: FUSE smoke test in CI
 
-- **Status:** ready
+- **Status:** done (#2)
 - **Milestone:** M0
 - **Wave:** 1
 - **Depends on:** —
