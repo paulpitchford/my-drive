@@ -10,4 +10,21 @@ Third-party code
 
 Code adapted from other projects is listed here with its origin and licence (ADR-0002).
 
-(none yet)
+rclone quickXorHash test vectors
+  Used in:  crates/mydrive-core/src/hash.rs (test module only; test data, no code)
+  Source:   https://github.com/rclone/rclone
+            backend/onedrive/quickxorhash/quickxorhash_test.go
+  Commit:   b0ef5f6a6eca641a6bfb55bc05ef1595f4105d07
+  Licence:  MIT ("Copyright (C) 2012 by Nick Craig-Wood"), read from COPYING at the
+            same commit.
+  What:     70 input/digest pairs (base64), copied unchanged.
+
+Microsoft quickXorHash reference sample (algorithm description, not copied)
+  Used in:  crates/mydrive-core/src/hash.rs
+  Source:   https://learn.microsoft.com/en-us/onedrive/developer/code-snippets/quickxorhash
+            (https://github.com/OneDrive/onedrive-api-docs,
+            docs/code-snippets/quickxorhash.md)
+  Commit:   8cdff2e5cbd362cf2bb3de9d8f102386af7abddd
+  What:     The implementation was written from this description; no code was copied.
+            The sample was run outside this repository to compute expected digests for
+            additional test vectors (test data only).
