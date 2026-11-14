@@ -88,11 +88,19 @@ CREATE TABLE items (
     local_dirty    INTEGER NOT NULL DEFAULT 0 CHECK (local_dirty IN (0, 1)),
     local_generation INTEGER NOT NULL DEFAULT 0 CHECK (local_generation >= 0),
     remote_changed INTEGER NOT NULL DEFAULT 0 CHECK (remote_changed IN (0, 1)),
-    PRIMARY KEY (drive_id, item_id)
+    remote_etag    TEXT,
+    remote_ctag    TEXT,
+    remote_hash    TEXT,
+    remote_size    INTEGER CHECK (remote_size IS NULL OR remote_size >= 0),
+    PRIMARY KEY (drive_id, item_id),
+    CHECK (is_provisional = 0 OR local_dirty = 1),
+    CHECK (local_dirty = 0 OR sync NOT IN ('in-sync', 'pending-download')),
+    CHECK (local_dirty = 1 OR remote_size IS NULL)
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX items_by_parent ON items (drive_id, parent_item_id);
 CREATE INDEX items_by_sync ON items (sync);
+CREATE INDEX items_by_dirty ON items (local_dirty) WHERE local_dirty = 1;
 
 CREATE TABLE hydrated_ranges (
     drive_id    TEXT NOT NULL,
@@ -145,16 +153,23 @@ pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
     // (ADR-0012 R3) survives power loss, not just a process crash.
     conn.pragma_update(None, "synchronous", "FULL")
         .ctx(|| "set synchronous=FULL")?;
+    // Foreign keys stay off while migrating, so a migration may rebuild a table (create,
+    // copy, drop, rename); `migrate` checks every key before it commits.
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .ctx(|| "disable foreign keys for migration")?;
+    migrate(&mut conn, path, MIGRATIONS)?;
     conn.pragma_update(None, "foreign_keys", "ON")
         .ctx(|| "enable foreign keys")?;
-
-    migrate(&mut conn, path)?;
     Ok(conn)
 }
 
-/// Refuses a file that is not a my-drive store or is newer than this build, and returns
-/// its schema version otherwise. Reads only.
 fn check_openable(conn: &Connection, path: &Path) -> Result<i64, StoreError> {
+    check_openable_up_to(conn, path, SCHEMA_VERSION)
+}
+
+/// Refuses a file that is not a my-drive store or is newer than `supported`, and returns
+/// its schema version otherwise. Reads only.
+fn check_openable_up_to(conn: &Connection, path: &Path, supported: i64) -> Result<i64, StoreError> {
     let not_ours = |reason: &str| StoreError::NotAStateStore {
         path: path.to_owned(),
         reason: reason.to_owned(),
@@ -180,11 +195,11 @@ fn check_openable(conn: &Connection, path: &Path) -> Result<i64, StoreError> {
     if app_id != APPLICATION_ID {
         return Err(not_ours(&format!("its application ID is {app_id:#x}")));
     }
-    if version > SCHEMA_VERSION {
+    if version > supported {
         return Err(StoreError::SchemaTooNew {
             path: path.to_owned(),
             found: version,
-            supported: SCHEMA_VERSION,
+            supported,
         });
     }
     if version < 1 {
@@ -209,14 +224,19 @@ fn classify(source: rusqlite::Error, path: &Path, what: &str) -> StoreError {
     }
 }
 
-/// Applies every migration newer than the database, in one transaction.
-fn migrate(conn: &mut Connection, path: &Path) -> Result<(), StoreError> {
+/// Applies every migration in `migrations` newer than the database, in one transaction.
+///
+/// The caller turns foreign keys off first (they cannot change inside a transaction), so
+/// a migration may rebuild a table. Before committing, `PRAGMA foreign_key_check` must
+/// report nothing; otherwise everything is rolled back.
+fn migrate(conn: &mut Connection, path: &Path, migrations: &[Migration]) -> Result<(), StoreError> {
+    let latest = migrations.last().map_or(0, |m| m.version);
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .ctx(|| "begin the migration transaction")?;
     // Read inside the write lock, so the version cannot change under us.
-    let from = check_openable(&tx, path)?;
-    let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > from).collect();
+    let from = check_openable_up_to(&tx, path, latest)?;
+    let pending: Vec<&Migration> = migrations.iter().filter(|m| m.version > from).collect();
     if pending.is_empty() {
         return Ok(());
     }
@@ -225,16 +245,43 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<(), StoreError> {
             .ctx(|| format!("apply migration {}", migration.version))?;
         tx.pragma_update(None, "user_version", migration.version)
             .ctx(|| format!("record schema version {}", migration.version))?;
+        let violations = tx
+            .prepare("PRAGMA foreign_key_check")
+            .and_then(|mut stmt| stmt.query_map([], |_| Ok(()))?.count_rows())
+            .ctx(|| format!("check foreign keys after migration {}", migration.version))?;
+        if violations > 0 {
+            return Err(StoreError::MigrationForeignKeys {
+                path: path.to_owned(),
+                version: migration.version,
+                violations,
+            });
+        }
     }
     tx.commit()
-        .ctx(|| format!("commit migrations from version {from} to {SCHEMA_VERSION}"))?;
+        .ctx(|| format!("commit migrations from version {from} to {latest}"))?;
     tracing::info!(
         from,
-        to = SCHEMA_VERSION,
+        to = latest,
         path = %path.display(),
         "migrated state store"
     );
     Ok(())
+}
+
+/// Counts rows without collecting them.
+trait CountRows {
+    fn count_rows(self) -> rusqlite::Result<usize>;
+}
+
+impl<I: Iterator<Item = rusqlite::Result<()>>> CountRows for I {
+    fn count_rows(self) -> rusqlite::Result<usize> {
+        let mut n = 0;
+        for row in self {
+            row?;
+            n += 1;
+        }
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +340,142 @@ mod tests {
             .pragma_query_value(None, "application_id", |r| r.get(0))
             .unwrap();
         assert_eq!(id, APPLICATION_ID);
+    }
+
+    /// A v1 store holding one item with one hydrated range, closed again.
+    fn v1_store_with_an_item(path: &Path) {
+        let conn = open(path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO items (drive_id, item_id, name, kind, size, created_at, modified_at, \
+             hydration, pin, sync) VALUES ('d', 'i', 'n', 'file', 10, 0, 0, 'partial', \
+             'inherit', 'in-sync');
+             INSERT INTO hydrated_ranges VALUES ('d', 'i', 0, 5);",
+        )
+        .unwrap();
+    }
+
+    /// The 12-step table rebuild SQLite documents, applied to `items`: a new first column.
+    fn rebuild_items_migration() -> &'static str {
+        let start = V1.find("CREATE TABLE items (").unwrap();
+        let end = V1[start..].find(") STRICT, WITHOUT ROWID;").unwrap() + start;
+        let body = &V1[start + "CREATE TABLE items (".len()..end];
+        let sql = format!(
+            "CREATE TABLE items_new (extra TEXT, {body}) STRICT, WITHOUT ROWID;
+             INSERT INTO items_new SELECT NULL, * FROM items;
+             DROP TABLE items;
+             ALTER TABLE items_new RENAME TO items;
+             CREATE INDEX items_by_parent ON items (drive_id, parent_item_id);
+             CREATE INDEX items_by_sync ON items (sync);
+             CREATE INDEX items_by_dirty ON items (local_dirty) WHERE local_dirty = 1;"
+        );
+        Box::leak(sql.into_boxed_str())
+    }
+
+    /// Third review: a later migration can rebuild `items` (which `hydrated_ranges`
+    /// references) because the runner turns foreign keys off around it, and every key
+    /// still holds afterwards.
+    #[test]
+    fn a_table_rebuild_migration_works_and_keeps_every_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        v1_store_with_an_item(&path);
+
+        let mut conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        let migrations = [
+            Migration {
+                version: 1,
+                sql: V1,
+            },
+            Migration {
+                version: 2,
+                sql: rebuild_items_migration(),
+            },
+        ];
+        migrate(&mut conn, &path, &migrations).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let (extra, size): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT extra, size FROM items WHERE item_id = 'i'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((extra, size), (None, 10));
+        let ranges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hydrated_ranges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ranges, 1);
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        // The cascade still works after the rebuild.
+        conn.execute("UPDATE items SET item_id = 'j' WHERE item_id = 'i'", [])
+            .unwrap();
+        let moved: String = conn
+            .query_row("SELECT item_id FROM hydrated_ranges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moved, "j");
+    }
+
+    /// A migration that leaves a foreign-key violation is rolled back entirely.
+    #[test]
+    fn a_migration_that_breaks_foreign_keys_is_rolled_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        v1_store_with_an_item(&path);
+
+        let mut conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+        let migrations = [
+            Migration {
+                version: 1,
+                sql: V1,
+            },
+            Migration {
+                version: 2,
+                sql: "DELETE FROM items;",
+            },
+        ];
+        let err = migrate(&mut conn, &path, &migrations).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::MigrationForeignKeys {
+                    version: 2,
+                    violations: 1,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        let items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((version, items), (1, 1));
+    }
+
+    /// The store's own connection has foreign keys on after opening, even though they are
+    /// off during migration.
+    #[test]
+    fn foreign_keys_are_on_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("state.db")).unwrap();
+        let fks: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        assert_eq!(fks, 1);
     }
 
     /// ADR-0006 R3: each migration's number is greater than all previous ones, numbering

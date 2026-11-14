@@ -55,7 +55,10 @@ fn adr_0006_r3_migrating_from_version_0_yields_the_current_schema() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(indexes, ["items_by_parent", "items_by_sync"]);
+    assert_eq!(
+        indexes,
+        ["items_by_dirty", "items_by_parent", "items_by_sync"]
+    );
 
     let range_fks: Vec<String> = conn
         .prepare(
@@ -332,6 +335,10 @@ fn expected_schema() -> BTreeMap<String, Columns> {
                 ("local_dirty", "INTEGER", true, 0),
                 ("local_generation", "INTEGER", true, 0),
                 ("remote_changed", "INTEGER", true, 0),
+                ("remote_etag", "TEXT", false, 0),
+                ("remote_ctag", "TEXT", false, 0),
+                ("remote_hash", "TEXT", false, 0),
+                ("remote_size", "INTEGER", false, 0),
             ]),
         ),
         (

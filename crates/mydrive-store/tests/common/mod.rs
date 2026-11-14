@@ -127,6 +127,36 @@ pub fn file(id: &str, parent: Option<&str>, name: &str, size: u64) -> Item {
         local_dirty: false,
         local_generation: 0,
         remote_changed: false,
+        last_remote: None,
+    }
+}
+
+/// A file created locally and not yet uploaded: provisional, dirty (generation 1),
+/// pending upload, no eTag. The only kind of dirty item `insert_item` accepts.
+pub fn provisional(id: &str, parent: Option<&str>, name: &str, size: u64) -> Item {
+    let mut item = file(id, parent, name, size);
+    item.is_provisional = true;
+    item.local_dirty = true;
+    item.local_generation = 1;
+    item.etag = None;
+    item.state.sync = SyncState::PendingUpload;
+    item
+}
+
+/// Sync states a dirty item can be in (never `in-sync` or `pending-download`).
+pub const DIRTY_SYNC_STATES: [SyncState; 5] = [
+    SyncState::PendingUpload,
+    SyncState::Uploading,
+    SyncState::Conflict,
+    SyncState::Error,
+    SyncState::Blocked,
+];
+
+/// Makes a stored clean item dirty through the API and moves it to `sync`.
+pub fn make_dirty(store: &impl Queries, key: &ItemKey, sync: SyncState) {
+    store.mark_local_change(key).unwrap();
+    if sync != SyncState::PendingUpload {
+        store.set_sync(key, SyncState::PendingUpload, sync).unwrap();
     }
 }
 

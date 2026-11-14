@@ -4,13 +4,16 @@
 
 mod common;
 
-use common::{Fixture, ROOT, file, folder, key, mount_id, raw, remote};
+use common::{
+    DIRTY_SYNC_STATES, Fixture, ROOT, file, folder, key, make_dirty, mount_id, provisional, raw,
+    remote,
+};
 use mydrive_core::hash::QuickXorHash;
 use mydrive_core::ids::{DriveId, ItemId, ItemKey, MountId};
 use mydrive_core::state::{Hydration, ItemState, Pin, Sync as SyncState};
 use mydrive_store::{
-    ByteRange, DeleteMode, Item, ItemKind, PendingChanges, Queries, RemoteApplied, RemoteMetadata,
-    Store, StoreError, UploadCompleted,
+    ByteRange, DeleteMode, Item, ItemKind, PendingChanges, Queries, RemoteApplied, RemoteIdentity,
+    RemoteMetadata, Store, StoreError, UploadCompleted,
 };
 
 const REFUSE: PendingChanges = PendingChanges::Refuse;
@@ -42,13 +45,8 @@ fn insert_and_fetch_round_trip_every_column() {
     store.insert_item(&item).unwrap();
     assert_eq!(store.item(&item.key).unwrap(), Some(item.clone()));
 
-    let mut local = file("local-1", Some(ROOT), "new.txt", 0);
-    local.etag = None;
-    local.is_provisional = true;
-    local.local_dirty = true;
+    let mut local = provisional("local-1", Some(ROOT), "new.txt", 0);
     local.local_generation = 3;
-    local.remote_changed = true;
-    local.state.sync = SyncState::PendingUpload;
     store.insert_item(&local).unwrap();
     assert_eq!(store.item(&local.key).unwrap(), Some(local));
     assert_eq!(store.item(&key("absent")).unwrap(), None);
@@ -93,6 +91,13 @@ fn setters_change_only_their_column() {
     // Local content changes mark the item dirty and bump the generation.
     assert_eq!(store.mark_local_change(&item.key).unwrap(), 1);
     assert_eq!(store.set_local_size(&item.key, 20).unwrap(), 2);
+    // The base version's identity (size still 10) was recorded when it became dirty.
+    item.last_remote = Some(RemoteIdentity {
+        etag: item.etag.clone(),
+        ctag: None,
+        hash: None,
+        size: 10,
+    });
     item.size = 20;
     item.local_dirty = true;
     item.local_generation = 2;
@@ -120,10 +125,7 @@ fn local_move_works_on_provisional_items_and_validates_names() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
     store.insert_item(&folder("d", Some(ROOT), "d")).unwrap();
-    let mut tmp = file("tmp", Some(ROOT), "draft.txt", 5);
-    tmp.is_provisional = true;
-    tmp.etag = None;
-    tmp.local_dirty = true;
+    let tmp = provisional("tmp", Some(ROOT), "draft.txt", 5);
     store.insert_item(&tmp).unwrap();
     store
         .move_item_local(&tmp.key, Some(&ItemId::new("d").unwrap()), "final.txt")
@@ -420,11 +422,15 @@ fn hydrated(store: &Store, sync: SyncState, dirty: bool) -> Item {
         sync,
     };
     item.last_error = Some("old".to_owned());
-    item.local_dirty = dirty;
-    item.local_generation = u64::from(dirty);
+    if dirty {
+        item.state.sync = SyncState::InSync;
+    }
     store.insert_item(&item).unwrap();
     store.record_hydrated_range(&item.key, r(0, 80)).unwrap();
-    item
+    if dirty {
+        make_dirty(store, &item.key, sync);
+    }
+    store.item(&item.key).unwrap().unwrap()
 }
 
 /// Second review B1, the reviewer's sequence: in-sync 1000-byte file, the user appends to
@@ -445,9 +451,6 @@ fn review_b1_remote_rename_does_not_shrink_a_locally_grown_file() {
     store.set_local_size(&item.key, 2000).unwrap();
     store
         .record_hydrated_range(&item.key, r(1000, 2000))
-        .unwrap();
-    store
-        .set_sync(&item.key, SyncState::InSync, SyncState::PendingUpload)
         .unwrap();
 
     // A remote rename: same content (same hash), old size, new eTag.
@@ -532,7 +535,7 @@ fn remote_content_change_on_a_clean_item_drops_its_ranges() {
 /// (it survives a reopen) and tells the caller.
 #[test]
 fn remote_content_change_on_a_dirty_item_keeps_everything_and_reports() {
-    for &sync in SyncState::ALL {
+    for sync in DIRTY_SYNC_STATES {
         let fx = Fixture::new();
         let store = fx.open_with_mount();
         store.insert_item(&folder("d", Some(ROOT), "d")).unwrap();
@@ -553,6 +556,7 @@ fn remote_content_change_on_a_dirty_item_keeps_everything_and_reports() {
             name: "moved.txt".to_owned(),
             parent_item_id: Some(ItemId::new("d").unwrap()),
             remote_changed: true,
+            last_remote: Some(update.identity()),
             ..item.clone()
         };
         assert_eq!(stored, expected, "{sync}");
@@ -720,7 +724,9 @@ fn dehydrate_is_atomic_and_refused_for_dirty_or_unsynced_items() {
 
     for &sync in SyncState::ALL {
         for dirty in [false, true] {
-            if sync == SyncState::InSync && !dirty {
+            if (sync == SyncState::InSync && !dirty)
+                || (dirty && !DIRTY_SYNC_STATES.contains(&sync))
+            {
                 continue;
             }
             let fx = Fixture::new();
@@ -755,21 +761,52 @@ fn dirty_items_refuse_clearing_ranges_and_lowering_hydration() {
     assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 80)]);
 }
 
-/// The one explicit way to clear `local_dirty` other than an upload.
+/// Third review F2, the reviewer's sequence: a 100-byte file is truncated to 0 locally
+/// and the change is then discarded. The item must come back as a clean placeholder of
+/// the server's version (100 bytes), never as an empty in-sync file.
 #[test]
-fn discard_local_changes_clears_dirty_ranges_and_state() {
+fn review_f2_discard_restores_the_server_version_not_the_local_size() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let mut item = file("f", Some(ROOT), "f", 100);
+    item.server_hash = hash(1);
+    item.state.hydration = Hydration::Full;
+    store.insert_item(&item).unwrap();
+    store.record_hydrated_range(&item.key, r(0, 100)).unwrap();
+    store.truncate_local(&item.key, 0).unwrap();
+
+    let current = remote(&item);
+    store.discard_local_changes(&item.key, &current).unwrap();
+    let stored = store.item(&item.key).unwrap().unwrap();
+    assert_eq!(stored.size, 100, "the server's size, not the local 0");
+    assert_eq!(stored.server_hash, hash(1));
+    assert_eq!(stored.state.hydration, Hydration::Placeholder);
+    assert_eq!(stored.state.sync, SyncState::InSync);
+    assert!(!stored.local_dirty && !stored.remote_changed && stored.last_remote.is_none());
+    assert!(store.hydrated_ranges(&item.key).unwrap().is_empty());
+    assert!(!store.is_range_hydrated(&item.key, r(0, 1)).unwrap());
+}
+
+/// F2: discard needs metadata for the same item, and is refused on a provisional item
+/// (it has no server version); nothing changes when refused.
+#[test]
+fn discard_refusals_change_nothing() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
     let item = hydrated(&store, SyncState::Conflict, true);
-    store.discard_local_changes(&item.key).unwrap();
-    let stored = store.item(&item.key).unwrap().unwrap();
-    assert!(!stored.local_dirty);
-    assert_eq!(stored.state.hydration, Hydration::Placeholder);
-    assert_eq!(stored.state.sync, SyncState::InSync);
-    assert!(store.hydrated_ranges(&item.key).unwrap().is_empty());
-    store
-        .delete_item(&item.key, DeleteMode::ItemOnly, REFUSE)
-        .unwrap();
+    let mut other = remote(&item);
+    other.key = key("other");
+    let err = store.discard_local_changes(&item.key, &other).unwrap_err();
+    assert!(matches!(err, StoreError::UploadMismatch { .. }), "{err}");
+    assert_eq!(store.item(&item.key).unwrap(), Some(item.clone()));
+
+    let tmp = provisional("tmp", Some(ROOT), "t", 5);
+    store.insert_item(&tmp).unwrap();
+    let err = store
+        .discard_local_changes(&tmp.key, &remote(&tmp))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ProvisionalItem { .. }), "{err}");
+    assert_eq!(store.item(&tmp.key).unwrap(), Some(tmp));
 }
 
 // ------------------------------------------------------------------- uploads
@@ -792,7 +829,7 @@ fn complete_upload_of_the_current_generation_syncs_the_item() {
     let item = hydrated(&store, SyncState::InSync, false);
     let generation = store.mark_local_change(&item.key).unwrap();
     store
-        .set_sync(&item.key, SyncState::InSync, SyncState::Uploading)
+        .set_sync(&item.key, SyncState::PendingUpload, SyncState::Uploading)
         .unwrap();
     let response = upload_response(&item, "etag-up", 5, 100);
 
@@ -820,7 +857,7 @@ fn complete_upload_of_an_older_generation_keeps_the_item_dirty() {
     let item = hydrated(&store, SyncState::InSync, false);
     let first = store.mark_local_change(&item.key).unwrap();
     store
-        .set_sync(&item.key, SyncState::InSync, SyncState::Uploading)
+        .set_sync(&item.key, SyncState::PendingUpload, SyncState::Uploading)
         .unwrap();
     // The user appends while upload 1 is in flight.
     let second = store.set_local_size(&item.key, 150).unwrap();
@@ -870,14 +907,13 @@ fn complete_upload_of_an_older_generation_keeps_the_item_dirty() {
 fn complete_upload_rekeys_a_provisional_item() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    let mut tmp = file("tmp-1", Some(ROOT), "new.txt", 10);
-    tmp.is_provisional = true;
-    tmp.etag = None;
-    tmp.local_dirty = true;
-    tmp.local_generation = 1;
-    tmp.state.sync = SyncState::Uploading;
+    let tmp = provisional("tmp-1", Some(ROOT), "new.txt", 10);
     store.insert_item(&tmp).unwrap();
     store.record_hydrated_range(&tmp.key, r(0, 10)).unwrap();
+    store
+        .set_sync(&tmp.key, SyncState::PendingUpload, SyncState::Uploading)
+        .unwrap();
+    let tmp = store.item(&tmp.key).unwrap().unwrap();
 
     let server_id = ItemId::new("srv-1").unwrap();
     let response = RemoteMetadata {
@@ -909,10 +945,7 @@ fn complete_upload_rekeys_a_provisional_item() {
 fn complete_upload_refuses_when_the_server_item_is_already_stored() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    let mut tmp = file("tmp-1", Some(ROOT), "new.txt", 10);
-    tmp.is_provisional = true;
-    tmp.local_dirty = true;
-    tmp.local_generation = 1;
+    let tmp = provisional("tmp-1", Some(ROOT), "new.txt", 10);
     store.insert_item(&tmp).unwrap();
     store
         .insert_item(&file("srv-1", Some(ROOT), "new.txt", 10))
@@ -939,6 +972,259 @@ fn complete_upload_refuses_when_the_server_item_is_already_stored() {
     assert!(!store.item(&key("srv-1")).unwrap().unwrap().local_dirty);
 }
 
+/// Third review F1, the reviewer's sequence: clean V1, local change, uploading; the
+/// server accepts our V2; then a delta reports V3 from another client; then our V2
+/// upload completes. The item must not end clean and in-sync at V2: our bytes reached the
+/// server (clean), but it is `pending-download` with `remote_changed` kept, and the result
+/// says so. Dehydration stays refused.
+#[test]
+fn review_f1_remote_change_during_an_upload_is_not_forgotten() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let v1 = hydrated(&store, SyncState::InSync, false);
+    let generation = store.mark_local_change(&v1.key).unwrap();
+    store
+        .set_sync(&v1.key, SyncState::PendingUpload, SyncState::Uploading)
+        .unwrap();
+    // The server accepted our V2 (response not yet recorded), then V3 arrives by delta.
+    let v2 = upload_response(&v1, "etag-v2", 2, 100);
+    let v3 = upload_response(&v1, "etag-v3", 3, 120);
+    assert_eq!(
+        store.apply_remote_metadata(&v3).unwrap(),
+        RemoteApplied::ContentChangedUnderLocalState {
+            sync: SyncState::Uploading
+        }
+    );
+
+    assert_eq!(
+        store
+            .complete_upload(&v1.key, generation, hash(2).unwrap(), &v2, None)
+            .unwrap(),
+        UploadCompleted::UploadedButRemoteMovedOn
+    );
+    let stored = store.item(&v1.key).unwrap().unwrap();
+    assert!(!stored.local_dirty, "our bytes reached the server");
+    assert!(stored.remote_changed, "the server has moved on: kept");
+    assert_eq!(stored.state.sync, SyncState::PendingDownload);
+    assert_eq!(stored.etag.as_deref(), Some("etag-v2"));
+    let err = store.dehydrate(&v1.key).unwrap_err();
+    assert!(matches!(err, StoreError::NotInSync { .. }), "{err}");
+
+    // Applying the current metadata (V3) to the now clean item replaces its content.
+    assert_eq!(
+        store.apply_remote_metadata(&v3).unwrap(),
+        RemoteApplied::ContentReplaced { ranges_cleared: 1 }
+    );
+    let stored = store.item(&v1.key).unwrap().unwrap();
+    assert!(!stored.remote_changed);
+    assert_eq!((stored.size, stored.server_hash), (120, hash(3)));
+}
+
+/// F1: when the delta seen during the upload is our own upload echoing back, completion
+/// is `Synced` as usual.
+#[test]
+fn delta_echo_of_our_own_upload_still_syncs() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let v1 = hydrated(&store, SyncState::InSync, false);
+    let generation = store.mark_local_change(&v1.key).unwrap();
+    let v2 = upload_response(&v1, "etag-v2", 2, 100);
+    // The delta reports V2 (ours) before the upload response is recorded.
+    store.apply_remote_metadata(&v2).unwrap();
+    assert!(store.item(&v1.key).unwrap().unwrap().remote_changed);
+
+    assert_eq!(
+        store
+            .complete_upload(&v1.key, generation, hash(2).unwrap(), &v2, None)
+            .unwrap(),
+        UploadCompleted::Synced
+    );
+    let stored = store.item(&v1.key).unwrap().unwrap();
+    assert!(!stored.local_dirty && !stored.remote_changed);
+    assert_eq!(stored.state.sync, SyncState::InSync);
+}
+
+/// Third review F4: a replayed completion on a clean item is refused and changes nothing,
+/// so it cannot overwrite newer server identity.
+#[test]
+fn review_f4_replayed_completion_is_refused() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let item = hydrated(&store, SyncState::InSync, false);
+    let generation = store.mark_local_change(&item.key).unwrap();
+    let v2 = upload_response(&item, "etag-v2", 2, 100);
+    store
+        .complete_upload(&item.key, generation, hash(2).unwrap(), &v2, None)
+        .unwrap();
+    // A newer version arrives, then the old completion is replayed.
+    let v3 = upload_response(&item, "etag-v3", 3, 100);
+    store.apply_remote_metadata(&v3).unwrap();
+    let before = store.item(&item.key).unwrap();
+    let err = store
+        .complete_upload(&item.key, generation, hash(2).unwrap(), &v2, None)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotDirty { .. }), "{err}");
+    assert_eq!(store.item(&item.key).unwrap(), before);
+}
+
+/// Third review F3, the reviewer's sequence: the mark commits and the process dies before
+/// any `set_sync`. Recovery must still find the item: the mark itself moved it to
+/// `pending-upload`, and `dirty_items` lists it whatever its sync state.
+#[test]
+fn review_f3_a_marked_item_is_found_by_recovery() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    for (id, sync) in [
+        ("a", SyncState::InSync),
+        ("b", SyncState::PendingDownload),
+        ("c", SyncState::Blocked),
+        ("d", SyncState::Error),
+    ] {
+        let mut f = file(id, Some(ROOT), id, 10);
+        f.state.sync = sync;
+        store.insert_item(&f).unwrap();
+        store.mark_local_change(&f.key).unwrap();
+    }
+    drop(store);
+    let store = fx.open();
+    let pending: Vec<String> = store
+        .items_with_sync(SyncState::PendingUpload)
+        .unwrap()
+        .into_iter()
+        .map(|i| i.key.item_id.to_string())
+        .collect();
+    assert_eq!(
+        pending,
+        ["a", "b"],
+        "in-sync and pending-download became pending-upload"
+    );
+    let dirty: Vec<(String, SyncState)> = store
+        .dirty_items()
+        .unwrap()
+        .into_iter()
+        .map(|i| (i.key.item_id.to_string(), i.state.sync))
+        .collect();
+    assert_eq!(
+        dirty,
+        [
+            ("a".to_owned(), SyncState::PendingUpload),
+            ("b".to_owned(), SyncState::PendingUpload),
+            ("c".to_owned(), SyncState::Blocked),
+            ("d".to_owned(), SyncState::Error),
+        ]
+    );
+}
+
+/// F3: a dirty item can never be set `in-sync` or `pending-download`, through the API or
+/// by SQL.
+#[test]
+fn a_dirty_item_cannot_be_marked_in_sync() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let item = hydrated(&store, SyncState::PendingUpload, true);
+    for target in [SyncState::InSync, SyncState::PendingDownload] {
+        let err = store
+            .set_sync(&item.key, SyncState::PendingUpload, target)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::LocalChanges { .. }), "{err}");
+    }
+    assert_eq!(store.item(&item.key).unwrap(), Some(item));
+    drop(store);
+    let refused =
+        raw(&fx.path()).execute("UPDATE items SET sync = 'in-sync' WHERE item_id = 'f'", []);
+    assert!(refused.is_err(), "the schema CHECK refuses it too");
+}
+
+/// F3: `dirty_items` is backed by the partial index on the dirty flag.
+#[test]
+fn dirty_items_uses_the_dirty_index() {
+    let fx = Fixture::new();
+    drop(fx.open());
+    let plan: Vec<String> = raw(&fx.path())
+        .prepare("EXPLAIN QUERY PLAN SELECT * FROM items WHERE local_dirty = 1")
+        .unwrap()
+        .query_map([], |r| r.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|step| step.contains("items_by_dirty")),
+        "{plan:?}"
+    );
+}
+
+/// Third review F6: provisional implies dirty, in the insert path and in the schema.
+#[test]
+fn review_f6_provisional_implies_dirty() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    for bad in [
+        Item {
+            local_dirty: false,
+            ..provisional("p1", Some(ROOT), "p", 1)
+        },
+        Item {
+            state: ItemState {
+                sync: SyncState::InSync,
+                ..provisional("p2", Some(ROOT), "p", 1).state
+            },
+            ..provisional("p2", Some(ROOT), "p", 1)
+        },
+        Item {
+            local_dirty: true,
+            ..file("p3", Some(ROOT), "p", 1)
+        },
+    ] {
+        let err = store.insert_item(&bad).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidItem { .. }), "{err}");
+        assert_eq!(store.item(&bad.key).unwrap(), None);
+    }
+    store
+        .insert_item(&provisional("ok", Some(ROOT), "p", 1))
+        .unwrap();
+    drop(store);
+    let refused = raw(&fx.path()).execute(
+        "UPDATE items SET local_dirty = 0, sync = 'uploading' WHERE item_id = 'ok'",
+        [],
+    );
+    assert!(
+        refused.is_err(),
+        "the schema CHECK refuses a clean provisional item"
+    );
+}
+
+/// Third review F9: on the hash path the size is compared too, for a clean item and for
+/// the identity recorded on a dirty one.
+#[test]
+fn review_f9_the_hash_path_compares_size() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let item = hydrated(&store, SyncState::InSync, false);
+    let mut same_hash_other_size = remote(&item);
+    same_hash_other_size.size = 90;
+    assert_eq!(
+        store.apply_remote_metadata(&same_hash_other_size).unwrap(),
+        RemoteApplied::ContentReplaced { ranges_cleared: 1 }
+    );
+
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let item = hydrated(&store, SyncState::PendingUpload, true);
+    let mut report = remote(&item);
+    report.size = 100; // the base version's size, though the local size may differ
+    assert_eq!(
+        store.apply_remote_metadata(&report).unwrap(),
+        RemoteApplied::ContentUnchanged
+    );
+    report.size = 90;
+    assert_eq!(
+        store.apply_remote_metadata(&report).unwrap(),
+        RemoteApplied::ContentChangedUnderLocalState {
+            sync: SyncState::PendingUpload
+        }
+    );
+}
+
 // ------------------------------------------------------------------ re-keying
 
 /// Lead ruling on provisional items: re-keying moves the item, its children's parent
@@ -947,12 +1233,11 @@ fn complete_upload_refuses_when_the_server_item_is_already_stored() {
 fn rekey_moves_item_children_and_ranges() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    let mut dir = folder("tmp-1", Some(ROOT), "new folder");
-    dir.is_provisional = true;
-    dir.etag = None;
+    let mut dir = provisional("tmp-1", Some(ROOT), "new folder", 0);
+    dir.kind = ItemKind::Folder;
+    dir.state.hydration = Hydration::Full;
     store.insert_item(&dir).unwrap();
-    let mut child = file("tmp-2", Some("tmp-1"), "a.txt", 10);
-    child.is_provisional = true;
+    let child = provisional("tmp-2", Some("tmp-1"), "a.txt", 10);
     store.insert_item(&child).unwrap();
     store.record_hydrated_range(&child.key, r(0, 10)).unwrap();
 
@@ -987,8 +1272,7 @@ fn rekey_moves_item_children_and_ranges() {
 fn rekey_refusals_change_nothing() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    let mut tmp = file("tmp", Some(ROOT), "t", 10);
-    tmp.is_provisional = true;
+    let tmp = provisional("tmp", Some(ROOT), "t", 10);
     store.insert_item(&tmp).unwrap();
     store
         .insert_item(&file("taken", Some(ROOT), "x", 1))
@@ -1234,14 +1518,8 @@ fn delete_refuses_items_with_pending_local_changes() {
         .unwrap();
     store.record_hydrated_range(&key("plan"), r(0, 10)).unwrap();
     // Second review B2: dirty items in `error` and `blocked` must be protected too.
-    store.mark_local_change(&key("plan")).unwrap();
-    store
-        .set_sync(&key("plan"), SyncState::InSync, SyncState::Error)
-        .unwrap();
-    store.mark_local_change(&key("c1")).unwrap();
-    store
-        .set_sync(&key("c1"), SyncState::InSync, SyncState::Blocked)
-        .unwrap();
+    make_dirty(&store, &key("plan"), SyncState::Error);
+    make_dirty(&store, &key("c1"), SyncState::Blocked);
     let before = row_snapshot(&fx);
 
     let err = store
@@ -1255,15 +1533,11 @@ fn delete_refuses_items_with_pending_local_changes() {
     }
     assert!(err.to_string().contains("plan") && err.to_string().contains("c1"));
 
-    for &sync in SyncState::ALL {
+    for sync in DIRTY_SYNC_STATES {
         store
-            .insert_item(&{
-                let mut f = file("single", Some(ROOT), "s", 1);
-                f.state.sync = sync;
-                f.local_dirty = true;
-                f
-            })
+            .insert_item(&file("single", Some(ROOT), "s", 1))
             .unwrap();
+        make_dirty(&store, &key("single"), sync);
         let err = store
             .delete_item(&key("single"), DeleteMode::ItemOnly, REFUSE)
             .unwrap_err();
@@ -1275,7 +1549,9 @@ fn delete_refuses_items_with_pending_local_changes() {
             .delete_item(
                 &key("single"),
                 DeleteMode::ItemOnly,
-                PendingChanges::ServerConfirmedLocalDelete,
+                PendingChanges::ServerConfirmedLocalDelete {
+                    expected_generation: 1,
+                },
             )
             .unwrap();
     }
@@ -1283,26 +1559,121 @@ fn delete_refuses_items_with_pending_local_changes() {
     assert_eq!(store.hydrated_ranges(&key("plan")).unwrap(), [r(0, 10)]);
 }
 
-/// The explicit opt-in deletes a subtree with pending local changes.
+/// The explicit opt-in deletes the named dirty item, with its ranges.
 #[test]
-fn server_confirmed_local_delete_removes_pending_items() {
+fn server_confirmed_local_delete_removes_the_named_item() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
     tree(&store);
-    store.mark_local_change(&key("plan")).unwrap();
+    let generation = store.mark_local_change(&key("plan")).unwrap();
     store.record_hydrated_range(&key("plan"), r(0, 10)).unwrap();
     assert_eq!(
         store
             .delete_item(
-                &key("docs"),
-                DeleteMode::Recursive,
-                PendingChanges::ServerConfirmedLocalDelete
+                &key("plan"),
+                DeleteMode::ItemOnly,
+                PendingChanges::ServerConfirmedLocalDelete {
+                    expected_generation: generation
+                }
             )
             .unwrap(),
-        3
+        1
     );
     assert_eq!(store.item(&key("plan")).unwrap(), None);
     assert_eq!(range_rows(&fx), 0);
+}
+
+/// Third review F5, the reviewer's sequence: the user deletes folder `docs` locally;
+/// meanwhile another client moves a file into it, and that file is dirty here. The server
+/// confirms the folder delete. A recursive confirmed delete must not take the dirty
+/// newcomer with it: it is refused and named, and nothing changes. A confirmation whose
+/// generation is stale is refused too.
+#[test]
+fn review_f5_confirmed_delete_exempts_only_the_named_item() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    tree(&store);
+    // The user's local delete of `docs` is the dirty change being confirmed.
+    let generation = store.mark_local_change(&key("docs")).unwrap();
+    // A file another client moved into `docs/work`, with local edits not yet uploaded.
+    store
+        .insert_item(&file("moved-in", Some("work"), "theirs.txt", 10))
+        .unwrap();
+    store
+        .record_hydrated_range(&key("moved-in"), r(0, 10))
+        .unwrap();
+    store.mark_local_change(&key("moved-in")).unwrap();
+    let before = row_snapshot(&fx);
+
+    let confirmed = PendingChanges::ServerConfirmedLocalDelete {
+        expected_generation: generation,
+    };
+    let err = store
+        .delete_item(&key("docs"), DeleteMode::Recursive, confirmed)
+        .unwrap_err();
+    assert!(
+        matches!(&err, StoreError::HasPendingLocalChanges { pending, .. } if pending == &[key("moved-in")]),
+        "{err}"
+    );
+    assert_eq!(row_snapshot(&fx), before);
+    assert_eq!(store.hydrated_ranges(&key("moved-in")).unwrap(), [r(0, 10)]);
+
+    let stale = PendingChanges::ServerConfirmedLocalDelete {
+        expected_generation: generation + 1,
+    };
+    let err = store
+        .delete_item(&key("docs"), DeleteMode::Recursive, stale)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::GenerationMismatch { .. }),
+        "{err}"
+    );
+    assert_eq!(row_snapshot(&fx), before);
+}
+
+/// F2/F6: a never-uploaded item is removed with its own explicitly named mode, which
+/// refuses an item the server knows, and a confirmed server delete refuses a provisional
+/// item.
+#[test]
+fn never_uploaded_items_have_their_own_delete_mode() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let tmp = provisional("tmp", Some(ROOT), "t", 5);
+    store.insert_item(&tmp).unwrap();
+    store.insert_item(&file("srv", Some(ROOT), "s", 5)).unwrap();
+
+    let err = store
+        .delete_item(
+            &tmp.key,
+            DeleteMode::ItemOnly,
+            PendingChanges::ServerConfirmedLocalDelete {
+                expected_generation: 1,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ProvisionalItem { .. }), "{err}");
+    let err = store
+        .delete_item(
+            &key("srv"),
+            DeleteMode::ItemOnly,
+            PendingChanges::DiscardNeverUploaded {
+                expected_generation: 0,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotProvisional { .. }), "{err}");
+    assert_eq!(
+        store
+            .delete_item(
+                &tmp.key,
+                DeleteMode::ItemOnly,
+                PendingChanges::DiscardNeverUploaded {
+                    expected_generation: 1
+                },
+            )
+            .unwrap(),
+        1
+    );
 }
 
 /// A clean item is deletable whatever its sync state: the guard keys on `local_dirty`.
@@ -1336,7 +1707,12 @@ fn delete_refuses_a_mount_root() {
         ("work", DeleteMode::Recursive),
         ("docs", DeleteMode::Recursive),
     ] {
-        for pending in [REFUSE, PendingChanges::ServerConfirmedLocalDelete] {
+        for pending in [
+            REFUSE,
+            PendingChanges::ServerConfirmedLocalDelete {
+                expected_generation: 0,
+            },
+        ] {
             let err = store.delete_item(&key(target), mode, pending).unwrap_err();
             assert!(
                 matches!(err, StoreError::MountRoot { .. }),

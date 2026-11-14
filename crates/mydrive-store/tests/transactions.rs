@@ -309,6 +309,15 @@ fn killed_during_a_local_change_and_upload_never_loses_the_dirty_mark() {
         if point == "after-complete" {
             assert_eq!(item.local_hash, Some(hash(9)));
         }
+        // The restart-recovery listing finds the item exactly when it is dirty (F3).
+        let recovered: Vec<_> = store
+            .dirty_items()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        let want: &[mydrive_core::ids::ItemKey] = if item.local_dirty { &[key("f")] } else { &[] };
+        assert_eq!(recovered, want, "{point}");
         assert_ranges_merged_and_in_bounds(&store);
     }
 }
@@ -329,9 +338,8 @@ fn upload_crash_child(db: &Path, point: &str) -> ! {
     let k = key("f");
 
     let tx = store.transaction().unwrap();
+    // The mark itself moves the item to pending-upload (F3); no separate set_sync.
     tx.mark_local_change(&k).unwrap();
-    tx.set_sync(&k, SyncState::InSync, SyncState::PendingUpload)
-        .unwrap();
     kill_at("mid-mark");
     tx.commit().unwrap();
     kill_at("after-mark");

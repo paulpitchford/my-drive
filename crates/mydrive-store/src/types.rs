@@ -170,6 +170,56 @@ pub struct Item {
     /// columns were deliberately not updated: they still describe the version the local
     /// change was based on. Survives a restart, so conflict handling is not forgotten.
     pub remote_changed: bool,
+    /// While the item is dirty: the last content identity the server reported for it.
+    /// When the item first becomes dirty this is the identity of the version the local
+    /// change is based on; each remote report on the dirty item then replaces it.
+    /// `None` for a clean item.
+    pub last_remote: Option<RemoteIdentity>,
+}
+
+/// What identifies one version of a file's content on the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteIdentity {
+    /// The eTag of that version.
+    pub etag: Option<String>,
+    /// The cTag of that version, if the server sent one.
+    pub ctag: Option<String>,
+    /// The quickXorHash of that version, if the server sent one.
+    pub hash: Option<QuickXorHash>,
+    /// The size of that version in bytes.
+    pub size: u64,
+}
+
+impl RemoteIdentity {
+    /// Whether `self` and `other` name the same content: the hashes and sizes are equal
+    /// when either side has a hash; otherwise the cTags and sizes when both have a cTag
+    /// (a rename changes the eTag but not the cTag); otherwise the eTags and sizes.
+    #[must_use]
+    pub fn same_content(&self, other: &Self) -> bool {
+        if self.size != other.size {
+            return false;
+        }
+        if self.hash.is_some() || other.hash.is_some() {
+            return self.hash == other.hash;
+        }
+        match (&self.ctag, &other.ctag) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.etag == other.etag,
+        }
+    }
+}
+
+impl RemoteMetadata {
+    /// The content identity this report describes.
+    #[must_use]
+    pub fn identity(&self) -> RemoteIdentity {
+        RemoteIdentity {
+            etag: self.etag.clone(),
+            ctag: self.ctag.clone(),
+            hash: self.server_hash,
+            size: self.size,
+        }
+    }
 }
 
 /// The server-owned part of an item, as a delta or an upload response reports it.
@@ -227,8 +277,14 @@ pub enum RemoteApplied {
 /// What [`complete_upload`](crate::Queries::complete_upload) did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadCompleted {
-    /// The uploaded version is still the local version: the item is clean and `in-sync`.
+    /// The uploaded version is still the local version and the server has nothing newer:
+    /// the item is clean and `in-sync`.
     Synced,
+    /// The uploaded version is still the local version, so the item is clean, but the
+    /// server reported a different version after our upload (another client changed it).
+    /// The item is `pending-download` with `remote_changed` kept: the engine fetches the
+    /// current metadata and applies it.
+    UploadedButRemoteMovedOn,
     /// The item changed locally after the upload started. The server columns and hashes
     /// now describe the uploaded version (so the next upload's `If-Match` is right), but
     /// the item stays dirty and `pending-upload`.
@@ -244,9 +300,20 @@ pub enum UploadCompleted {
 pub enum PendingChanges {
     /// Refuse if the item, or any descendant, is dirty (`local_dirty`).
     Refuse,
-    /// The server has confirmed a delete the user made locally, so the pending state is
-    /// that delete and removing the rows loses nothing.
-    ServerConfirmedLocalDelete,
+    /// The server has confirmed a delete the user made locally of the named item. Only
+    /// that item is exempt, and only if its `local_generation` still equals
+    /// `expected_generation`; any other dirty item in a recursive delete is still refused.
+    ServerConfirmedLocalDelete {
+        /// The named item's generation when the user deleted it.
+        expected_generation: u64,
+    },
+    /// The named item was created locally and never uploaded (it is provisional), and the
+    /// user deleted it. Only that item is exempt, with the same generation check; any
+    /// other dirty item in a recursive delete is still refused.
+    DiscardNeverUploaded {
+        /// The named item's generation when the user deleted it.
+        expected_generation: u64,
+    },
 }
 
 /// A half-open byte range `[start, end)` within a file.

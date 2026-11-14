@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{SqlContext, StoreError};
 use crate::types::{
     Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, PendingChanges,
-    RemoteApplied, RemoteMetadata, Timestamp, UploadCompleted,
+    RemoteApplied, RemoteIdentity, RemoteMetadata, Timestamp, UploadCompleted,
 };
 
 pub(crate) mod sealed {
@@ -42,6 +42,12 @@ pub(crate) mod sealed {
 }
 
 const ITEM_COLUMNS: &str = "drive_id, item_id, parent_item_id, name, kind, size, created_at, \
+     modified_at, etag, ctag, server_hash, local_hash, hydration, pin, sync, last_error, \
+     is_provisional, local_dirty, local_generation, remote_changed, remote_etag, remote_ctag, \
+     remote_hash, remote_size";
+
+/// The columns `insert_item` writes; the `remote_*` columns start `NULL`.
+const INSERT_COLUMNS: &str = "drive_id, item_id, parent_item_id, name, kind, size, created_at, \
      modified_at, etag, ctag, server_hash, local_hash, hydration, pin, sync, last_error, \
      is_provisional, local_dirty, local_generation, remote_changed";
 
@@ -270,10 +276,15 @@ pub trait Queries: sealed::Connected {
 
     /// Sets the sync state to `new` if it is currently `expected` (compare-and-set).
     ///
+    /// A dirty item cannot be set `in-sync` or `pending-download`: only
+    /// [`complete_upload`](Self::complete_upload) or
+    /// [`discard_local_changes`](Self::discard_local_changes) end a local change.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`], and [`StoreError::SyncMismatch`] with the stored
-    /// value if it is not `expected`; nothing changes.
+    /// [`StoreError::ItemNotFound`], [`StoreError::LocalChanges`] as above, and
+    /// [`StoreError::SyncMismatch`] with the stored value if it is not `expected`;
+    /// nothing changes.
     fn set_sync(
         &self,
         key: &ItemKey,
@@ -282,6 +293,14 @@ pub trait Queries: sealed::Connected {
     ) -> Result<(), StoreError> {
         run(self, |c| {
             atomic(c, |c| {
+                let item = load_item(c, key, "set the sync state")?;
+                if item.local_dirty && matches!(new, SyncState::InSync | SyncState::PendingDownload)
+                {
+                    return Err(StoreError::LocalChanges {
+                        action: "set in sync or pending download",
+                        key: key.clone(),
+                    });
+                }
                 let changed = c
                     .execute(
                         "UPDATE items SET sync = ?4 \
@@ -343,8 +362,12 @@ pub trait Queries: sealed::Connected {
 
     /// Records, durably, that a local change to the item's content is about to be made:
     /// sets `local_dirty` and bumps `local_generation`, returning the new generation. Call
-    /// it, and commit, before the change touches the backing file (ADR-0012 R3). The sync
-    /// state is not changed here; the engine sets it in the same transaction.
+    /// it, and commit, before the change touches the backing file (ADR-0012 R3). An item
+    /// that was `in-sync` or `pending-download` becomes `pending-upload` in the same
+    /// statement, so a dirty item is never `in-sync` and restart recovery always finds it.
+    /// On the clean-to-dirty transition the base version's identity is recorded as the
+    /// last remote identity. The engine must hydrate a placeholder before extending it
+    /// (ADR-0012 R1); the store does not see the bytes.
     ///
     /// # Errors
     ///
@@ -405,21 +428,28 @@ pub trait Queries: sealed::Connected {
 
     /// Records a finished upload, in one operation:
     ///
-    /// 1. A provisional item takes the server's ID (`new_item_id`), as
+    /// 1. Only a dirty item can complete an upload; a replayed completion is refused.
+    /// 2. A provisional item takes the server's ID (`new_item_id`), as
     ///    [`rekey_item`](Self::rekey_item).
-    /// 2. `uploaded_local_hash` becomes `local_hash`, and the server's eTag, cTag, hash,
-    ///    parent and name from `response` are written; `remote_changed` is cleared.
-    /// 3. If `local_generation` still equals `expected_generation` (the generation that was
-    ///    uploaded), the size and timestamps are written too, ranges are trimmed to the
-    ///    server size, and the item becomes clean and `in-sync`:
-    ///    [`UploadCompleted::Synced`].
-    /// 4. Otherwise the item changed locally while uploading: size, timestamps and ranges
+    /// 3. `uploaded_local_hash` becomes `local_hash`, and the server's eTag, cTag, hash,
+    ///    parent and name from `response` are written.
+    /// 4. The server has "moved on" if a remote report seen while dirty
+    ///    (`remote_changed`) names different content from `response`; if it names the
+    ///    same content, that report was our own upload echoing back.
+    /// 5. If `local_generation` still equals `expected_generation`, our current bytes are
+    ///    on the server: the size and timestamps are written, ranges trimmed to the server
+    ///    size, and the item becomes clean. It is `in-sync` ([`UploadCompleted::Synced`]),
+    ///    or, if the server moved on, `pending-download` with `remote_changed` kept
+    ///    ([`UploadCompleted::UploadedButRemoteMovedOn`]).
+    /// 6. Otherwise the item changed locally while uploading: size, timestamps and ranges
     ///    keep describing the local content, and the item stays dirty and
-    ///    `pending-upload`: [`UploadCompleted::LocalChangedSince`].
+    ///    `pending-upload` ([`UploadCompleted::LocalChangedSince`]), with `remote_changed`
+    ///    kept if the server moved on.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`]; [`StoreError::UploadMismatch`] if a provisional item
+    /// [`StoreError::ItemNotFound`]; [`StoreError::NotDirty`] for an item with no local
+    /// changes; [`StoreError::UploadMismatch`] if a provisional item
     /// gets no server ID, a non-provisional one gets a different one, or `response`
     /// names another item; [`StoreError::ItemExists`] if the server ID is already stored
     /// (see "Recovery" in `docs/architecture/store-schema.md`); [`StoreError::InvalidName`],
@@ -446,36 +476,51 @@ pub trait Queries: sealed::Connected {
         })
     }
 
-    /// Throws away the item's unsynced local content, explicitly: clears `local_dirty`,
-    /// the hydrated ranges and sets hydration to `placeholder` (`full` for a folder) and
-    /// sync to `in-sync`. `remote_changed` is kept, so stale server columns stay flagged
-    /// until fresh metadata is applied. The caller must also discard the bytes.
+    /// Throws away the item's unsynced local content, explicitly, and makes it a clean
+    /// placeholder of the server's current version, in one operation: `current` is that
+    /// version's metadata, written as for a clean item (size, timestamps, eTag, cTag,
+    /// server hash); `local_dirty`, `remote_changed` and the recorded remote identity are
+    /// cleared, the ranges cleared, hydration set to `placeholder` (`full` for a folder)
+    /// and sync to `in-sync`. There is no way to discard without the server's metadata, so
+    /// a local size can never be left on a placeholder. The caller must also discard the
+    /// bytes. A provisional item has no server version; delete it with
+    /// [`PendingChanges::DiscardNeverUploaded`] instead.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`].
-    fn discard_local_changes(&self, key: &ItemKey) -> Result<(), StoreError> {
+    /// [`StoreError::ItemNotFound`], [`StoreError::ProvisionalItem`],
+    /// [`StoreError::UploadMismatch`] if `current` describes another item,
+    /// [`StoreError::InvalidName`], [`StoreError::FolderHasChildren`],
+    /// [`StoreError::SizeTooLarge`]. A refusal changes nothing.
+    fn discard_local_changes(
+        &self,
+        key: &ItemKey,
+        current: &RemoteMetadata,
+    ) -> Result<(), StoreError> {
         run(self, |c| {
-            atomic(c, |c| {
-                let item = load_item(c, key, "discard local changes")?;
-                clear_ranges(c, key)?;
-                let hydration = match item.kind {
-                    ItemKind::File => Hydration::Placeholder,
-                    ItemKind::Folder => Hydration::Full,
-                };
-                c.execute(
-                    "UPDATE items SET local_dirty = 0, hydration = ?3, sync = ?4 \
-                     WHERE drive_id = ?1 AND item_id = ?2",
-                    params![
-                        key.drive_id.as_str(),
-                        key.item_id.as_str(),
-                        hydration.as_str(),
-                        SyncState::InSync.as_str()
-                    ],
-                )
-                .ctx(|| describe("discard the local changes of", key))?;
-                Ok(())
-            })
+            atomic(c, |c| discard_local_changes(c, key, current))
+        })
+    }
+
+    /// Every dirty item, in any drive and whatever its sync state, ordered by key. This is
+    /// the restart-recovery listing: a blocked or errored mount cannot hide a dirty item
+    /// from it. Backed by the partial index `items_by_dirty`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if a row is
+    /// invalid.
+    fn dirty_items(&self) -> Result<Vec<Item>, StoreError> {
+        run(self, |c| {
+            query_items(
+                c,
+                &format!(
+                    "SELECT {ITEM_COLUMNS} FROM items WHERE local_dirty = 1 \
+                     ORDER BY drive_id, item_id"
+                ),
+                &[],
+                || "list dirty items",
+            )
         })
     }
 
@@ -594,15 +639,21 @@ pub trait Queries: sealed::Connected {
     ///
     /// With [`PendingChanges::Refuse`], a delete that would remove any dirty item
     /// (`local_dirty`), whatever its sync state, is refused, naming every such item.
-    /// [`PendingChanges::ServerConfirmedLocalDelete`] is only for the case where the server
-    /// confirmed a delete the user made locally. A delete that would remove a mount's root
-    /// item is always refused. Deleting rows never touches a backing directory.
+    /// [`PendingChanges::ServerConfirmedLocalDelete`] (the server confirmed a delete the
+    /// user made locally) and [`PendingChanges::DiscardNeverUploaded`] (a provisional item
+    /// the user deleted) exempt only the named item, and only if its generation still
+    /// matches; any other dirty item in the delete is still refused and named. A delete
+    /// that would remove a mount's root item is always refused. Deleting rows never touches
+    /// a backing directory.
     ///
     /// # Errors
     ///
     /// [`StoreError::ItemNotFound`], [`StoreError::HasChildren`] for a non-recursive
     /// delete of an item with children, [`StoreError::MountRoot`],
-    /// [`StoreError::HasPendingLocalChanges`]. A refused delete changes nothing.
+    /// [`StoreError::HasPendingLocalChanges`], [`StoreError::GenerationMismatch`],
+    /// [`StoreError::ProvisionalItem`] (a confirmed server delete of an item the server
+    /// never had), [`StoreError::NotProvisional`] (`DiscardNeverUploaded` on an item the
+    /// server knows). A refused delete changes nothing.
     fn delete_item(
         &self,
         key: &ItemKey,
@@ -889,6 +940,27 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
     let key = &item.key;
     check_name(key, &item.name)?;
     let size = to_i64_checked(item.size, key)?;
+    let invalid = |reason| StoreError::InvalidItem {
+        key: key.clone(),
+        reason,
+    };
+    // A new item is either known to the server and clean, or created locally: then it is
+    // provisional, dirty and pending upload (F6). A dirty item has no in-sync state (F3).
+    if item.is_provisional && !(item.local_dirty && item.state.sync == SyncState::PendingUpload) {
+        return Err(invalid(
+            "a provisional item must be inserted dirty and pending-upload",
+        ));
+    }
+    if item.local_dirty && !item.is_provisional {
+        return Err(invalid(
+            "only a provisional item can be inserted dirty; mark local changes instead",
+        ));
+    }
+    if item.remote_changed || item.last_remote.is_some() {
+        return Err(invalid(
+            "a new item has no remote change or remote identity recorded",
+        ));
+    }
     if item_exists(c, key)? {
         return Err(StoreError::ItemExists {
             action: "insert an item",
@@ -897,7 +969,7 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
     }
     c.execute(
         &format!(
-            "INSERT INTO items ({ITEM_COLUMNS}) VALUES \
+            "INSERT INTO items ({INSERT_COLUMNS}) VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
               ?18, ?19, ?20)"
         ),
@@ -936,29 +1008,41 @@ fn generation_to_i64(generation: u64, key: &ItemKey) -> Result<i64, StoreError> 
     })
 }
 
-/// Whether the server's content differs from the version the stored server columns
-/// describe.
-fn content_changed(old: &Item, new: &RemoteMetadata) -> bool {
-    if old.kind != new.kind {
-        return true;
-    }
-    if old.kind == ItemKind::Folder {
-        return false;
-    }
-    match (&old.server_hash, &new.server_hash) {
-        // A rename changes the eTag but not the cTag, so prefer the cTag.
-        (None, None) => match (&old.ctag, &new.ctag) {
-            (Some(a), Some(b)) => a != b || old.size != new.size,
-            _ => old.etag != new.etag || old.size != new.size,
-        },
-        (old_hash, new_hash) => old_hash != new_hash,
+/// The content identity the stored server columns of `item` describe. Meaningful as the
+/// server version only while the item is clean; while dirty, `size` is the local size and
+/// `last_remote` is used instead.
+fn base_identity(item: &Item) -> RemoteIdentity {
+    RemoteIdentity {
+        etag: item.etag.clone(),
+        ctag: item.ctag.clone(),
+        hash: item.server_hash,
+        size: item.size,
     }
 }
 
+/// Whether a report names different content from `known` (the version the store last
+/// knew of). A kind change always counts; folders have no content identity.
+fn content_changed(old: &Item, known: &RemoteIdentity, new: &RemoteMetadata) -> bool {
+    if old.kind != new.kind {
+        return true;
+    }
+    old.kind == ItemKind::File && !known.same_content(&new.identity())
+}
+
 fn mark_local_change(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
+    // On the clean -> dirty transition the base version's identity (server columns and the
+    // size, which is still the server's) is recorded as the last remote identity, and an
+    // `in-sync` or `pending-download` item becomes `pending-upload`, so a restart finds it
+    // whatever happens next (F3). Every right-hand side reads the row as it was.
     let generation: Option<i64> = c
         .query_row(
-            "UPDATE items SET local_dirty = 1, local_generation = local_generation + 1 \
+            "UPDATE items SET local_dirty = 1, local_generation = local_generation + 1, \
+             sync = CASE WHEN sync IN ('in-sync', 'pending-download') \
+                    THEN 'pending-upload' ELSE sync END, \
+             remote_etag = CASE WHEN local_dirty = 0 THEN etag ELSE remote_etag END, \
+             remote_ctag = CASE WHEN local_dirty = 0 THEN ctag ELSE remote_ctag END, \
+             remote_hash = CASE WHEN local_dirty = 0 THEN server_hash ELSE remote_hash END, \
+             remote_size = CASE WHEN local_dirty = 0 THEN size ELSE remote_size END \
              WHERE drive_id = ?1 AND item_id = ?2 RETURNING local_generation",
             [key.drive_id.as_str(), key.item_id.as_str()],
             |row| row.get(0),
@@ -1007,6 +1091,10 @@ fn complete_upload(
     new_item_id: Option<&ItemId>,
 ) -> Result<UploadCompleted, StoreError> {
     let item = load_item(c, key, "complete an upload")?;
+    if !item.local_dirty {
+        // A replayed completion would overwrite newer server identity (F4).
+        return Err(StoreError::NotDirty { key: key.clone() });
+    }
     let mismatch = |reason: &str| StoreError::UploadMismatch {
         key: key.clone(),
         reason: reason.to_owned(),
@@ -1034,11 +1122,69 @@ fn complete_upload(
     check_name(&final_key, &response.name)?;
     let size = to_i64_checked(response.size, &final_key)?;
     let ids = [final_key.drive_id.as_str(), final_key.item_id.as_str()];
-    // The uploaded version's identity, written in both cases so the next upload's
-    // If-Match carries the right eTag.
+
+    // F1: a remote report seen while dirty that is not our own upload echoing back means
+    // another client changed the file after our upload was accepted.
+    let uploaded = response.identity();
+    let moved_on = item.remote_changed
+        && item
+            .last_remote
+            .as_ref()
+            .is_none_or(|seen| !seen.same_content(&uploaded));
+
+    if item.local_generation != expected_generation {
+        // Still dirty: the uploaded version becomes the base (its eTag is the next
+        // If-Match), and size, timestamps and ranges keep describing the local content.
+        let last_remote = if moved_on {
+            item.last_remote.clone()
+        } else {
+            Some(uploaded)
+        };
+        c.execute(
+            "UPDATE items SET parent_item_id = ?3, name = ?4, etag = ?5, ctag = ?6, \
+             server_hash = ?7, local_hash = ?8, sync = ?9, remote_changed = ?10, \
+             remote_etag = ?11, remote_ctag = ?12, remote_hash = ?13, remote_size = ?14 \
+             WHERE drive_id = ?1 AND item_id = ?2",
+            params![
+                ids[0],
+                ids[1],
+                response.parent_item_id.as_ref().map(ItemId::as_str),
+                response.name,
+                response.etag.as_deref(),
+                response.ctag.as_deref(),
+                response.server_hash.as_ref().map(QuickXorHash::to_base64),
+                uploaded_local_hash.to_base64(),
+                SyncState::PendingUpload.as_str(),
+                moved_on,
+                last_remote.as_ref().and_then(|r| r.etag.as_deref()),
+                last_remote.as_ref().and_then(|r| r.ctag.as_deref()),
+                last_remote
+                    .as_ref()
+                    .and_then(|r| r.hash.as_ref().map(QuickXorHash::to_base64)),
+                last_remote
+                    .as_ref()
+                    .map(|r| to_i64_checked(r.size, &final_key))
+                    .transpose()?,
+            ],
+        )
+        .ctx(|| describe("record the upload of", &final_key))?;
+        return Ok(UploadCompleted::LocalChangedSince {
+            generation: item.local_generation,
+        });
+    }
+
+    // Our current bytes reached the server: the item is clean. If the server moved on
+    // since, it is not in sync: `pending-download`, `remote_changed` kept.
+    let sync = if moved_on {
+        SyncState::PendingDownload
+    } else {
+        SyncState::InSync
+    };
     c.execute(
         "UPDATE items SET parent_item_id = ?3, name = ?4, etag = ?5, ctag = ?6, \
-         server_hash = ?7, local_hash = ?8, remote_changed = 0 \
+         server_hash = ?7, local_hash = ?8, size = ?9, created_at = ?10, modified_at = ?11, \
+         local_dirty = 0, sync = ?12, remote_changed = ?13, remote_etag = NULL, \
+         remote_ctag = NULL, remote_hash = NULL, remote_size = NULL \
          WHERE drive_id = ?1 AND item_id = ?2",
         params![
             ids[0],
@@ -1049,35 +1195,20 @@ fn complete_upload(
             response.ctag.as_deref(),
             response.server_hash.as_ref().map(QuickXorHash::to_base64),
             uploaded_local_hash.to_base64(),
-        ],
-    )
-    .ctx(|| describe("record the upload of", &final_key))?;
-
-    if item.local_generation != expected_generation {
-        c.execute(
-            "UPDATE items SET sync = ?3 WHERE drive_id = ?1 AND item_id = ?2",
-            params![ids[0], ids[1], SyncState::PendingUpload.as_str()],
-        )
-        .ctx(|| describe("keep pending the upload of", &final_key))?;
-        return Ok(UploadCompleted::LocalChangedSince {
-            generation: item.local_generation,
-        });
-    }
-    c.execute(
-        "UPDATE items SET size = ?3, created_at = ?4, modified_at = ?5, local_dirty = 0, \
-         sync = ?6 WHERE drive_id = ?1 AND item_id = ?2",
-        params![
-            ids[0],
-            ids[1],
             size,
             response.created.as_unix_seconds(),
             response.modified.as_unix_seconds(),
-            SyncState::InSync.as_str(),
+            sync.as_str(),
+            moved_on,
         ],
     )
-    .ctx(|| describe("mark in sync", &final_key))?;
+    .ctx(|| describe("record the upload of", &final_key))?;
     trim_ranges(c, &final_key, size)?;
-    Ok(UploadCompleted::Synced)
+    Ok(if moved_on {
+        UploadCompleted::UploadedButRemoteMovedOn
+    } else {
+        UploadCompleted::Synced
+    })
 }
 
 fn apply_remote_metadata(
@@ -1086,33 +1217,39 @@ fn apply_remote_metadata(
 ) -> Result<RemoteApplied, StoreError> {
     let key = &remote.key;
     check_name(key, &remote.name)?;
-    let size = to_i64_checked(remote.size, key)?;
+    to_i64_checked(remote.size, key)?;
     let old = load_item(c, key, "apply remote metadata")?;
-    if old.kind == ItemKind::Folder && remote.kind == ItemKind::File {
-        let children = child_count(c, key)?;
-        if children > 0 {
-            return Err(StoreError::FolderHasChildren {
-                key: key.clone(),
-                children,
-            });
-        }
-    }
+    check_folder_to_file(c, &old, remote)?;
     let ids = [key.drive_id.as_str(), key.item_id.as_str()];
-    let parent = remote.parent_item_id.as_ref().map(ItemId::as_str);
-
-    let replaced = content_changed(&old, remote);
 
     if old.local_dirty {
         // Unsynced local content: write nothing that describes content, so size and
         // ranges keep describing the local bytes and the old eTag keeps the 412 check.
+        // Compare with, then record, the last remote identity seen (F1, F9).
+        let known = old
+            .last_remote
+            .clone()
+            .unwrap_or_else(|| base_identity(&old));
+        let changed = content_changed(&old, &known, remote);
+        let reported = remote.identity();
         c.execute(
             "UPDATE items SET parent_item_id = ?3, name = ?4, \
-             remote_changed = MAX(remote_changed, ?5) \
-             WHERE drive_id = ?1 AND item_id = ?2",
-            params![ids[0], ids[1], parent, remote.name, replaced],
+             remote_changed = MAX(remote_changed, ?5), remote_etag = ?6, remote_ctag = ?7, \
+             remote_hash = ?8, remote_size = ?9 WHERE drive_id = ?1 AND item_id = ?2",
+            params![
+                ids[0],
+                ids[1],
+                remote.parent_item_id.as_ref().map(ItemId::as_str),
+                remote.name,
+                changed,
+                reported.etag.as_deref(),
+                reported.ctag.as_deref(),
+                reported.hash.as_ref().map(QuickXorHash::to_base64),
+                to_i64_checked(reported.size, key)?,
+            ],
         )
         .ctx(|| describe("apply a remote move of", key))?;
-        return Ok(if replaced {
+        return Ok(if changed {
             RemoteApplied::ContentChangedUnderLocalState {
                 sync: old.state.sync,
             }
@@ -1121,17 +1258,49 @@ fn apply_remote_metadata(
         });
     }
 
+    let replaced = content_changed(&old, &base_identity(&old), remote);
+    write_server_columns(c, key, remote)?;
+    if !replaced {
+        return Ok(RemoteApplied::ContentUnchanged);
+    }
+    let ranges_cleared = release_content(c, key, remote.kind)?;
+    Ok(RemoteApplied::ContentReplaced { ranges_cleared })
+}
+
+fn check_folder_to_file(
+    c: &Connection,
+    old: &Item,
+    remote: &RemoteMetadata,
+) -> Result<(), StoreError> {
+    if old.kind == ItemKind::Folder && remote.kind == ItemKind::File {
+        let children = child_count(c, &old.key)?;
+        if children > 0 {
+            return Err(StoreError::FolderHasChildren {
+                key: old.key.clone(),
+                children,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Writes every server-owned column of a clean item and clears `remote_changed`.
+fn write_server_columns(
+    c: &Connection,
+    key: &ItemKey,
+    remote: &RemoteMetadata,
+) -> Result<(), StoreError> {
     c.execute(
         "UPDATE items SET parent_item_id = ?3, name = ?4, kind = ?5, size = ?6, \
          created_at = ?7, modified_at = ?8, etag = ?9, ctag = ?10, server_hash = ?11, \
          remote_changed = 0 WHERE drive_id = ?1 AND item_id = ?2",
         params![
-            ids[0],
-            ids[1],
-            parent,
+            key.drive_id.as_str(),
+            key.item_id.as_str(),
+            remote.parent_item_id.as_ref().map(ItemId::as_str),
             remote.name,
             remote.kind.as_str(),
-            size,
+            to_i64_checked(remote.size, key)?,
             remote.created.as_unix_seconds(),
             remote.modified.as_unix_seconds(),
             remote.etag.as_deref(),
@@ -1140,20 +1309,61 @@ fn apply_remote_metadata(
         ],
     )
     .ctx(|| describe("apply remote metadata to", key))?;
-    if !replaced {
-        return Ok(RemoteApplied::ContentUnchanged);
-    }
+    Ok(())
+}
+
+/// Clears a clean item's ranges and sets hydration to `placeholder` (`full` for a folder).
+fn release_content(c: &Connection, key: &ItemKey, kind: ItemKind) -> Result<u64, StoreError> {
     let ranges_cleared = clear_ranges(c, key)?;
-    let hydration = match remote.kind {
+    let hydration = match kind {
         ItemKind::File => Hydration::Placeholder,
         ItemKind::Folder => Hydration::Full,
     };
+    update_item(
+        c,
+        key,
+        "hydration",
+        hydration.as_str(),
+        "reset the hydration",
+    )?;
+    Ok(ranges_cleared)
+}
+
+fn discard_local_changes(
+    c: &Connection,
+    key: &ItemKey,
+    current: &RemoteMetadata,
+) -> Result<(), StoreError> {
+    let item = load_item(c, key, "discard local changes")?;
+    if item.is_provisional {
+        return Err(StoreError::ProvisionalItem {
+            action: "discard the local changes of",
+            key: key.clone(),
+        });
+    }
+    if &current.key != key {
+        return Err(StoreError::UploadMismatch {
+            key: key.clone(),
+            reason: "the server metadata describes a different item".to_owned(),
+        });
+    }
+    check_name(key, &current.name)?;
+    check_folder_to_file(c, &item, current)?;
+    // Clean first, in one statement, so the CHECKs hold; then the item takes the
+    // server's current version exactly as a clean item would (F2).
     c.execute(
-        "UPDATE items SET hydration = ?3 WHERE drive_id = ?1 AND item_id = ?2",
-        params![ids[0], ids[1], hydration.as_str()],
+        "UPDATE items SET local_dirty = 0, sync = ?3, remote_etag = NULL, remote_ctag = NULL, \
+         remote_hash = NULL, remote_size = NULL WHERE drive_id = ?1 AND item_id = ?2",
+        params![
+            key.drive_id.as_str(),
+            key.item_id.as_str(),
+            SyncState::InSync.as_str()
+        ],
     )
-    .ctx(|| describe("reset the hydration of", key))?;
-    Ok(RemoteApplied::ContentReplaced { ranges_cleared })
+    .ctx(|| describe("discard the local changes of", key))?;
+    write_server_columns(c, key, current)?;
+    release_content(c, key, current.kind)?;
+    Ok(())
 }
 
 fn rekey_item(c: &Connection, old: &ItemKey, new_item_id: &ItemId) -> Result<(), StoreError> {
@@ -1204,10 +1414,38 @@ fn delete_item(
     mode: DeleteMode,
     pending: PendingChanges,
 ) -> Result<u64, StoreError> {
-    if !item_exists(c, key)? {
-        return Err(StoreError::ItemNotFound {
-            action: "delete an item",
+    let item = load_item(c, key, "delete an item")?;
+    // Which item, if any, the caller vouches for (F5): only the named one, and only if it
+    // has not changed locally since the caller read its generation.
+    let exempt_generation = match pending {
+        PendingChanges::Refuse => None,
+        PendingChanges::ServerConfirmedLocalDelete {
+            expected_generation,
+        } => {
+            if item.is_provisional {
+                return Err(StoreError::ProvisionalItem {
+                    action: "confirm a server delete of",
+                    key: key.clone(),
+                });
+            }
+            Some(expected_generation)
+        }
+        PendingChanges::DiscardNeverUploaded {
+            expected_generation,
+        } => {
+            if !item.is_provisional {
+                return Err(StoreError::NotProvisional { key: key.clone() });
+            }
+            Some(expected_generation)
+        }
+    };
+    if let Some(expected) = exempt_generation
+        && item.local_generation != expected
+    {
+        return Err(StoreError::GenerationMismatch {
             key: key.clone(),
+            expected,
+            actual: item.local_generation,
         });
     }
     let ids = [key.drive_id.as_str(), key.item_id.as_str()];
@@ -1241,16 +1479,19 @@ fn delete_item(
             mount_id: parse_id("mounts row", "mount_id", mount_id, MountId::new)?,
         });
     }
-    if pending == PendingChanges::Refuse {
+    {
         let mut stmt = c
             .prepare(&format!(
                 "{SUBTREE} SELECT item_id FROM items WHERE drive_id = ?1 \
                  AND item_id IN (SELECT item_id FROM subtree) AND local_dirty = 1 \
-                 ORDER BY item_id"
+                 AND NOT (item_id = ?2 AND ?3) ORDER BY item_id"
             ))
             .ctx(|| describe("look for pending local changes below", key))?;
         let blocking: Vec<String> = stmt
-            .query_map(ids, |row| row.get(0))
+            .query_map(
+                params![ids[0], ids[1], exempt_generation.is_some()],
+                |row| row.get(0),
+            )
             .and_then(Iterator::collect)
             .ctx(|| describe("look for pending local changes below", key))?;
         if !blocking.is_empty() {
@@ -1704,6 +1945,10 @@ struct RawItem {
     local_dirty: bool,
     local_generation: i64,
     remote_changed: bool,
+    remote_etag: Option<String>,
+    remote_ctag: Option<String>,
+    remote_hash: Option<String>,
+    remote_size: Option<i64>,
 }
 
 impl RawItem {
@@ -1729,6 +1974,10 @@ impl RawItem {
             local_dirty: row.get(17)?,
             local_generation: row.get(18)?,
             remote_changed: row.get(19)?,
+            remote_etag: row.get(20)?,
+            remote_ctag: row.get(21)?,
+            remote_hash: row.get(22)?,
+            remote_size: row.get(23)?,
         })
     }
 
@@ -1767,6 +2016,15 @@ impl RawItem {
             local_dirty: self.local_dirty,
             local_generation: to_u64(self.local_generation, "items", "local_generation", &key)?,
             remote_changed: self.remote_changed,
+            last_remote: match self.remote_size {
+                None => None,
+                Some(size) => Some(RemoteIdentity {
+                    etag: self.remote_etag,
+                    ctag: self.remote_ctag,
+                    hash: parse_hash(self.remote_hash, "remote_hash", &key)?,
+                    size: to_u64(size, "items", "remote_size", &key)?,
+                }),
+            },
             key,
         })
     }

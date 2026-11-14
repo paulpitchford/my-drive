@@ -32,7 +32,7 @@ pub use crate::ops::Queries;
 pub use crate::schema::{APPLICATION_ID, SCHEMA_VERSION};
 pub use crate::types::{
     Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, PendingChanges,
-    RemoteApplied, RemoteMetadata, Timestamp, UploadCompleted,
+    RemoteApplied, RemoteIdentity, RemoteMetadata, Timestamp, UploadCompleted,
 };
 
 use crate::error::SqlContext;
@@ -212,6 +212,7 @@ mod tests {
             local_dirty: false,
             local_generation: 0,
             remote_changed: false,
+            last_remote: None,
         }
     }
 

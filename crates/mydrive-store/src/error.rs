@@ -112,6 +112,63 @@ pub enum StoreError {
         key: ItemKey,
     },
 
+    /// `complete_upload` was called for an item with no local changes, for example a
+    /// replayed completion. Nothing changed.
+    #[error("state store: refusing to complete an upload of item {item_id} in drive \
+             {drive_id}: it has no local changes", drive_id = .key.drive_id, item_id = .key.item_id)]
+    NotDirty {
+        /// The item.
+        key: ItemKey,
+    },
+
+    /// The operation is not allowed on a provisional item (one the server has never
+    /// seen). Nothing changed.
+    #[error("state store: refusing to {action} item {item_id} in drive {drive_id}: it was \
+             never uploaded", drive_id = .key.drive_id, item_id = .key.item_id)]
+    ProvisionalItem {
+        /// What was refused.
+        action: &'static str,
+        /// The item.
+        key: ItemKey,
+    },
+
+    /// The item changed locally after the caller read its generation. Nothing changed.
+    #[error("state store: refusing to delete item {item_id} in drive {drive_id}: it changed \
+             locally since (generation {actual}, expected {expected})",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    GenerationMismatch {
+        /// The item.
+        key: ItemKey,
+        /// The generation the caller expected.
+        expected: u64,
+        /// The stored generation.
+        actual: u64,
+    },
+
+    /// An item to insert breaks a rule of the dirty mark. Nothing changed.
+    #[error("state store: cannot insert item {item_id} in drive {drive_id}: {reason}",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    InvalidItem {
+        /// The item.
+        key: ItemKey,
+        /// The rule it breaks.
+        reason: &'static str,
+    },
+
+    /// A migration left foreign-key violations; it was rolled back and nothing changed.
+    #[error(
+        "cannot migrate state store {path}: migration {version} left {violations} \
+             foreign-key violation(s); it was rolled back"
+    )]
+    MigrationForeignKeys {
+        /// The database file.
+        path: PathBuf,
+        /// The migration that left them.
+        version: i64,
+        /// How many violations `PRAGMA foreign_key_check` reported.
+        violations: usize,
+    },
+
     /// Dehydration needs the item to be in sync with the server. Nothing changed.
     #[error("state store: refusing to dehydrate item {item_id} in drive {drive_id}: its sync \
              state is {sync}, not in-sync", drive_id = .key.drive_id, item_id = .key.item_id)]
