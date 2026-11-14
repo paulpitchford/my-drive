@@ -7,6 +7,8 @@
 //! The test also checks that it captured events from every auth module it exercises, so
 //! it cannot pass by capturing nothing.
 
+#[path = "auth_fake_secret_service.rs"]
+mod fake_secret_service;
 #[path = "auth_support.rs"]
 mod support;
 
@@ -62,8 +64,8 @@ impl Subscriber for Capture {
 }
 
 /// AC8, ADR-0010 R6, review item 12: across the loopback and paste sign-ins, refreshes,
-/// store-write failures and their warning, a rejected refresh and a forged redirect, no
-/// secret reaches a log event, `Debug` output or an error message.
+/// store-write failures and their warning, a rejected refresh, a forged redirect, and the
+/// Secret Service store (save, load, replace, a dismissed prompt, failures), no secret reaches a log event, `Debug` output or an error message.
 #[test]
 fn no_secret_in_logs_debug_or_errors() -> TestResult {
     let capture = Capture::default();
@@ -75,7 +77,7 @@ fn no_secret_in_logs_debug_or_errors() -> TestResult {
     let (seen, verifiers) = runtime.block_on(scenario())?;
 
     let logs = lock(&capture.0).clone();
-    for module in ["loopback", "token", "provider"] {
+    for module in ["loopback", "token", "provider", "secret_service"] {
         let target = format!("[mydrive_graph::auth::{module}]");
         assert!(
             logs.contains(&target),
@@ -94,6 +96,10 @@ fn no_secret_in_logs_debug_or_errors() -> TestResult {
         "fake-code-paste".to_owned(),
         "fake-code-forged".to_owned(),
         "seed-refresh-token".to_owned(),
+        "ss-secret-1".to_owned(),
+        "ss-secret-2".to_owned(),
+        "ss-dismissed".to_owned(),
+        "ss-failed".to_owned(),
     ];
     secrets.extend(verifiers);
     for secret in &secrets {
@@ -104,6 +110,76 @@ fn no_secret_in_logs_debug_or_errors() -> TestResult {
         );
     }
     Ok(())
+}
+
+/// The real `SecretServiceStore` against the fake service: save, load, replace, a
+/// dismissed prompt and failures, as a store and behind a provider. Returns what it
+/// printed.
+async fn secret_service_scenario() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use fake_secret_service::{Keyring, LOGIN, PromptMode, fake_service, lock as keyring};
+    use mydrive_graph::auth::{RefreshToken, SecretServiceStore, TokenStore};
+
+    let mut seen = String::new();
+    let (conn, state) = fake_service(Keyring {
+        default_alias: Some(LOGIN.into()),
+        ..Keyring::default()
+    })
+    .await?;
+    let store = SecretServiceStore::with_connection(conn).await?;
+    seen += &format!("{store:?}");
+    let acct = account("ss");
+    seen += &format!("{:?}", store.load(&acct).await?);
+    store.save(&acct, &RefreshToken::new("ss-secret-1")).await?;
+    store.save(&acct, &RefreshToken::new("ss-secret-2")).await?;
+    let loaded = store.load(&acct).await?;
+    assert_eq!(
+        loaded.as_ref().map(RefreshToken::expose_secret),
+        Some("ss-secret-2")
+    );
+    seen += &format!("{loaded:?}");
+
+    // A dismissed prompt.
+    {
+        let mut k = keyring(&state);
+        k.prompt_on_create = true;
+        k.prompt_mode = PromptMode::Dismiss;
+    }
+    let e = store
+        .save(&acct, &RefreshToken::new("ss-dismissed"))
+        .await
+        .err()
+        .ok_or("the dismissed save must fail")?;
+    assert!(
+        matches!(e, mydrive_graph::auth::StoreError::Dismissed { .. }),
+        "{e:?}"
+    );
+    seen += &format!("{e} {e:?}");
+
+    // The service refuses to create the item.
+    {
+        let mut k = keyring(&state);
+        k.prompt_on_create = false;
+        k.fail_create = true;
+    }
+    let e = store
+        .save(&acct, &RefreshToken::new("ss-failed"))
+        .await
+        .err()
+        .ok_or("the failing save must fail")?;
+    seen += &format!("{e} {e:?}");
+
+    // Behind a provider: a refresh rolls the token, whose write the service refuses.
+    let fake = FakeAuthority::start().await?;
+    let provider = RefreshingTokenProvider::resume(
+        acct.clone(),
+        Scopes::initial_sign_in(),
+        fake.client(),
+        Arc::new(store),
+    );
+    let t = provider.access_token().await?;
+    let w = provider.store_warning().ok_or("expected a store warning")?;
+    seen += &format!("{t:?} {provider:?} {w:?} {}", w.error);
+    Ok(seen)
 }
 
 async fn scenario() -> Result<(String, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
@@ -176,6 +252,8 @@ async fn scenario() -> Result<(String, Vec<String>), Box<dyn std::error::Error +
         .err()
         .ok_or("expected failure")?;
     seen += &format!("{e} {e:?}");
+
+    seen += &secret_service_scenario().await?;
 
     let verifiers = fake
         .requests()

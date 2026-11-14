@@ -740,3 +740,78 @@ async fn dismissed_read_is_not_retried_soon() -> TestResult {
     assert_eq!(store.loads(), 2);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------
+// Final verification gaps
+// ---------------------------------------------------------------------------------------
+
+/// Review item 10 on the `force_refresh` path: after a 401 on another token, a cached
+/// token whose wall-clock deadline has passed is not handed back; a refresh happens.
+#[tokio::test]
+async fn force_refresh_does_not_return_wall_clock_expired_token() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let past = SystemTime::now()
+        .checked_sub(Duration::from_secs(1))
+        .ok_or("clock")?;
+    let p = signed_in(
+        &fake,
+        token_set("stale", "r0", Duration::from_secs(3600), past),
+    )
+    .await?;
+    let t = p
+        .force_refresh(&AccessToken::new("some-older-token"))
+        .await?;
+    assert_eq!(t.expose_secret(), "fake-access-1");
+    assert_eq!(fake.count(), 1);
+    Ok(())
+}
+
+/// Review items 3 and 10: when an early refresh fails transiently, a cached token whose
+/// wall-clock deadline has passed is not handed out instead.
+#[tokio::test]
+async fn transient_failure_does_not_return_wall_clock_expired_token() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let past = SystemTime::now()
+        .checked_sub(Duration::from_secs(1))
+        .ok_or("clock")?;
+    let p = signed_in(
+        &fake,
+        token_set("stale", "r0", Duration::from_secs(3600), past),
+    )
+    .await?;
+    fake.error(503, "temporarily_unavailable");
+    let r = p.access_token().await;
+    assert!(matches!(r, Err(TokenError::Transient { .. })), "{r:?}");
+    let r = p.access_token().await;
+    assert!(matches!(r, Err(TokenError::Transient { .. })), "{r:?}");
+    Ok(())
+}
+
+/// AC6, ADR-0010 R8: while the write of the rolled refresh token is in progress (within
+/// the documented 10-second wait), the new access token is not handed out; it is handed
+/// out once the store holds the new refresh token.
+#[tokio::test]
+async fn access_token_waits_for_the_store_write() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let store = FlakyStore::seeded("a", "old").await;
+    let gate = store.hold();
+    let provider = Arc::new(resume(fake.client(), store.clone(), "a"));
+    let caller = {
+        let p = provider.clone();
+        tokio::spawn(async move { p.access_token().await })
+    };
+    assert!(settle(|| store.saves() == 1).await, "the write started");
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !caller.is_finished(),
+        "the access token was handed out before the refresh token was stored"
+    );
+    assert_eq!(store.stored("a").as_deref(), Some("old"));
+    gate.add_permits(1);
+    let t = caller.await??;
+    assert_eq!(t.expose_secret(), "fake-access-1");
+    assert_eq!(store.stored("a").as_deref(), Some("fake-refresh-1"));
+    Ok(())
+}

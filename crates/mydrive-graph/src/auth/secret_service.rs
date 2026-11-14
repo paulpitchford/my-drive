@@ -288,6 +288,7 @@ impl SecretServiceStore {
         const OP: &str = "reading a refresh token from the Secret Service";
         let (_collection, items) = self.find_items(account, OP).await?;
         let Some(item) = items.first() else {
+            tracing::debug!(%account, "no refresh token in the Secret Service");
             return Ok(None);
         };
         let session = self.open_session().await.map_err(failed(OP))?;
@@ -300,6 +301,7 @@ impl SecretServiceStore {
             operation: OP,
             reason: "the stored secret is not UTF-8".to_owned(),
         })?;
+        tracing::debug!(%account, "refresh token read from the Secret Service");
         Ok(Some(RefreshToken::new(value)))
     }
 
@@ -341,7 +343,9 @@ impl SecretServiceStore {
             .await;
         self.close_session(&session).await;
         let (_item, prompt) = created.map_err(failed(OP))?;
-        self.run_prompt(&prompt, OP).await
+        self.run_prompt(&prompt, OP).await?;
+        tracing::debug!(%account, "refresh token stored in the Secret Service");
+        Ok(())
     }
 
     async fn delete_inner(&self, account: &AccountId) -> Result<(), StoreError> {
