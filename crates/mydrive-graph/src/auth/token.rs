@@ -1,7 +1,8 @@
 //! The token endpoint: redeeming a code and refreshing, against an injectable authority.
 
 use std::fmt;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use tokio::time::Instant;
@@ -15,9 +16,14 @@ use super::secret::{AccessToken, AuthorizationCode, IdToken, RefreshToken};
 /// The longest a token request may take before it counts as a network failure.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Assumed lifetime when the response omits `expires_in`. Short, so we refresh early rather
-/// than send an expired token.
-const FALLBACK_LIFETIME: Duration = Duration::from_secs(5 * 60);
+/// Assumed lifetime when the response omits `expires_in` (Entra access tokens live 60 to
+/// 90 minutes; this errs short).
+const FALLBACK_LIFETIME: Duration = Duration::from_secs(10 * 60);
+
+/// Floor on a reported lifetime, so a zero or tiny `expires_in` cannot cause a refresh on
+/// every call. If the token really expires sooner, Graph answers 401 and the caller uses
+/// `force_refresh`, which refreshes once per rejected token.
+pub(crate) const MIN_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Upper bound on a reported lifetime, so a bogus `expires_in` cannot overflow the clock.
 const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
@@ -27,8 +33,11 @@ const MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct TokenSet {
     /// The access token.
     pub access_token: AccessToken,
-    /// When the access token expires, on the tokio clock.
+    /// When the access token expires, on the monotonic (tokio) clock.
     pub expires_at: Instant,
+    /// When the access token expires, on the wall clock. The monotonic clock stops during
+    /// suspend; the token counts as expired when either deadline has passed.
+    pub expires_at_wall: SystemTime,
     /// The refresh token, if one was returned. A refresh that returns none keeps the old one.
     pub refresh_token: Option<RefreshToken>,
     /// The ID token, if one was returned.
@@ -42,6 +51,7 @@ impl fmt::Debug for TokenSet {
         f.debug_struct("TokenSet")
             .field("access_token", &self.access_token)
             .field("expires_at", &self.expires_at)
+            .field("expires_at_wall", &self.expires_at_wall)
             .field("refresh_token", &self.refresh_token)
             .field("id_token", &self.id_token)
             .field("scope", &self.scope)
@@ -98,7 +108,7 @@ impl TokenClient {
             .build()
             .map_err(|e| {
                 SignInError::Token(TokenRequestError::Network {
-                    source: e.without_url(),
+                    source: Arc::new(e.without_url()),
                 })
             })?;
         Ok(Self {
@@ -148,12 +158,13 @@ impl TokenClient {
             ("refresh_token", refresh_token.expose_secret()),
             ("scope", scope.as_str()),
         ];
+        tracing::debug!("refreshing access token");
         self.post(&form).await
     }
 
     async fn post(&self, form: &[(&str, &str)]) -> Result<TokenSet, TokenRequestError> {
         let network = |e: reqwest::Error| TokenRequestError::Network {
-            source: e.without_url(),
+            source: Arc::new(e.without_url()),
         };
         let response = self
             .http
@@ -196,10 +207,16 @@ impl TokenClient {
         let lifetime = parsed
             .expires_in
             .map_or(FALLBACK_LIFETIME, Duration::from_secs)
-            .min(MAX_LIFETIME);
+            .clamp(MIN_LIFETIME, MAX_LIFETIME);
+        tracing::debug!(
+            lifetime_secs = lifetime.as_secs(),
+            rolled_refresh_token = parsed.refresh_token.is_some(),
+            "token endpoint granted tokens"
+        );
         Ok(TokenSet {
             access_token: AccessToken::new(parsed.access_token),
             expires_at: Instant::now() + lifetime,
+            expires_at_wall: SystemTime::now() + lifetime,
             refresh_token: parsed
                 .refresh_token
                 .filter(|t| !t.is_empty())

@@ -3,32 +3,37 @@
 //! No variant carries a token, code, verifier or response body: messages hold only OAuth
 //! error codes and descriptions, status codes and fixed reasons (ADR-0010 R6).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use mydrive_core::ids::AccountId;
 
 /// A sign-in configuration value was invalid.
-#[derive(Debug, thiserror::Error)]
+///
+/// The rejected authority is deliberately not echoed: it may carry credentials.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ConfigError {
     /// The authority base URL cannot be used.
-    #[error("invalid sign-in authority {authority:?}: {reason}")]
+    #[error("invalid sign-in authority: {reason}")]
     InvalidAuthority {
-        /// The rejected value.
-        authority: String,
         /// Why it was rejected.
         reason: &'static str,
     },
+    /// The loopback redirect host is not one of `localhost`, `127.0.0.1` or `[::1]`.
+    #[error("invalid loopback redirect host: use localhost, 127.0.0.1 or [::1]")]
+    InvalidLoopbackHost,
 }
 
 /// A request to the token endpoint failed.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum TokenRequestError {
     /// The request did not reach the token endpoint or no response came back.
     #[error("token request to the identity platform failed: {source}")]
     Network {
-        /// The transport error, with its URL removed.
+        /// The transport error, with its URL removed. Shared, so one failure can be handed
+        /// to every caller waiting on the same refresh.
         #[source]
-        source: reqwest::Error,
+        source: Arc<reqwest::Error>,
     },
     /// The token endpoint answered with an OAuth error.
     #[error(
@@ -110,8 +115,9 @@ pub enum SignInError {
         /// How long the attempt was kept.
         after: Duration,
     },
-    /// A redirect carried a missing or wrong `state`. The attempt is cancelled.
-    #[error("this sign-in response does not belong to this attempt; the attempt is cancelled")]
+    /// A redirect carried a missing or wrong `state`. The paste flow cancels the attempt;
+    /// the loopback flow ignores the request and keeps waiting.
+    #[error("this sign-in response does not belong to this attempt")]
     StateMismatch,
     /// A pasted address is not a redirect to the URI this attempt used.
     #[error("the address is not the sign-in redirect to {expected}; paste the full address")]
@@ -156,7 +162,7 @@ pub enum SignInError {
     },
 }
 
-/// The token store failed.
+/// The token store failed. Every message names `mydrive doctor` (ADR-0010 R7).
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum StoreError {
     /// No Secret Service is reachable (ADR-0010 R7).
@@ -178,7 +184,7 @@ pub enum StoreError {
         operation: &'static str,
     },
     /// The store failed in some other way.
-    #[error("token store failed while {operation}: {reason}")]
+    #[error("token store failed while {operation}: {reason}. Run `mydrive doctor` for help")]
     Failed {
         /// What was being done.
         operation: &'static str,
@@ -188,7 +194,7 @@ pub enum StoreError {
 }
 
 /// The token provider could not hand out an access token.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum TokenError {
     /// The refresh token was rejected: the account is `needs-sign-in` and stays so until
     /// a new interactive sign-in. Not a transient failure.
@@ -226,6 +232,13 @@ pub enum TokenError {
         /// The store error.
         #[source]
         source: StoreError,
+    },
+    /// The background refresh ended without a result (its task was aborted, for example
+    /// at runtime shutdown). Transient.
+    #[error("refreshing the access token of account {account} was interrupted; will retry")]
+    RefreshAborted {
+        /// The account.
+        account: AccountId,
     },
 }
 

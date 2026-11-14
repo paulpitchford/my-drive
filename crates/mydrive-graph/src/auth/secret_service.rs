@@ -1,8 +1,10 @@
 //! A [`TokenStore`] over the freedesktop Secret Service API on the session bus
 //! (gnome-keyring, KWallet), using `zbus` (ADR-0010).
 //!
-//! Each account has one item in the default collection, found by the attributes
-//! `application = mydrive` and `account = <account ID>`. Secrets travel to the service
+//! Each account has one item in the default collection (the one the service's `default`
+//! alias names), found by the attributes `xdg:schema = mydrive.RefreshToken`,
+//! `application = mydrive` and `account = <account ID>`. Items are never looked up or
+//! written in any other collection. Secrets travel to the service
 //! with the `plain` session algorithm: the session bus is private to the user, and the
 //! encrypted algorithm would need crypto crates outside the workspace stack. Accepted for
 //! now and recorded as a follow-up.
@@ -31,9 +33,13 @@ const COLLECTION_IFACE: &str = "org.freedesktop.Secret.Collection";
 const ITEM_IFACE: &str = "org.freedesktop.Secret.Item";
 const SESSION_IFACE: &str = "org.freedesktop.Secret.Session";
 const PROMPT_IFACE: &str = "org.freedesktop.Secret.Prompt";
-const DEFAULT_COLLECTION: &str = "/org/freedesktop/secrets/aliases/default";
+/// The empty object path: "no prompt needed" or "no such collection".
 const NO_PROMPT: &str = "/";
 
+/// The libsecret-style schema attribute, so our items cannot be confused with another
+/// application's that happen to use `application` and `account` attributes too.
+const ATTR_SCHEMA: &str = "xdg:schema";
+const SCHEMA: &str = "mydrive.RefreshToken";
 const ATTR_APPLICATION: &str = "application";
 const APPLICATION: &str = "mydrive";
 const ATTR_ACCOUNT: &str = "account";
@@ -101,7 +107,13 @@ impl SecretServiceStore {
         Self::with_connection(conn).await
     }
 
-    async fn with_connection(conn: Connection) -> Result<Self, StoreError> {
+    /// Uses an existing D-Bus connection, for example a peer-to-peer one to a fake service
+    /// in tests, and checks that the Secret Service answers on it.
+    ///
+    /// # Errors
+    ///
+    /// As [`SecretServiceStore::connect`].
+    pub async fn with_connection(conn: Connection) -> Result<Self, StoreError> {
         let store = Self { conn };
         let session = store.open_session().await.map_err(|e| unavailable(&e))?;
         store.close_session(&session).await;
@@ -149,31 +161,49 @@ impl SecretServiceStore {
 
     fn attributes(account: &AccountId) -> HashMap<&'static str, String> {
         HashMap::from([
+            (ATTR_SCHEMA, SCHEMA.to_owned()),
             (ATTR_APPLICATION, APPLICATION.to_owned()),
             (ATTR_ACCOUNT, account.as_str().to_owned()),
         ])
     }
 
-    /// The account's items, unlocked (prompting if needed).
+    /// The default collection, unlocked (prompting if needed). Items are only ever looked
+    /// up in and written to this collection.
+    async fn default_collection(
+        &self,
+        operation: &'static str,
+    ) -> Result<OwnedObjectPath, StoreError> {
+        let collection: OwnedObjectPath = self
+            .call(SERVICE_PATH, SERVICE_IFACE, "ReadAlias", &"default")
+            .await
+            .map_err(failed(operation))?;
+        if collection.as_str() == NO_PROMPT {
+            return Err(StoreError::Unavailable {
+                reason: "the Secret Service has no default collection".to_owned(),
+            });
+        }
+        self.unlock(std::slice::from_ref(&collection), operation)
+            .await?;
+        Ok(collection)
+    }
+
+    /// The account's items in the default collection.
     async fn find_items(
         &self,
         account: &AccountId,
         operation: &'static str,
-    ) -> Result<Vec<OwnedObjectPath>, StoreError> {
-        let (mut unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) = self
+    ) -> Result<(OwnedObjectPath, Vec<OwnedObjectPath>), StoreError> {
+        let collection = self.default_collection(operation).await?;
+        let items: Vec<OwnedObjectPath> = self
             .call(
-                SERVICE_PATH,
-                SERVICE_IFACE,
+                collection.as_str(),
+                COLLECTION_IFACE,
                 "SearchItems",
                 &Self::attributes(account),
             )
             .await
             .map_err(failed(operation))?;
-        if !locked.is_empty() {
-            self.unlock(&locked, operation).await?;
-            unlocked.extend(locked);
-        }
-        Ok(unlocked)
+        Ok((collection, items))
     }
 
     async fn unlock(
@@ -235,7 +265,7 @@ impl SecretServiceStore {
 
     async fn load_inner(&self, account: &AccountId) -> Result<Option<RefreshToken>, StoreError> {
         const OP: &str = "reading a refresh token from the Secret Service";
-        let items = self.find_items(account, OP).await?;
+        let (_collection, items) = self.find_items(account, OP).await?;
         let Some(item) = items.first() else {
             return Ok(None);
         };
@@ -258,8 +288,7 @@ impl SecretServiceStore {
         token: &RefreshToken,
     ) -> Result<(), StoreError> {
         const OP: &str = "storing a refresh token in the Secret Service";
-        let collection = OwnedObjectPath::try_from(DEFAULT_COLLECTION).map_err(failed(OP))?;
-        self.unlock(std::slice::from_ref(&collection), OP).await?;
+        let collection = self.default_collection(OP).await?;
         let label = format!("my-drive refresh token ({account})");
         let attributes = Self::attributes(account);
         let properties: HashMap<&str, Variant<'_>> = HashMap::from([
@@ -283,7 +312,7 @@ impl SecretServiceStore {
         // call, so a failure leaves the previous token in place.
         let created: Result<(OwnedObjectPath, OwnedObjectPath), _> = self
             .call(
-                DEFAULT_COLLECTION,
+                collection.as_str(),
                 COLLECTION_IFACE,
                 "CreateItem",
                 &(properties, secret, true),
@@ -296,7 +325,8 @@ impl SecretServiceStore {
 
     async fn delete_inner(&self, account: &AccountId) -> Result<(), StoreError> {
         const OP: &str = "deleting a refresh token from the Secret Service";
-        for item in self.find_items(account, OP).await? {
+        let (_collection, items) = self.find_items(account, OP).await?;
+        for item in items {
             let prompt: OwnedObjectPath = self
                 .call(item.as_str(), ITEM_IFACE, "Delete", &())
                 .await

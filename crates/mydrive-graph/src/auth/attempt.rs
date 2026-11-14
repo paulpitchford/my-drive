@@ -130,8 +130,15 @@ impl PendingSignIn {
         })
     }
 
-    /// The URL the user opens in their own browser. It holds no secret: the challenge is
-    /// public and the `state` is only useful together with this attempt.
+    /// The URL the user opens in their own browser. It never holds the PKCE verifier.
+    ///
+    /// It is not private, though: the `state` and the code challenge in it are visible to
+    /// other local users, for example in the browser's command line in the process list.
+    /// On a multi-user host that allows authorisation-code injection: another user can
+    /// sign in to their own account with this attempt's `state` and challenge and deliver
+    /// the code to the loopback listener, so this attempt ends signed in as them. Callers
+    /// must therefore show which account was signed in and have the user confirm it
+    /// before creating a mount.
     #[must_use]
     pub fn authorization_url(&self) -> &Url {
         &self.authorization_url

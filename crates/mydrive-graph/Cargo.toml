@@ -18,7 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "rt"] }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "rt", "macros"] }
 tracing.workspace = true
 url.workspace = true
 zbus = { workspace = true, features = ["tokio"] }
@@ -26,6 +26,7 @@ zbus = { workspace = true, features = ["tokio"] }
 [dev-dependencies]
 axum.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+zbus = { workspace = true, features = ["tokio", "p2p"] }
 
 [lints]
 workspace = true

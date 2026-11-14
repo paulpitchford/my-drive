@@ -98,6 +98,20 @@ impl Scopes {
 pub struct AuthConfig {
     client_id: ClientId,
     authority: Url,
+    loopback_host: String,
+}
+
+/// The default host of the loopback redirect URI, as ADR-0010 specifies.
+pub const DEFAULT_LOOPBACK_HOST: &str = "localhost";
+
+/// Whether `url`'s host is the loopback interface: `localhost`, `127.0.0.0/8` or `::1`.
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(a)) => a.is_loopback(),
+        Some(url::Host::Ipv6(a)) => a.is_loopback(),
+        None => false,
+    }
 }
 
 impl AuthConfig {
@@ -116,16 +130,24 @@ impl AuthConfig {
     ///
     /// # Errors
     ///
-    /// [`ConfigError::InvalidAuthority`] if `authority` is not an absolute `http` or
-    /// `https` URL without query or fragment.
+    /// [`ConfigError::InvalidAuthority`] if `authority` is not an absolute `https` URL (or
+    /// `http` to a loopback host, for tests), or has a user name, password, query or
+    /// fragment. The error never repeats the URL, which may hold credentials.
     pub fn with_authority(client_id: ClientId, authority: &str) -> Result<Self, ConfigError> {
-        let invalid = |reason: &'static str| ConfigError::InvalidAuthority {
-            authority: authority.to_owned(),
-            reason,
-        };
+        let invalid = |reason: &'static str| ConfigError::InvalidAuthority { reason };
         let mut url = Url::parse(authority).map_err(|_| invalid("not an absolute URL"))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(invalid("scheme is not http or https"));
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(invalid("it contains a user name or password"));
+        }
+        match url.scheme() {
+            "https" => {}
+            "http" if is_loopback_host(&url) => {}
+            "http" => {
+                return Err(invalid(
+                    "http is allowed only for a loopback host; use https",
+                ));
+            }
+            _ => return Err(invalid("the scheme is not https")),
         }
         if url.query().is_some() || url.fragment().is_some() {
             return Err(invalid("has a query or fragment"));
@@ -137,7 +159,29 @@ impl AuthConfig {
         Ok(Self {
             client_id,
             authority: url,
+            loopback_host: DEFAULT_LOOPBACK_HOST.to_owned(),
         })
+    }
+
+    /// Sets the host of the loopback redirect URI: `localhost` (the default), `127.0.0.1`
+    /// or `[::1]`. The listener binds the loopback interface whatever this is.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::InvalidLoopbackHost`] for any other value.
+    pub fn with_loopback_host(mut self, host: &str) -> Result<Self, ConfigError> {
+        let host = host.to_ascii_lowercase();
+        if !matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]") {
+            return Err(ConfigError::InvalidLoopbackHost);
+        }
+        self.loopback_host = host;
+        Ok(self)
+    }
+
+    /// The host of the loopback redirect URI.
+    #[must_use]
+    pub fn loopback_host(&self) -> &str {
+        &self.loopback_host
     }
 
     /// The client ID.
@@ -174,7 +218,6 @@ impl AuthConfig {
         self.authority
             .join(path)
             .map_err(|_| ConfigError::InvalidAuthority {
-                authority: self.authority.to_string(),
                 reason: "cannot join the endpoint path",
             })
     }
@@ -236,5 +279,63 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Review item 7: plain http only to loopback hosts.
+    #[test]
+    fn http_only_for_loopback() {
+        let id = ClientId::from_config(None);
+        for ok in [
+            "http://127.0.0.1:9/t/",
+            "http://127.1.2.3/t/",
+            "http://localhost:9/t/",
+            "http://[::1]:9/t/",
+            "https://login.example.invalid/t/",
+        ] {
+            assert!(AuthConfig::with_authority(id.clone(), ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://login.example.invalid/t/",
+            "http://10.0.0.1/t/",
+            "http://localhost.example.invalid/t/",
+        ] {
+            assert!(
+                AuthConfig::with_authority(id.clone(), bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Review item 7: a user name or password is rejected, and the error does not repeat
+    /// the URL or its credentials.
+    #[test]
+    fn userinfo_rejected_without_echo() {
+        let id = ClientId::from_config(None);
+        for bad in [
+            "https://someone:hunter2@login.example.invalid/t/",
+            "https://someone@login.example.invalid/t/",
+            "http://someone:hunter2@127.0.0.1/t/",
+            "https://someone:hunter2@[bad",
+        ] {
+            let e = match AuthConfig::with_authority(id.clone(), bad) {
+                Err(e) => e,
+                Ok(_) => panic!("{bad} accepted"),
+            };
+            let shown = format!("{e} {e:?}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert!(!shown.contains("someone"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn loopback_host_is_restricted() -> Result<(), ConfigError> {
+        let c = AuthConfig::new(ClientId::from_config(None))?;
+        assert_eq!(c.loopback_host(), "localhost");
+        assert_eq!(
+            c.clone().with_loopback_host("[::1]")?.loopback_host(),
+            "[::1]"
+        );
+        assert!(c.with_loopback_host("example.invalid").is_err());
+        Ok(())
     }
 }

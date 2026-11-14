@@ -23,13 +23,16 @@ mod token;
 
 pub use attempt::{ATTEMPT_LIFETIME, PasteSignIn, PendingSignIn, RedirectUri};
 pub use config::{
-    AuthConfig, ClientId, DEFAULT_AUTHORITY, DEFAULT_CLIENT_ID, INITIAL_SCOPES,
-    NATIVE_CLIENT_REDIRECT_URI, SITE_SEARCH_SCOPE, Scopes,
+    AuthConfig, ClientId, DEFAULT_AUTHORITY, DEFAULT_CLIENT_ID, DEFAULT_LOOPBACK_HOST,
+    INITIAL_SCOPES, NATIVE_CLIENT_REDIRECT_URI, SITE_SEARCH_SCOPE, Scopes,
 };
 pub use error::{ConfigError, SignInError, StoreError, TokenError, TokenRequestError};
-pub use loopback::{LOOPBACK_TIMEOUT, LoopbackSignIn};
+pub use loopback::{CONNECTION_READ_TIMEOUT, LOOPBACK_TIMEOUT, LoopbackSignIn};
 pub use pkce::{CODE_CHALLENGE_METHOD, State};
-pub use provider::{REFRESH_MARGIN, RefreshingTokenProvider, STORE_RETRY_INTERVAL, TokenProvider};
+pub use provider::{
+    REFRESH_MARGIN, REFRESH_RETRY_INITIAL, REFRESH_RETRY_MAX, RefreshingTokenProvider,
+    STORE_RETRY_AFTER_DISMISSED, STORE_RETRY_INITIAL, STORE_RETRY_MAX, TokenProvider,
+};
 pub use secret::{AccessToken, AuthorizationCode, IdToken, PkceVerifier, RefreshToken};
 pub use secret_service::SecretServiceStore;
 pub use store::{BoxFuture, MemoryTokenStore, TokenStore};
