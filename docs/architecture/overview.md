@@ -290,7 +290,7 @@ that must pass before the dependent work starts. If a gate fails, the ADR is rev
 |---|---|---|
 | G1 | Does `Range` work on authenticated `/content` requests, personal and work? | ADR-0005 partial hydration (falls back to whole-file) |
 | G2 | What does Graph return under unmanaged-device policy, and how do shortcut stubs appear in delta? | ADR-0015 |
-| G3 | What did abraunegg's FUSE ADR (PR #3600) conclude, and why is it on hold? | ADR-0005 |
+| G3 | What did abraunegg's FUSE ADR (PR #3600) conclude, and why is it on hold? Answered 2026-11-15: pass with changes, see `docs/gates/G3.md` | ADR-0005 |
 | G4 | Will Files (`folio`) accept a per-file status hook? | ADR-0014 status icons on Omarchy |
 | G5 | Does device-code sign-in work for personal accounts? | ADR-0010 headless flow |
 

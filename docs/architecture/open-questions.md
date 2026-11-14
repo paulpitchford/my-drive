@@ -22,7 +22,6 @@ The owner should know these were choices, not findings.
 |---|---|---|---|
 | Q1 | Does `Range` work on authenticated `/content` (gate G1)? | WP-011, owner signs in | M1 |
 | Q2 | Does device-code sign-in work for personal accounts (gate G5)? | WP-011 | M1 |
-| Q4 | What did abraunegg's FUSE design conclude and why is it on hold (gate G3)? | Lead | M2 |
 | Q5 | Do FUSE mmap page faults reach the daemon as reads in every case we rely on? | M2 VFS work | M2 |
 | Q6 | What counts as "one operation" for the mass-delete guard (`rm -rf` is many unlinks)? | Lead, in the M2 write-path WP | M2 |
 | Q7 | Conflict copies: what if `<name>-<hostname>.<ext>` already exists or is an invalid name? When exactly is sync `Conflict` set and cleared? | Lead, in the M1 conflict WP | M1 |
@@ -51,6 +50,7 @@ The owner should know these were choices, not findings.
 | Q31 | When Graph reports only a deleted folder (not its contents), an item moved into that folder just before is never reported at all, so no client can learn of it from the feed. Unknown whether real Graph does this (it is one of the simulator's harder settings). The engine must handle a folder delete from its own store's tree and may need a targeted listing | Experiment with a real account; lead, in the M1 delta WP | M1 |
 | Q32 | Accepted risk: a broken or hostile server or TLS-intercepting proxy can send bytes beyond a response's declared length on a reused connection, which are then read as the next response. Not prevented in the Graph client (it would cost a TLS handshake per ranged read). The engine must verify the whole-file quickXorHash when a file becomes fully hydrated | Lead, in the M2 hydration WP | M2 |
 | Q33 | A file replaced by different content of exactly the same size passes the client's size checks; ranged reads of it can mix versions until the eTag or hash is checked. Depends on whether ranged responses carry a usable version tag (gate G1) | WP-011, then the M2 hydration WP | M2 |
+| Q34 | Gate G3 passed with changes (`docs/gates/G3.md`): ADR-0005 must be amended before M2 for pitfalls another project hit. Chiefly: never mix content versions within an open handle or a partially hydrated file (invalidate extents on a remote change; check a ranged response against the version on disk); file managers get no change events for writes the daemon makes behind the mount, so the VFS must invalidate or replay them; hydration must not block other requests on the mount; renaming or deleting a placeholder never hydrates it; a backing file missing at start-up never becomes a remote delete; tell a dead, hung or live stale mount apart before unmounting; the systemd user unit must not hide the mount in a private namespace; pinned files are unreachable while the daemon is down | Lead: a new ADR amending ADR-0005 | Before M2 |
 | Q30 | Whether a loopback redirect to `127.0.0.1` rather than `localhost` is accepted by Entra for our app registration (RFC 8252 recommends the literal address) | With the app registration (Q22) | Before WP-011 |
 
 ## Detail questions in the flows and journeys

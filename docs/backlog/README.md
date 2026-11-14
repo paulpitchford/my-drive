@@ -40,7 +40,7 @@ From `docs/architecture/overview.md`. A gate is an experiment, not a code delive
 | — FUSE in hosted CI | WP-010 | — | **answered: yes** (`docs/process/ci-fuse.md`) |
 | G1 Range on authenticated `/content` | WP-011 against a real personal account, then a work account | App registration; owner signs in | open |
 | G2 Policy errors and shortcut stubs | Manual experiment against a work tenant with unmanaged-device controls | A work tenant; owner | open |
-| G3 abraunegg FUSE ADR | Lead reads PR #3600 and its ADR, writes up findings | Nothing | open |
+| G3 abraunegg FUSE ADR | Lead reads PR #3600 and its ADR, writes up findings | Nothing | **answered: pass with changes** ([docs/gates/G3.md](../gates/G3.md)); ADR-0005 to be amended before M2 |
 | G4 Per-file status in Files | Issue on omacom/folio | Owner approves the wording before it is posted | open |
 | G5 Device-code sign-in for personal accounts | WP-011 | App registration; owner signs in | open |
 
