@@ -1,6 +1,6 @@
 # WP-008: Graph client foundations
 
-- **Status:** blocked on wave 2
+- **Status:** ready
 - **Milestone:** M0
 - **Wave:** 3
 - **Depends on:** WP-001, WP-007, WP-009

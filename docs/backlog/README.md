@@ -19,16 +19,17 @@ answered. No daemon yet.
 | [WP-003](WP-003-core-name-validation.md) | Name and path validation | 1 | — | done (#6) |
 | [WP-004](WP-004-core-quickxorhash.md) | quickXorHash | 1 | — | done (#5) |
 | [WP-010](WP-010-fuse-smoke-test-in-ci.md) | FUSE smoke test in CI | 1 | — | done (#2) |
-| [WP-005](WP-005-ipc-protocol-types.md) | IPC protocol types and framing | 2 | WP-001, WP-002 | ready |
-| [WP-006](WP-006-store-schema.md) | State store schema v1 | 2 | WP-001, WP-002 | ready |
-| [WP-007](WP-007-graph-simulator-core.md) | Graph simulator core | 2 | WP-001, WP-004 | ready |
-| [WP-009](WP-009-graph-auth.md) | Sign-in and token storage | 2 | — | ready |
-| [WP-012](WP-012-architecture-conformance-checks.md) | Architecture conformance checks | 2 | WP-010 | ready |
-| [WP-008](WP-008-graph-client-foundations.md) | Graph client foundations | 3 | WP-001, WP-007, WP-009 | blocked on wave 2 |
+| [WP-005](WP-005-ipc-protocol-types.md) | IPC protocol types and framing | 2 | WP-001, WP-002 | done (#10) |
+| [WP-006](WP-006-store-schema.md) | State store schema v1 | 2 | WP-001, WP-002 | done (#12) |
+| [WP-007](WP-007-graph-simulator-core.md) | Graph simulator core | 2 | WP-001, WP-004 | done (#13) |
+| [WP-009](WP-009-graph-auth.md) | Sign-in and token storage | 2 | — | done (#16) |
+| [WP-012](WP-012-architecture-conformance-checks.md) | Architecture conformance checks | 2 | WP-010 | done (#9) |
+| [WP-008](WP-008-graph-client-foundations.md) | Graph client foundations | 3 | WP-001, WP-007, WP-009 | ready |
+| [WP-013](WP-013-wave-2-test-follow-ups.md) | Wave 2 test follow-ups | 3 | WP-005, WP-006, WP-009 | ready |
 | [WP-011](WP-011-gate-experiments-g1-g5.md) | Gate experiments G1 and G5 | 4 | WP-008, WP-009 | blocked on wave 3 and on the owner (app registration) |
 
-Wave 1 was merged on 2026-11-14. What it taught is in
-`docs/process/orchestration.md` ("Lessons from wave 1"). Wave 2 needs the owner's go-ahead.
+Waves 1 and 2 are merged. What they taught is in `docs/process/orchestration.md`
+("Lessons from wave 1", "Lessons from wave 2"). Wave 3 needs the owner's go-ahead.
 
 ## Validation gates
 

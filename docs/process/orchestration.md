@@ -89,6 +89,45 @@ Wave 1 (five WPs, 2026-11-14) merged in one sitting. What to keep and what to ch
 - **Cost.** Five WPs used 5 implementers, 5 reviewers and 6 verifiers, plus 5 resumed
   implementer rounds. Plan on about three agents and one fix round per WP.
 
+## Lessons from wave 2
+
+Wave 2 (five WPs, 2026-11-14) took far more rounds than wave 1: the protocol four, the state
+store five, sign-in four, the simulator three, the conformance checks two. That was the right
+outcome for what they are, and it changes how to plan.
+
+- **Foundation packages need adversarial review, and more than one round of it.** Every
+  review of the store and the protocol found a real problem the previous round had not, until
+  one did not. Plan two or three review rounds for anything other code will trust: a wire
+  contract, a store, a test double, credential handling.
+- **Ask the reviewer the question you most fear the answer to.** The most useful briefs were
+  "try to fool this check", "list every public operation and what it can do to a dirty item",
+  "is this converging or should responsibility move elsewhere", and "review as an attacker".
+- **Verification passing is not review passing.** Verifiers repeatedly confirmed that code did
+  what it was asked while reviewers showed that what it was asked was not enough. Both are
+  needed; neither substitutes for the other.
+- **Model-based and mutation testing by the verifier is the strongest evidence available.**
+  Random operation sequences against stated invariants (800,000 steps on the store), random
+  kills, and planted defects found things example tests never would, including a secrets test
+  that missed a planted leak 99 times in 100.
+- **Put invariants where they cannot be bypassed.** The store stopped losing unsynced content
+  only when "has unsynced content" became an explicit column with CHECK constraints, instead
+  of something each operation inferred. Prefer a constraint to a convention.
+- **A ruling can be wrong; say so and rule again.** ADR-0019 fixed pagination and still left
+  an index cursor that skipped files; ADR-0020 corrected it. Three rulings in wave 2 reversed
+  the lead's own earlier text.
+- **Stale verifications waste time.** Several verifiers reported on a tip that had already
+  moved. Do not push to a branch while a verifier is running on it unless the change is
+  tests-only; tell the verifier the commit to check and have it say which commit it checked.
+- **Lockfile conflicts are routine.** Every wave-2 branch conflicted in `Cargo.lock` once
+  another merged. Resolve by taking master's lockfile and letting `cargo check` add the
+  branch's entries, then run `just check`.
+- **Licence and audit configuration is the lead's to change**, and such changes go to the
+  owner afterwards: two were needed (Zlib allowed; audit limited to Linux targets).
+- **Leave non-blocking gaps in a follow-up WP** rather than another round, once a final
+  verification passes (WP-013).
+- **Cost.** Five WPs used roughly 45 agent runs: 5 implementers resumed 17 times, 11 reviews
+  and 17 verifications. Budget eight to ten agent runs for a foundation package.
+
 ## Scale
 
 Start small. The first wave is the test of this process as much as of the code: run it with

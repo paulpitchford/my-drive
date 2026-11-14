@@ -1,6 +1,6 @@
 # WP-009: Sign-in and token storage
 
-- **Status:** ready
+- **Status:** done (#16)
 - **Milestone:** M0
 - **Wave:** 2
 - **Depends on:** —
@@ -41,14 +41,18 @@ boring and correct.
 ## Acceptance criteria
 
 - AC1: The loopback flow completes against a fake authority in tests and returns tokens.
-- AC2: A redirect with a wrong or missing `state` is rejected and no token request is made.
+- AC2 (amended after security review): a redirect with a wrong or missing `state` gets a 400
+  and no token request is made; the loopback listener keeps waiting for the real redirect.
 - AC3: An error redirect (`error=access_denied`) is returned as a typed error with the
   description.
 - AC4: The paste flow accepts the full redirected URL and rejects a URL for a different
   redirect URI.
 - AC5: Ten concurrent callers needing a refresh cause exactly one refresh request.
-- AC6: A rolled refresh token replaces the stored one before the new access token is handed
-  out; if storing fails, the error is returned and the old token is not discarded.
+- AC6 (reworded after review): a rolled refresh token is stored before the new access token
+  is handed out when the store is working. If storing fails, the session continues from
+  memory, the stored old token is never deleted or partly overwritten, the failure is a
+  non-fatal warning, and the write is retried. No access token is handed out for a refresh
+  that was not granted.
 - AC7: `invalid_grant` on refresh produces "needs sign-in"; a network failure does not.
 - AC8: No token value appears in `Debug` output, error messages or log events.
 - AC9: The listener binds only to the loopback interface.

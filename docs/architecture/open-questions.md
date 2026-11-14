@@ -43,6 +43,12 @@ The owner should know these were choices, not findings.
 | Q22 | App registration and publisher verification | Owner | Before WP-011 |
 | Q23 | Can Graph return the same item ID in two casings (as it does for drive IDs since June 2025)? `ItemId` compares exactly | Simulator and gate work | Before the M1 delta WP |
 | Q24 | Which tenants refuse `#` and `%` in names, and how the engine learns it (`hash_and_percent_allowed`) | Lead, in the M1 upload WP | M1 |
+| Q25 | A path can grow past the protocol's 4,096-byte cap (renaming a parent to a longer name). The VFS must refuse creates and renames that would exceed OneDrive's own path limit, and mount points long enough to make that possible must be refused | Lead, in the M2 VFS WP | M2 |
+| Q26 | How a folder's display status is aggregated from its contents (the protocol says only that the daemon computes it) | Lead; amend ADR-0008 | M1 |
+| Q27 | On a shared machine another local user can inject an authorisation code so sign-in completes into their account. The CLI must show the signed-in account and ask for confirmation before creating a mount | Lead, in the M1 CLI WP | M1 |
+| Q28 | The store does not yet record local renames and moves as pending, so a remote metadata apply or an upload completion can revert one; and it lacks "adopt a server item" and "remote deleted while locally modified" operations | Lead, in the M1 engine WP (schema v2, pending-operations records) | M1 |
+| Q29 | The Secret Service client uses the `plain` session, so a token crosses the session bus unencrypted (same-user processes only) | Lead | Before M3 packaging |
+| Q30 | Whether a loopback redirect to `127.0.0.1` rather than `localhost` is accepted by Entra for our app registration (RFC 8252 recommends the literal address) | With the app registration (Q22) | Before WP-011 |
 
 ## Detail questions in the flows and journeys
 
@@ -65,6 +71,6 @@ Rules the ADRs state that CI does not check yet.
 
 | Rule | Status |
 |---|---|
-| ADR-0004 R3: crate dependencies match the overview's diagram | WP-012 |
-| ADR-0017 R3: every ADR rule is named by a test | WP-012 (report only until M1 has code) |
+| ADR-0004 R3: crate dependencies match the overview's diagram | enforced (WP-012) |
+| ADR-0017 R3: every ADR rule is named by a test | reported by `just rule-coverage` (52 of 160 after wave 2); becomes a failing check during M1 |
 | ADR-0017 R4: every journey acceptance ID has exactly one journey test | From M2, when journey tests exist |
