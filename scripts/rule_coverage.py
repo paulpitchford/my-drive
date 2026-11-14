@@ -9,16 +9,22 @@ its body. A list such as `ADR-0008 R5, R7` names each rule in it.
 Tests are Rust functions marked `#[test]` (or any `#[...::test]` attribute) under crates/,
 and Python `test_*` functions under scripts/.
 
+Prints a one-line summary; --verbose prints the full list.
+
 Report only: the exit status is 0 whatever the coverage. It is 1 only if the ADRs cannot
 be read.
 
-Usage: rule_coverage.py [--root DIR]
+Usage: rule_coverage.py [--root DIR] [--verbose]
 """
 
 import argparse
 import re
 import sys
 from pathlib import Path
+
+# Keep scripts/ free of __pycache__ when the shared lexer is imported.
+sys.dont_write_bytecode = True
+from rust_source import lex  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 ADR_DIR = Path("docs/adr")
@@ -36,9 +42,9 @@ NAME_REF = re.compile(r"adr_?(\d{4})_r(\d+)(?![0-9])", re.IGNORECASE)
 
 RUST_TEST_ATTR = re.compile(r"^\s*#\[\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*test\b")
 RUST_FN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)")
-RUST_ABOVE = re.compile(r"^\s*(//|#\[|$)")
-RUST_COMMENT = re.compile(r"//(.*)$")
-RUST_LITERAL = re.compile(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])'")
+# Lines above a test that still belong to it, once comments are blanked: attributes and
+# lines that held only comments or nothing.
+RUST_ABOVE = re.compile(r"^\s*(#\[|$)")
 PY_TEST = re.compile(r"^(\s*)(?:async\s+)?def\s+(test\w*)\s*\(")
 
 
@@ -87,8 +93,15 @@ def source_files(root, dirs, suffix):
                 yield path
 
 
-def rust_tests(lines):
-    """Yield (line_number, name, text_naming_it) for each test function in Rust source."""
+def rust_tests(text):
+    """Yield (line_number, name, text_naming_it) for each test function in Rust source.
+
+    Structure (attributes, `fn`, braces) is read from the source with comments and string
+    literals blanked out, so a brace inside a string, even one spanning lines, cannot move
+    where a test ends. The text naming a test is the comments above it and in its body.
+    """
+    code, comments = lex(text)
+    lines = code.split("\n")
     index = 0
     while index < len(lines):
         if not RUST_TEST_ATTR.match(lines[index]):
@@ -103,26 +116,22 @@ def rust_tests(lines):
         start = index
         while start > 0 and RUST_ABOVE.match(lines[start - 1]):
             start -= 1
-        above = [lines[i] for i in range(start, fn_index)]
-        body = []
         depth = 0
         opened = False
         end = fn_index
         for end in range(fn_index, len(lines)):
-            # Drop string and char literals first so a brace inside one is not counted.
-            code = RUST_LITERAL.sub('""', lines[end]).split("//", 1)[0]
-            body.append(lines[end])
-            depth += code.count("{") - code.count("}")
-            opened = opened or "{" in code
+            depth += lines[end].count("{") - lines[end].count("}")
+            opened = opened or "{" in lines[end]
             if opened and depth <= 0:
                 break
-        comments = [m.group(1) for m in map(RUST_COMMENT.search, above + body) if m]
-        yield fn_index + 1, name, "\n".join(comments)
+        naming = [comments[i] for i in range(start, end + 1) if i in comments]
+        yield fn_index + 1, name, "\n".join(naming)
         index = end + 1
 
 
-def python_tests(lines):
+def python_tests(text):
     """Yield (line_number, name, text_naming_it) for each test function in Python source."""
+    lines = text.splitlines()
     for index, line in enumerate(lines):
         match = PY_TEST.match(line)
         if not match:
@@ -156,9 +165,9 @@ def find_tests(root):
     scanners = [(RUST_DIRS, ".rs", rust_tests), (PYTHON_DIRS, ".py", python_tests)]
     for dirs, suffix, scan in scanners:
         for path in source_files(root, dirs, suffix):
-            lines = path.read_text(encoding="utf-8").splitlines()
+            source = path.read_text(encoding="utf-8")
             rel = path.relative_to(root)
-            for number, name, text in scan(lines):
+            for number, name, text in scan(source):
                 refs = set(refs_in_name(name)) | set(refs_in_text(text))
                 for ref in refs:
                     named.setdefault(ref, []).append(f"{rel}:{number} {name}")
@@ -193,21 +202,30 @@ def report(root):
         for adr, rule in unknown:
             for test in sorted(named[(adr, rule)]):
                 out.append(f"    ADR-{adr} R{rule}: {test}")
+    summary = (f"{total - len(uncovered)} of {total} rule(s) named by a test, "
+               f"{len(uncovered)} with none")
+    if unknown:
+        summary += f", {len(unknown)} named rule(s) that do not exist"
     out.append("")
-    out.append(f"{total - len(uncovered)} of {total} rule(s) named by a test")
+    out.append(summary)
     return out, total, len(uncovered)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", default=str(ROOT), help="repository root (default: repo)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="list every rule and its tests, not only the summary")
     args = parser.parse_args(argv)
     try:
         lines, _, _ = report(Path(args.root))
     except OSError as err:
         print(f"cannot read the ADRs: {err}")
         return 1
-    print("\n".join(lines))
+    if args.verbose:
+        print("\n".join(lines))
+    else:
+        print(f"rule coverage: {lines[-1]} (--verbose lists them)")
     return 0
 
 

@@ -78,11 +78,28 @@ class Fixture:
         self.dev_deps = {name: [] for name in CRATES}
         self.build_deps = {name: [] for name in CRATES}
         self.roots = {name: FORBID for name in CRATES}
+        self.build_scripts = {}
+        # Extra files by path relative to a crate, e.g. tests/it.rs.
+        self.extra = {name: {} for name in CRATES}
+        # Crates outside the workspace (excluded), as {dir_name: (package, [path deps])}.
+        self.outside = {}
+        # Extra path dependencies as {crate: [(dep_name, path)]}.
+        self.path_deps = {}
         self.diagram = DIAGRAM
 
     def write(self):
+        exclude = ", ".join(f'"{name}"' for name in self.outside)
         (self.root / "Cargo.toml").write_text(
-            '[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n', encoding="utf-8")
+            f'[workspace]\nresolver = "2"\nmembers = ["crates/*"]\nexclude = [{exclude}]\n',
+            encoding="utf-8")
+        for directory, (package, deps) in self.outside.items():
+            crate = self.root / directory
+            (crate / "src").mkdir(parents=True, exist_ok=True)
+            manifest = f'[package]\nname = "{package}"\nversion = "0.0.0"\nedition = "2021"\n'
+            manifest += "\n[dependencies]\n" + "".join(
+                f'{dep} = {{ path = "../crates/{dep}" }}\n' for dep in deps)
+            (crate / "Cargo.toml").write_text(manifest, encoding="utf-8")
+            (crate / "src" / "lib.rs").write_text(FORBID, encoding="utf-8")
         docs = self.root / "docs" / "architecture"
         docs.mkdir(parents=True, exist_ok=True)
         (docs / "overview.md").write_text(overview(self.diagram), encoding="utf-8")
@@ -95,9 +112,20 @@ class Fixture:
                                   ("build-dependencies", self.build_deps[name])):
                 manifest.append(f"\n[{section}]\n")
                 manifest.extend(f'{dep} = {{ path = "../{dep}" }}\n' for dep in deps)
+                if section == "dependencies":
+                    manifest.extend(f'{dep} = {{ path = "{path}" }}\n'
+                                    for dep, path in self.path_deps.get(name, []))
             (crate / "Cargo.toml").write_text("".join(manifest), encoding="utf-8")
             root_file = "main.rs" if name in BINS else "lib.rs"
             (crate / "src" / root_file).write_text(self.roots[name], encoding="utf-8")
+            build = crate / "build.rs"
+            if name in self.build_scripts:
+                build.write_text(self.build_scripts[name], encoding="utf-8")
+            elif build.exists():
+                build.unlink()
+            for rel, text in self.extra[name].items():
+                (crate / rel).parent.mkdir(parents=True, exist_ok=True)
+                (crate / rel).write_text(text, encoding="utf-8")
         return self
 
     def problems(self):
@@ -106,17 +134,16 @@ class Fixture:
 
 class DiagramParsing(unittest.TestCase):
     def test_ids_resolve_to_crate_names_through_labels(self):
-        crates, edges, dev_only = check_arch.parse_crate_diagram(overview(DIAGRAM))
+        crates, edges = check_arch.parse_crate_diagram(overview(DIAGRAM))
         self.assertEqual(crates["graphcrate"], "mydrive-graph")
         self.assertEqual(crates["sim"], "mydrive-graph-sim")
         self.assertEqual(crates["cli"], "mydrive-cli")
-        self.assertEqual(dev_only, {"mydrive-graph-sim"})
         self.assertIn(("mydrive-engine", "mydrive-graph"), edges)
         self.assertIn(("mydrive-graph-sim", "mydrive-core"), edges)
         self.assertEqual(len(edges), 12)
 
     def test_only_the_crates_section_is_read(self):
-        crates, _, _ = check_arch.parse_crate_diagram(overview(DIAGRAM))
+        crates, _ = check_arch.parse_crate_diagram(overview(DIAGRAM))
         self.assertNotIn("a", crates)
 
     def test_chains_edge_labels_and_ampersands(self):
@@ -128,7 +155,7 @@ class DiagramParsing(unittest.TestCase):
                     e("x-e") --> d;
                 end
             """)
-        _, edges, _ = check_arch.parse_crate_diagram(overview(diagram))
+        _, edges = check_arch.parse_crate_diagram(overview(diagram))
         self.assertEqual(edges, {("x-a", "x-b"), ("x-b", "x-c"), ("x-a", "x-d"),
                                  ("x-b", "x-d"), ("x-e", "x-d")})
 
@@ -217,6 +244,42 @@ class DependencyCheck(unittest.TestCase):
         fixture.diagram = DIAGRAM.replace("    engine --> graphcrate\n", "")
         self.assertIn("mydrive-engine -> mydrive-graph", "\n".join(fixture.problems()))
 
+    def test_adr_0004_r3_path_dependency_on_a_crate_outside_the_workspace_fails(self):
+        """ADR-0004 R3: a forbidden edge cannot be routed through an excluded shim crate."""
+        fixture = Fixture(self)
+        fixture.outside["shim"] = ("mydrive-shim", ["mydrive-graph"])
+        fixture.path_deps["mydrive-store"] = [("mydrive-shim", "../../shim")]
+        problems = fixture.problems()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("mydrive-store -> mydrive-shim", problems[0])
+        self.assertIn("not a workspace member", problems[0])
+
+    def test_adr_0017_r1_graph_sim_rule_does_not_depend_on_the_label(self):
+        """ADR-0004 R4, ADR-0017 R1: dropping "(dev only)" from the label and drawing an
+        edge to the simulator does not let a normal dependency on it pass."""
+        fixture = Fixture(self)
+        fixture.diagram = DIAGRAM.replace(" (dev only)", "") + "    engine --> sim\n"
+        fixture.deps["mydrive-engine"].append("mydrive-graph-sim")
+        self.assertIn("mydrive-engine -> mydrive-graph-sim (normal dependency)",
+                      "\n".join(fixture.problems()))
+
+    def test_dev_only_label_on_another_crate_grants_nothing(self):
+        fixture = Fixture(self)
+        fixture.diagram = DIAGRAM.replace('core["mydrive-core"]',
+                                          'core["mydrive-core (dev only)"]')
+        fixture.dev_deps["mydrive-cli"].append("mydrive-core")
+        self.assertIn("mydrive-cli -> mydrive-core (dev dependency)",
+                      "\n".join(fixture.problems()))
+
+    def test_cargo_runs_from_the_repository_not_the_checked_workspace(self):
+        """cargo metadata takes --manifest-path and runs from this repository, so cargo
+        configuration in the checked directory (here, a broken one) is not used."""
+        fixture = Fixture(self)
+        config = fixture.root / ".cargo" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text("this is not [ valid toml\n", encoding="utf-8")
+        self.assertEqual(fixture.problems(), [])
+
 
 class UnsafeCheck(unittest.TestCase):
     def test_ac2_removing_forbid_from_a_library_root_fails(self):
@@ -246,6 +309,73 @@ class UnsafeCheck(unittest.TestCase):
     def test_vfs_is_exempt(self):
         fixture = Fixture(self)
         fixture.roots["mydrive-vfs"] = "#![deny(unsafe_code)]\n"
+        fixture.build_scripts["mydrive-vfs"] = "fn main() { unsafe {} }\n"
+        self.assertEqual(fixture.problems(), [])
+
+    def assert_root_rejected(self, source):
+        fixture = Fixture(self)
+        fixture.roots["mydrive-core"] = source
+        problems = fixture.problems()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("mydrive-core: crate root", problems[0])
+
+    def test_forbid_inside_a_block_comment_does_not_count(self):
+        self.assert_root_rejected("/*\n#![forbid(unsafe_code)]\n*/\npub fn f() {}\n")
+
+    def test_forbid_inside_a_nested_block_comment_does_not_count(self):
+        self.assert_root_rejected("/* outer /* inner */\n#![forbid(unsafe_code)]\n*/\n")
+
+    def test_forbid_inside_an_inline_module_does_not_count(self):
+        self.assert_root_rejected("mod inner {\n#![forbid(unsafe_code)]\n}\n")
+
+    def test_forbid_inside_a_string_literal_does_not_count(self):
+        self.assert_root_rejected('pub const S: &str = "\n#![forbid(unsafe_code)]\n";\n')
+
+    def test_forbid_inside_a_raw_string_literal_does_not_count(self):
+        self.assert_root_rejected('pub const S: &str = r#"\n#![forbid(unsafe_code)]\n"#;\n')
+
+    def test_indented_forbid_does_not_count(self):
+        self.assert_root_rejected("    #![forbid(unsafe_code)]\n")
+
+    def test_forbid_after_the_first_item_does_not_count(self):
+        self.assert_root_rejected("pub fn f() {}\n#![forbid(unsafe_code)]\n")
+
+    def test_forbid_after_comments_and_other_attributes_counts(self):
+        fixture = Fixture(self)
+        fixture.roots["mydrive-core"] = textwrap.dedent("""\
+            //! Crate docs.
+            /* A block comment
+               spanning lines. */
+            #![warn(missing_docs)]
+            #![forbid(
+                unsafe_code
+            )]
+
+            pub fn f() {}
+            """)
+        self.assertEqual(fixture.problems(), [])
+
+    def test_build_script_with_unsafe_fails(self):
+        """WP-012 ruling: build scripts get the same safety as crate roots."""
+        fixture = Fixture(self)
+        fixture.build_scripts["mydrive-store"] = "fn main() {\n    unsafe { }\n}\n"
+        problems = fixture.problems()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("mydrive-store: build script", problems[0])
+
+    def test_build_script_mentioning_unsafe_only_in_comments_passes(self):
+        fixture = Fixture(self)
+        fixture.build_scripts["mydrive-store"] = (
+            "// No unsafe here.\n/* unsafe */\nfn main() {}\n")
+        self.assertEqual(fixture.problems(), [])
+
+    def test_test_example_and_bench_roots_are_not_checked(self):
+        fixture = Fixture(self)
+        fixture.extra["mydrive-store"] = {
+            "tests/it.rs": "#[test]\nfn t() {}\n",
+            "examples/ex.rs": "fn main() {}\n",
+            "benches/b.rs": "fn main() {}\n",
+        }
         self.assertEqual(fixture.problems(), [])
 
 

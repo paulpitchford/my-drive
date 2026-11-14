@@ -148,6 +148,50 @@ class RuleCoverage(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("3 of 4 rule(s) named by a test", out.getvalue())
 
+    def test_default_output_is_the_one_line_summary(self):
+        with redirect_stdout(io.StringIO()) as out:
+            rule_coverage.main(["--root", str(fixture(self))])
+        self.assertEqual(out.getvalue().splitlines(), [
+            "rule coverage: 3 of 4 rule(s) named by a test, 1 with none, 1 named rule(s) "
+            "that do not exist (--verbose lists them)"])
+
+    def test_verbose_lists_every_rule_and_test(self):
+        root = fixture(self)
+        with redirect_stdout(io.StringIO()) as out:
+            rule_coverage.main(["--root", str(root), "--verbose"])
+        lines, _, _ = rule_coverage.report(root)
+        self.assertEqual(out.getvalue().splitlines(), lines)
+        self.assertIn("    ADR-0001 R3", lines)
+
+    def test_multi_line_string_with_unbalanced_brace_does_not_merge_tests(self):
+        """The reviewer's case: a string spanning lines with an unbalanced brace in test
+        `a` must not swallow tests `b` and `d`, or credit their rules to `a`."""
+        source = textwrap.dedent("""\
+            /// ADR-0001 R1
+            #[test]
+            fn a() {
+                let s = "multi
+            line {";
+            }
+
+            /// ADR-0001 R2
+            #[test]
+            fn b() {
+                let c = '{';
+            }
+
+            /// ADR-0002 R1
+            #[test]
+            fn d() {
+                let r = r#"}"#;
+            }
+            """)
+        tests = list(rule_coverage.rust_tests(source))
+        self.assertEqual([name for _, name, _ in tests], ["a", "b", "d"])
+        credited = {name: set(rule_coverage.refs_in_text(text)) for _, name, text in tests}
+        self.assertEqual(credited, {"a": {("0001", 1)}, "b": {("0001", 2)},
+                                    "d": {("0002", 1)}})
+
     def test_reference_forms(self):
         text = textwrap.dedent("""\
             ADR-0008 R5, R7 and ADR-0012 R3 and R4; ADR-0015 "Names"; ADR-0001 R10
