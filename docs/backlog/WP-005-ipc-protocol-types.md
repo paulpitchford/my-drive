@@ -6,7 +6,7 @@
 - **Depends on:** WP-001, WP-002
 - **Gates:** —
 - **Owned paths:** `crates/mydrive-ipc/**`, `docs/protocol/**`
-- **ADRs:** ADR-0009, ADR-0019, ADR-0004, ADR-0008
+- **ADRs:** ADR-0009, ADR-0019, ADR-0020, ADR-0004, ADR-0008
 - **Flows / journeys:** F11, J17
 
 ## Goal
