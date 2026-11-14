@@ -61,6 +61,12 @@ catalogue, so the daemon, CLI and adapters can be built in parallel against one 
 Adapters will be written in Python, shell and Lua. Keep the JSON plain: no tagged-enum
 shapes that are awkward outside Rust, snake_case field names, strings for enums.
 
+## Shared files
+
+This WP may change `Cargo.lock`, and only as a result of dependencies it adds to its own
+crate from `[workspace.dependencies]`. Other wave-2 WPs do the same in parallel; the lead
+resolves `Cargo.lock` conflicts at merge. Do not edit the root `Cargo.toml`.
+
 ## Open questions
 
 None.

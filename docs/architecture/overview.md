@@ -100,6 +100,7 @@ flowchart TB
     ipc["mydrive-ipc"] --> core
     store["mydrive-store"] --> core
     graphcrate["mydrive-graph"] --> core
+    sim["mydrive-graph-sim (dev only)"] --> core
     core["mydrive-core"]
 ```
 

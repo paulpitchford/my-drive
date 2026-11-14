@@ -62,8 +62,14 @@ boring and correct.
 
 ## Notes
 
-Never an embedded web view (ADR-0010). Scopes and authority are parameters; this WP does not
+`sha2` and `rand` are in `[workspace.dependencies]` for PKCE. Never an embedded web view (ADR-0010). Scopes and authority are parameters; this WP does not
 hard-code them beyond documented defaults.
+
+## Shared files
+
+This WP may change `Cargo.lock`, and only as a result of dependencies it adds to its own
+crate from `[workspace.dependencies]`. Other wave-2 WPs do the same in parallel; the lead
+resolves `Cargo.lock` conflicts at merge. Do not edit the root `Cargo.toml`.
 
 ## Open questions
 
