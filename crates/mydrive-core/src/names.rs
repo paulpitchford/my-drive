@@ -11,8 +11,28 @@
 //! `research_notes/OneDrive Linux on demand clients/sharepoint_libraries.md`, section
 //! "Names, paths, types", which records Microsoft's page
 //! [Restrictions and limitations in OneDrive and SharePoint][restrictions] and the
-//! [rclone OneDrive docs][rclone]. Where a rule was ambiguous the stricter reading is
-//! implemented and the rule's doc comment says so.
+//! [rclone OneDrive docs][rclone].
+//!
+//! # Doubtful rules
+//!
+//! The server is the final authority. A name wrongly accepted here fails at upload and is
+//! shown as an error; a name wrongly rejected here never syncs. So where the source is silent
+//! or ambiguous this module accepts, and the rule's doc comment records the doubt:
+//!
+//! - `#` and `%`: the source says only "some organisations" refuse them. They are accepted
+//!   unless [`NameContext::hash_and_percent_allowed`] is false for a work account.
+//! - Reserved device names: only the bare names are rejected (`CON`, any case). The source
+//!   does not say whether `CON.txt` is reserved, so it is accepted.
+//! - `.lock` and `desktop.ini`: rejected as whole names only, so `Cargo.lock` is accepted.
+//! - Case: `_vti_`, `forms`, `.lock`, `desktop.ini` and device names are matched
+//!   case-insensitively. The source does not state a case rule; the server namespace is
+//!   case-insensitive, so a different-case spelling is taken to name the same thing.
+//! - Trailing period: not in the source, so it is accepted (flow F04 step 12 lists it; the
+//!   lead ruled it out as unsourced).
+//! - The 400-character path limit: how it is counted is unverified (see
+//!   [`validate_server_path`]).
+//! - Case folding: an approximation of the server's comparison (see
+//!   [`find_case_collisions`]).
 //!
 //! # Rules from the research note not implemented here, and why
 //!
@@ -52,6 +72,9 @@ pub struct NameContext {
     /// Whether the item sits directly in the root folder of its drive. A work drive, including
     /// OneDrive for Business, is a SharePoint document library, so its root is a library root.
     pub at_library_root: bool,
+    /// Whether the tenant accepts `#` and `%` in names. True in the normal case; the engine
+    /// sets it false for a tenant known to refuse them. Ignored for personal accounts.
+    pub hash_and_percent_allowed: bool,
 }
 
 /// Characters the server rejects anywhere in a name, for every account kind.
@@ -60,19 +83,20 @@ pub struct NameContext {
 /// restrictions page.
 pub const FORBIDDEN_CHARACTERS: [char; 9] = ['"', '*', ':', '<', '>', '?', '/', '\\', '|'];
 
-/// Characters rejected in work accounts only.
+/// Characters some work tenants refuse.
 ///
-/// Source: research note, "some organisations do not yet support `#` and `%`". Whether a given
-/// organisation supports them cannot be known from the name, so the stricter reading applies:
-/// they are rejected in every work account. Personal accounts are not named by the source and
-/// accept them.
-pub const WORK_FORBIDDEN_CHARACTERS: [char; 2] = ['#', '%'];
+/// Source: research note, "some organisations do not yet support `#` and `%`". Which
+/// organisations cannot be known from the name, so they are accepted unless the context says
+/// the tenant refuses them ([`NameContext::hash_and_percent_allowed`]). Personal accounts are
+/// not organisations and always accept them.
+pub const TENANT_RESTRICTED_CHARACTERS: [char; 2] = ['#', '%'];
 
-/// Reserved device names, rejected as the whole name or as the part before the first `.`.
+/// Reserved device names, rejected when they are the whole name, in any case.
 ///
 /// Source: research note, "Reserved names: ... `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`,
-/// `LPT0`–`LPT9`". The source does not say whether a name with an extension (`CON.txt`) or a
-/// different case (`con`) is also reserved; the stricter reading rejects both, as Windows does.
+/// `LPT0`–`LPT9`". The source does not say whether a name with an extension (`CON.txt`) is
+/// also reserved, as it is on Windows; it is accepted here and left to the server. Matching is
+/// case-insensitive because the server namespace is.
 pub const RESERVED_DEVICE_NAMES: [&str; 24] = [
     "CON", "PRN", "AUX", "NUL", "COM0", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
     "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -81,9 +105,8 @@ pub const RESERVED_DEVICE_NAMES: [&str; 24] = [
 /// Names reserved as a whole.
 ///
 /// Source: research note, "Reserved names: `.lock`, ... `desktop.ini`". They are matched as
-/// the whole name, case-insensitively (stricter reading, since the namespace is
-/// case-insensitive). The source lists them among names, not extensions, so `Cargo.lock` is
-/// accepted; this reading is unverified.
+/// the whole name, case-insensitively, because the server namespace is case-insensitive. The
+/// source lists them among names, not extensions, so `Cargo.lock` is accepted.
 pub const RESERVED_WHOLE_NAMES: [&str; 2] = [".lock", "desktop.ini"];
 
 /// Prefix the server rejects.
@@ -94,17 +117,18 @@ pub const FORBIDDEN_PREFIX: &str = "~$";
 /// Substring the server rejects anywhere in a name.
 ///
 /// Source: research note, "`_vti_` cannot appear anywhere in a name". Matched
-/// case-insensitively (stricter reading; the source does not state the case rule). Applied to
-/// personal accounts too, since the source does not restrict it to SharePoint.
+/// case-insensitively; the source does not state the case rule, and the server namespace is
+/// case-insensitive. Applied to personal accounts too, since the source lists it for both.
 pub const FORBIDDEN_SUBSTRING: &str = "_vti_";
 
 /// Name the server rejects at a library root in work accounts.
 ///
 /// Source: research note, "`forms` cannot be used for a file or folder at the library root".
-/// Matched case-insensitively (stricter reading).
+/// Matched case-insensitively; the source does not state the case rule. The root of a
+/// OneDrive for Business drive counts as a library root.
 pub const LIBRARY_ROOT_RESERVED_NAME: &str = "forms";
 
-/// The server path must be shorter than this many characters.
+/// The server path must be shorter than this many characters, counted as UTF-16 code units.
 ///
 /// Source: research note, the path must be "fewer than 400 characters for OneDrive, OneDrive
 /// for Business and SharePoint Online" (rclone OneDrive docs).
@@ -118,7 +142,7 @@ pub enum NameProblem {
     Empty,
     /// The name contains a character the server rejects.
     ForbiddenCharacter(char),
-    /// The name is, or starts with, a reserved name.
+    /// The name is a reserved name.
     ReservedName(String),
     /// The name starts with a prefix the server rejects.
     ForbiddenPrefix(&'static str),
@@ -130,8 +154,6 @@ pub enum NameProblem {
     LeadingSpace,
     /// The name ends with a space.
     TrailingSpace,
-    /// The name ends with a period.
-    TrailingPeriod,
     /// The server path is too long.
     PathTooLong {
         /// Length counted in UTF-16 code units.
@@ -159,10 +181,9 @@ impl fmt::Display for NameProblem {
             }
             Self::LeadingSpace => write!(f, "names may not start with a space"),
             Self::TrailingSpace => write!(f, "names may not end with a space"),
-            Self::TrailingPeriod => write!(f, "names may not end with a period"),
             Self::PathTooLong { length, limit } => write!(
                 f,
-                "the server path is {length} characters long and must be fewer than {limit}"
+                "the server path is {length} UTF-16 code units long and must be fewer than {limit}"
             ),
             Self::CaseCollision { with } => {
                 write!(
@@ -196,17 +217,17 @@ impl NameError {
 /// Checks whether a single name (one path component) can exist on the server in `context`.
 ///
 /// Returns the first problem found. The checks, each citing its source on the constant or
-/// variant it uses, are: empty name; [`FORBIDDEN_CHARACTERS`]; [`WORK_FORBIDDEN_CHARACTERS`]
-/// in work accounts; leading space, trailing space, trailing period; [`FORBIDDEN_PREFIX`];
-/// [`FORBIDDEN_SUBSTRING`]; [`RESERVED_WHOLE_NAMES`]; [`RESERVED_DEVICE_NAMES`]; and
-/// [`LIBRARY_ROOT_RESERVED_NAME`] at a work library root.
+/// variant it uses, are: empty name; [`FORBIDDEN_CHARACTERS`];
+/// [`TENANT_RESTRICTED_CHARACTERS`] in a work account whose tenant refuses them; leading
+/// space, trailing space; [`FORBIDDEN_PREFIX`]; [`FORBIDDEN_SUBSTRING`];
+/// [`RESERVED_WHOLE_NAMES`]; [`RESERVED_DEVICE_NAMES`]; and [`LIBRARY_ROOT_RESERVED_NAME`] at
+/// a work library root.
 ///
 /// Leading and trailing spaces: research note, "no leading or trailing spaces". Only U+0020
 /// is checked; the source names no other whitespace.
 ///
-/// Trailing period: not in the research note. Flow F04 step 12 and this work package list it,
-/// and Windows rejects it, so the stricter reading rejects it. Unverified against Microsoft's
-/// page.
+/// A trailing period is accepted: the source does not list it (see the module's doubtful
+/// rules).
 pub fn validate_name(name: &str, context: NameContext) -> Result<(), NameError> {
     let fail = |problem| Err(NameError::new(name, problem));
 
@@ -217,7 +238,10 @@ pub fn validate_name(name: &str, context: NameContext) -> Result<(), NameError> 
         return fail(NameProblem::ForbiddenCharacter(c));
     }
     if context.account == AccountKind::Work
-        && let Some(c) = name.chars().find(|c| WORK_FORBIDDEN_CHARACTERS.contains(c))
+        && !context.hash_and_percent_allowed
+        && let Some(c) = name
+            .chars()
+            .find(|c| TENANT_RESTRICTED_CHARACTERS.contains(c))
     {
         return fail(NameProblem::ForbiddenCharacter(c));
     }
@@ -226,9 +250,6 @@ pub fn validate_name(name: &str, context: NameContext) -> Result<(), NameError> 
     }
     if name.ends_with(' ') {
         return fail(NameProblem::TrailingSpace);
-    }
-    if name.ends_with('.') {
-        return fail(NameProblem::TrailingPeriod);
     }
     if name.starts_with(FORBIDDEN_PREFIX) {
         return fail(NameProblem::ForbiddenPrefix(FORBIDDEN_PREFIX));
@@ -240,11 +261,9 @@ pub fn validate_name(name: &str, context: NameContext) -> Result<(), NameError> 
     if let Some(reserved) = RESERVED_WHOLE_NAMES.iter().find(|r| lower == **r) {
         return fail(NameProblem::ReservedName((*reserved).to_owned()));
     }
-    // Windows also treats "CON .txt" as CON, so trailing spaces before the dot are ignored.
-    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
     if let Some(reserved) = RESERVED_DEVICE_NAMES
         .iter()
-        .find(|r| stem.eq_ignore_ascii_case(r))
+        .find(|r| name.eq_ignore_ascii_case(r))
     {
         return fail(NameProblem::ReservedName((*reserved).to_owned()));
     }
@@ -261,13 +280,14 @@ pub fn validate_name(name: &str, context: NameContext) -> Result<(), NameError> 
 
 /// Checks a full server-relative path against the [`SERVER_PATH_LIMIT`].
 ///
-/// The research note says the counting rule (decoded or encoded, which segments are included)
-/// was not confirmed, so this rule is unverified. The caller passes the server path exactly as
-/// it will be sent, already encoded, and for a library including the site and library
-/// segments (research note: "for a library includes the site and library path segments").
-/// The length is counted in UTF-16 code units, which is never less than the number of Unicode
-/// characters, so this is the stricter reading. A path of exactly 400 units is rejected
-/// ("fewer than 400").
+/// The caller passes the decoded server-relative path: plain text, not percent-encoded, and
+/// for a library including the site and library segments (research note: "for a library
+/// includes the site and library path segments"). The length is counted in UTF-16 code units,
+/// so a character outside the Basic Multilingual Plane counts twice. A path of exactly 400
+/// units is rejected ("fewer than 400").
+///
+/// The counting rule is unverified: the research note says the Microsoft article on how the
+/// limit is counted (decoded or encoded, which segments, which unit) was not fetched.
 pub fn validate_server_path(path: &str) -> Result<(), NameError> {
     let length = path.encode_utf16().count();
     if length >= SERVER_PATH_LIMIT {
@@ -345,32 +365,41 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    const PERSONAL: NameContext = NameContext {
-        account: AccountKind::Personal,
-        at_library_root: false,
-    };
-    const PERSONAL_ROOT: NameContext = NameContext {
-        account: AccountKind::Personal,
-        at_library_root: true,
-    };
-    const WORK: NameContext = NameContext {
-        account: AccountKind::Work,
-        at_library_root: false,
-    };
-    const WORK_ROOT: NameContext = NameContext {
-        account: AccountKind::Work,
-        at_library_root: true,
-    };
-    const ALL_CONTEXTS: [NameContext; 4] = [PERSONAL, PERSONAL_ROOT, WORK, WORK_ROOT];
+    const fn context(account: AccountKind, at_library_root: bool, hash: bool) -> NameContext {
+        NameContext {
+            account,
+            at_library_root,
+            hash_and_percent_allowed: hash,
+        }
+    }
+
+    const PERSONAL: NameContext = context(AccountKind::Personal, false, true);
+    const PERSONAL_ROOT: NameContext = context(AccountKind::Personal, true, true);
+    const WORK: NameContext = context(AccountKind::Work, false, true);
+    const WORK_ROOT: NameContext = context(AccountKind::Work, true, true);
+    const WORK_NO_HASH: NameContext = context(AccountKind::Work, false, false);
+    const WORK_ROOT_NO_HASH: NameContext = context(AccountKind::Work, true, false);
+    const ALL_CONTEXTS: [NameContext; 6] = [
+        PERSONAL,
+        PERSONAL_ROOT,
+        WORK,
+        WORK_ROOT,
+        WORK_NO_HASH,
+        WORK_ROOT_NO_HASH,
+    ];
 
     fn problem(name: &str, context: NameContext) -> Option<NameProblem> {
         validate_name(name, context).err().map(|e| e.problem)
     }
 
-    /// AC1, ADR-0015 "Names": reserved characters. Each is rejected and named.
+    /// AC1, ADR-0015 "Names": reserved characters. Each character the source lists is rejected
+    /// and named. The list is written out here, not taken from the module's constant, so that
+    /// dropping a character from the constant fails this test.
     #[test]
     fn forbidden_characters_are_rejected_and_named() {
-        for c in FORBIDDEN_CHARACTERS {
+        // Research note: "Disallowed characters: `" * : < > ? / \ |`".
+        let source = ['"', '*', ':', '<', '>', '?', '/', '\\', '|'];
+        for c in source {
             for name in [format!("{c}"), format!("a{c}b"), format!("Q3{c} plan.txt")] {
                 for context in ALL_CONTEXTS {
                     assert_eq!(
@@ -391,29 +420,41 @@ mod tests {
         assert!(err.to_string().contains("':'"), "{err}");
     }
 
-    /// AC1: `#` and `%` are rejected in work accounts (stricter reading) and accepted in
-    /// personal accounts.
+    /// AC1: `#` and `%` are accepted unless a work tenant is marked as refusing them, and then
+    /// the error names the character.
     #[test]
-    fn hash_and_percent_depend_on_account_kind() {
-        for c in WORK_FORBIDDEN_CHARACTERS {
+    fn hash_and_percent_are_rejected_only_where_the_tenant_refuses_them() {
+        // Research note: "some organisations do not yet support `#` and `%`".
+        for c in ['#', '%'] {
             let name = format!("100{c} done");
-            assert_eq!(problem(&name, PERSONAL), None);
-            assert_eq!(problem(&name, PERSONAL_ROOT), None);
-            assert_eq!(
-                problem(&name, WORK),
-                Some(NameProblem::ForbiddenCharacter(c))
-            );
-            assert_eq!(
-                problem(&name, WORK_ROOT),
-                Some(NameProblem::ForbiddenCharacter(c))
-            );
+            for accepting in [
+                PERSONAL,
+                PERSONAL_ROOT,
+                WORK,
+                WORK_ROOT,
+                context(AccountKind::Personal, false, false),
+            ] {
+                assert_eq!(problem(&name, accepting), None, "{accepting:?}");
+            }
+            for refusing in [WORK_NO_HASH, WORK_ROOT_NO_HASH] {
+                assert_eq!(
+                    problem(&name, refusing),
+                    Some(NameProblem::ForbiddenCharacter(c))
+                );
+            }
         }
     }
 
-    /// AC2, ADR-0015 "Names": reserved device names, any case, with or without an extension.
+    /// AC2, ADR-0015 "Names": bare reserved device names are rejected in any case.
     #[test]
     fn reserved_device_names_are_rejected() {
-        for reserved in RESERVED_DEVICE_NAMES {
+        // Research note: "`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`".
+        let mut source = vec!["CON".to_owned(), "PRN".into(), "AUX".into(), "NUL".into()];
+        for n in 0..=9 {
+            source.push(format!("COM{n}"));
+            source.push(format!("LPT{n}"));
+        }
+        for reserved in source {
             let lower = reserved.to_lowercase();
             let mixed: String = reserved
                 .chars()
@@ -426,19 +467,11 @@ mod tests {
                     }
                 })
                 .collect();
-            let cases = [
-                reserved.to_owned(),
-                lower.clone(),
-                mixed,
-                format!("{reserved}.txt"),
-                format!("{lower}.tar.gz"),
-                format!("{lower} .txt"),
-            ];
-            for name in cases {
+            for name in [reserved.clone(), lower, mixed] {
                 for context in ALL_CONTEXTS {
                     assert_eq!(
                         problem(&name, context),
-                        Some(NameProblem::ReservedName(reserved.to_owned())),
+                        Some(NameProblem::ReservedName(reserved.clone())),
                         "{name:?} in {context:?}"
                     );
                 }
@@ -446,10 +479,16 @@ mod tests {
         }
     }
 
-    /// AC2: names that only contain or extend a device name are accepted.
+    /// AC2: names that contain or extend a device name are accepted; the source does not say
+    /// a name with an extension is reserved.
     #[test]
     fn names_resembling_device_names_are_accepted() {
         for name in [
+            "con.txt",
+            "aux.c",
+            "CON .txt",
+            "nul.tar.gz",
+            "LPT1.log",
             "CONSOLE",
             "console.log",
             "COM10",
@@ -522,33 +561,41 @@ mod tests {
     #[test]
     fn forms_is_rejected_only_at_a_work_library_root() {
         for name in ["forms", "Forms", "FORMS"] {
-            assert_eq!(
-                problem(name, WORK_ROOT),
-                Some(NameProblem::ReservedAtLibraryRoot("forms"))
-            );
-            assert_eq!(problem(name, WORK), None);
-            assert_eq!(problem(name, PERSONAL), None);
-            assert_eq!(problem(name, PERSONAL_ROOT), None);
+            for root in [WORK_ROOT, WORK_ROOT_NO_HASH] {
+                assert_eq!(
+                    problem(name, root),
+                    Some(NameProblem::ReservedAtLibraryRoot("forms"))
+                );
+            }
+            for elsewhere in [WORK, WORK_NO_HASH, PERSONAL, PERSONAL_ROOT] {
+                assert_eq!(problem(name, elsewhere), None, "{elsewhere:?}");
+            }
         }
         assert_eq!(problem("forms.docx", WORK_ROOT), None);
         assert_eq!(problem("my forms", WORK_ROOT), None);
     }
 
-    /// ADR-0015 "Names": leading and trailing spaces and trailing periods are rejected.
+    /// ADR-0015 "Names": leading and trailing spaces are rejected.
     #[test]
-    fn leading_and_trailing_characters_are_rejected() {
+    fn leading_and_trailing_spaces_are_rejected() {
         let cases = [
             (" report.txt", NameProblem::LeadingSpace),
             ("  ", NameProblem::LeadingSpace),
             ("report.txt ", NameProblem::TrailingSpace),
-            ("report.", NameProblem::TrailingPeriod),
-            ("report...", NameProblem::TrailingPeriod),
-            (".", NameProblem::TrailingPeriod),
-            ("..", NameProblem::TrailingPeriod),
         ];
         for (name, expected) in cases {
             for context in ALL_CONTEXTS {
                 assert_eq!(problem(name, context), Some(expected.clone()), "{name:?}");
+            }
+        }
+    }
+
+    /// A trailing period is not in the source, so it is accepted and left to the server.
+    #[test]
+    fn trailing_period_is_accepted() {
+        for name in ["report.", "report...", "v1.2."] {
+            for context in ALL_CONTEXTS {
+                assert_eq!(problem(name, context), None, "{name:?}");
             }
         }
     }
@@ -590,19 +637,22 @@ mod tests {
         }
     }
 
-    /// AC5, ADR-0015 "Names": the 400-character limit, counted in UTF-16 code units, exclusive.
+    /// AC5, ADR-0015 "Names": the 400-character limit on the decoded path, counted in UTF-16
+    /// code units, exclusive.
     #[test]
     fn server_path_length_limit() {
         let ok = "a".repeat(399);
         assert_eq!(validate_server_path(&ok), Ok(()));
         let at_limit = "a".repeat(400);
+        let err = validate_server_path(&at_limit).unwrap_err();
         assert_eq!(
-            validate_server_path(&at_limit).unwrap_err().problem,
+            err.problem,
             NameProblem::PathTooLong {
                 length: 400,
                 limit: 400
             }
         );
+        assert!(err.to_string().contains("400 UTF-16 code units"), "{err}");
         // An emoji outside the Basic Multilingual Plane counts as two UTF-16 units.
         let astral = format!("{}{}", "a".repeat(398), "😀");
         assert_eq!(astral.chars().count(), 399);
@@ -613,7 +663,8 @@ mod tests {
                 limit: 400
             }
         );
-        // A BMP character such as `é` counts once, though it is two bytes in UTF-8.
+        // A BMP character such as `é` counts once, though it is two bytes in UTF-8 and six
+        // characters percent-encoded.
         let bmp = "é".repeat(399);
         assert_eq!(validate_server_path(&bmp), Ok(()));
         assert_eq!(validate_server_path("/Documents/report.txt"), Ok(()));
@@ -640,6 +691,19 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// AC6: identical names passed twice are reported, as documented.
+    #[test]
+    fn identical_names_are_reported_as_collisions() {
+        let errors = find_case_collisions(["same.txt", "other.txt", "same.txt"]);
+        let expected = NameError::new(
+            "same.txt",
+            NameProblem::CaseCollision {
+                with: vec!["same.txt".to_owned()],
+            },
+        );
+        assert_eq!(errors, vec![expected.clone(), expected]);
     }
 
     /// AC6: the comparison is Unicode-aware, approximating simple case folding.
@@ -679,12 +743,10 @@ mod tests {
     }
 
     fn reserved_word(name: &str) -> bool {
-        let lower = name.to_ascii_lowercase();
-        let stem = lower.split('.').next().unwrap_or(&lower).trim_end();
         RESERVED_DEVICE_NAMES
             .iter()
-            .any(|r| stem.eq_ignore_ascii_case(r))
-            || lower == LIBRARY_ROOT_RESERVED_NAME
+            .any(|r| name.eq_ignore_ascii_case(r))
+            || name.eq_ignore_ascii_case(LIBRARY_ROOT_RESERVED_NAME)
     }
 
     proptest! {
