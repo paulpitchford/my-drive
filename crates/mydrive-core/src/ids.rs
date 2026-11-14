@@ -103,18 +103,24 @@ fn non_empty(value: String, kind: &'static str) -> Result<String, IdError> {
 /// OneDrive Personal has returned the same drive ID in mixed case across response fields
 /// since about June 2025, so the ID is lowercased here, once, on construction; two
 /// `DriveId`s built from inputs that differ only in case are equal (ADR-0007 R1).
+///
+/// Lowercasing is ASCII-only: `A`-`Z` become `a`-`z` and every other character, including
+/// any non-ASCII one, is kept unchanged. Graph drive IDs are ASCII, and ASCII folding
+/// preserves length and matches SQLite `lower()` and the adapters written in other
+/// languages, so every component agrees on the stored form.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DriveId(String);
 
 impl DriveId {
-    /// Builds a drive ID, normalising it to lowercase.
+    /// Builds a drive ID, normalising ASCII letters to lowercase.
     ///
     /// # Errors
     ///
     /// [`IdError::Empty`] if `value` is empty.
     pub fn new(value: impl Into<String>) -> Result<Self, IdError> {
-        let value = non_empty(value.into(), "drive ID")?;
-        Ok(Self(value.to_lowercase()))
+        let mut value = non_empty(value.into(), "drive ID")?;
+        value.make_ascii_lowercase();
+        Ok(Self(value))
     }
 }
 
@@ -243,7 +249,7 @@ mod tests {
 
     use proptest::prelude::*;
     use serde::de::IntoDeserializer;
-    use serde::de::value::{Error as ValueError, U32Deserializer};
+    use serde::de::value::{Error as ValueError, MapDeserializer, U32Deserializer};
 
     use super::*;
 
@@ -401,6 +407,22 @@ mod tests {
         assert_eq!("B!AbC123".parse::<DriveId>().unwrap(), lower);
     }
 
+    /// ADR-0007 R1: lowercasing is ASCII-only, so non-ASCII characters are kept unchanged
+    /// and the length never changes.
+    #[test]
+    fn adr_0007_r1_drive_id_lowercasing_is_ascii_only() {
+        for (input, expected) in [
+            ("ÀB!Ω", "Àb!Ω"),
+            ("İX", "İx"),
+            ("ẞQ", "ẞq"),
+            ("\u{212A}K", "\u{212A}k"),
+        ] {
+            let id = DriveId::new(input).unwrap();
+            assert_eq!(id.as_str(), expected);
+            assert_eq!(id.as_str().len(), input.len());
+        }
+    }
+
     /// AC2: item IDs keep their case and compare exactly.
     #[test]
     fn item_id_preserves_case_and_compares_exactly() {
@@ -540,6 +562,34 @@ mod tests {
         assert!(str_ser::to_string(&key).is_err());
     }
 
+    /// Deserialises an `ItemKey` from string fields, as `serde_json` would from an object.
+    fn item_key_from_fields(fields: &[(&str, &str)]) -> Result<ItemKey, ValueError> {
+        let de: MapDeserializer<'_, _, ValueError> = MapDeserializer::new(fields.iter().copied());
+        ItemKey::deserialize(de)
+    }
+
+    /// `ItemKey`'s serde form is the object `{"drive_id", "item_id"}`. Deserialising
+    /// normalises a mixed-case drive ID (ADR-0007 R1) and rejects a missing or empty field.
+    #[test]
+    fn item_key_serde_object_validates_fields() {
+        let key = item_key_from_fields(&[("drive_id", "B!AbC"), ("item_id", "01AbC")]).unwrap();
+        assert_eq!(key.drive_id.as_str(), "b!abc");
+        assert_eq!(key.item_id.as_str(), "01AbC");
+        assert_eq!(
+            key,
+            ItemKey::new(
+                DriveId::new("b!abc").unwrap(),
+                ItemId::new("01AbC").unwrap()
+            )
+        );
+
+        assert!(item_key_from_fields(&[("item_id", "01AbC")]).is_err());
+        assert!(item_key_from_fields(&[("drive_id", "b!abc")]).is_err());
+        assert!(item_key_from_fields(&[]).is_err());
+        assert!(item_key_from_fields(&[("drive_id", ""), ("item_id", "01AbC")]).is_err());
+        assert!(item_key_from_fields(&[("drive_id", "b!abc"), ("item_id", "")]).is_err());
+    }
+
     fn non_empty_string() -> impl Strategy<Value = String> {
         any::<String>().prop_filter("identifiers are non-empty", |s| !s.is_empty())
     }
@@ -588,9 +638,8 @@ mod tests {
         }
 
         /// ADR-0007 R1: inputs that differ only in ASCII case give the same drive ID, and
-        /// that ID has no uppercase ASCII letters. Graph drive IDs are ASCII; full Unicode
-        /// case folding is not a bijection (for example `ß` uppercases to `SS`), so the
-        /// property is stated over ASCII case.
+        /// that ID has no uppercase ASCII letters. Lowercasing is ASCII-only, so it also
+        /// equals the input's ASCII lowercase exactly, with non-ASCII characters unchanged.
         #[test]
         fn drive_id_is_case_insensitive(s in non_empty_string(), flips in any::<Vec<bool>>()) {
             let mixed: String = s
@@ -604,6 +653,8 @@ mod tests {
             prop_assert_eq!(&a, &b);
             prop_assert_eq!(&a, &c);
             prop_assert!(!a.as_str().chars().any(|ch| ch.is_ascii_uppercase()));
+            let original = DriveId::new(s.clone()).unwrap();
+            prop_assert_eq!(original.as_str(), s.to_ascii_lowercase());
         }
 
         /// AC4: anything that is not a valid mount ID is rejected, and nothing is normalised.
