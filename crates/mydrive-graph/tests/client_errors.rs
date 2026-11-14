@@ -31,7 +31,9 @@ async fn ac4_throttled_with_retry_after_and_no_retry() -> TestResult {
             GraphErrorKind::Throttled {
                 status: got,
                 retry_after,
+                retry_after_raw,
             } => {
+                assert_eq!(*retry_after_raw, None);
                 assert_eq!(*got, status.as_u16());
                 assert_eq!(*retry_after, Some(Duration::from_secs(secs)));
             }
@@ -55,9 +57,18 @@ async fn ac4_throttled_with_retry_after_and_no_retry() -> TestResult {
             err.kind(),
             GraphErrorKind::Throttled {
                 status: 429,
-                retry_after: None
+                retry_after: None,
+                retry_after_raw: None
             }
         ),
+        "{err}"
+    );
+
+    // A 503 without Retry-After is a server error, not throttling.
+    sim.push_fault(Fault::status(StatusCode::SERVICE_UNAVAILABLE));
+    let err = client.get_drive(&drive).await.unwrap_err();
+    assert!(
+        matches!(err.kind(), GraphErrorKind::ServerError { status: 503, .. }),
         "{err}"
     );
     Ok(())

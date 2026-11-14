@@ -1,15 +1,19 @@
 //! Content downloads against the simulator: AC2, AC3, AC6, AC10 (both download modes,
 //! `Range` honoured and ignored), ADR-0011 R10, R11.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 #[path = "client_support.rs"]
 mod support;
 
-use mydrive_graph::GraphErrorKind;
-use mydrive_graph::client::{ByteRange, Coverage};
+use mydrive_graph::client::{ByteRange, Download};
+use mydrive_graph::{GraphError, GraphErrorKind};
 use mydrive_graph_sim::{
     DownloadMode, DriveOptions, DriveType, Fault, Origin, RangeMode, StatusCode,
 };
-use support::{FakeTokens, TestResult, client, client_with, count, sim_with};
+use support::{FakeTokens, TestResult, body, client, client_with, count, read_all, sim_with};
+
+const SIZE: u64 = 4096;
 
 fn content() -> Vec<u8> {
     (0..4096u32).map(|n| (n % 251) as u8).collect()
@@ -35,15 +39,13 @@ async fn ac2_adr_0011_r11_ignored_range_is_whole_file() -> TestResult {
             sim_with(DriveType::Personal, options(mode, RangeMode::Ignored)).await;
         let file = sim.create_file(&drive, &root, "f", content())?;
         let download = client(&sim)
-            .download(&drive, &file, ByteRange::new(100, 50))
+            .download(&drive, &file, SIZE, ByteRange::new(100, 50))
             .await?;
-        assert_eq!(
-            download.coverage(),
-            &Coverage::WholeFile { length: Some(4096) },
-            "{mode:?}"
-        );
-        assert!(download.coverage().is_whole_file());
-        assert_eq!(download.bytes().await?, content(), "{mode:?}");
+        let Download::WholeFile { body } = download else {
+            panic!("{mode:?}: an ignored range must be the whole file: {download:?}");
+        };
+        assert_eq!(body.expected_len(), SIZE);
+        assert_eq!(body.bytes().await?, content(), "{mode:?}");
         // The range was asked for, so this is the ignored-range case and not a plain
         // whole-file download.
         assert!(
@@ -57,7 +59,7 @@ async fn ac2_adr_0011_r11_ignored_range_is_whole_file() -> TestResult {
 
 /// AC10 (`Range` honoured, both download modes), ADR-0011 R10: a ranged download gets
 /// exactly the requested bytes, confirmed by `Content-Range`; a range past the end of the
-/// file is reported as the shorter range that arrived.
+/// file is reported as the shorter range that ends at the file's last byte.
 #[tokio::test]
 async fn honoured_range_is_reported_as_the_confirmed_range() -> TestResult {
     for mode in MODES {
@@ -66,58 +68,91 @@ async fn honoured_range_is_reported_as_the_confirmed_range() -> TestResult {
         let file = sim.create_file(&drive, &root, "f", content())?;
         let client = client(&sim);
 
-        let download = client
-            .download(&drive, &file, ByteRange::new(100, 50))
-            .await?;
-        assert_eq!(
-            download.coverage(),
-            &Coverage::Range {
-                start: 100,
-                end: 149,
-                total: Some(4096)
-            },
-            "{mode:?}"
-        );
-        assert_eq!(download.expected_len(), Some(50));
-        assert_eq!(download.bytes().await?, content()[100..150], "{mode:?}");
-
-        let tail = client
-            .download(&drive, &file, ByteRange::new(4090, 100))
-            .await?;
-        assert_eq!(
-            tail.coverage(),
-            &Coverage::Range {
-                start: 4090,
-                end: 4095,
-                total: Some(4096)
+        match client
+            .download(&drive, &file, SIZE, ByteRange::new(100, 50))
+            .await?
+        {
+            Download::Range { start, end, body } => {
+                assert_eq!((start, end), (100, 149), "{mode:?}");
+                assert_eq!(body.expected_len(), 50);
+                assert_eq!(body.bytes().await?, content()[100..150], "{mode:?}");
             }
-        );
-        assert_eq!(tail.bytes().await?, content()[4090..]);
+            other => panic!("{mode:?}: {other:?}"),
+        }
 
-        let whole = client.download(&drive, &file, None).await?;
-        assert_eq!(
-            whole.coverage(),
-            &Coverage::WholeFile { length: Some(4096) }
+        match client
+            .download(&drive, &file, SIZE, ByteRange::new(4090, 100))
+            .await?
+        {
+            Download::Range { start, end, body } => {
+                assert_eq!((start, end), (4090, 4095));
+                assert_eq!(body.bytes().await?, content()[4090..]);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let whole = client.download(&drive, &file, SIZE, None).await?;
+        let Download::WholeFile { body } = whole else {
+            panic!("{whole:?}");
+        };
+        assert_eq!(body.bytes().await?, content());
+    }
+    Ok(())
+}
+
+/// The expected size is checked against what the server says: a stale size (the file
+/// changed remotely) is an error for both whole and ranged downloads, never a success.
+#[tokio::test]
+async fn stale_expected_size_is_a_size_mismatch() -> TestResult {
+    for mode in MODES {
+        let (sim, drive, root) =
+            sim_with(DriveType::Personal, options(mode, RangeMode::Honoured)).await;
+        let file = sim.create_file(&drive, &root, "f", content())?;
+        let client = client(&sim);
+        for (expected, range) in [
+            (SIZE + 1, None),
+            (SIZE - 1, None),
+            (SIZE + 10, ByteRange::new(0, 10)),
+        ] {
+            let err = client
+                .download(&drive, &file, expected, range)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    GraphErrorKind::SizeMismatch { expected: e, reported: Some(SIZE) } if *e == expected
+                ),
+                "{mode:?} {expected} {range:?}: {err}"
+            );
+        }
+        // An empty file downloads as an empty whole file.
+        let empty = sim.create_file(&drive, &root, "empty", Vec::new())?;
+        assert!(
+            read_all(client.download(&drive, &empty, 0, None).await?)
+                .await?
+                .is_empty()
         );
-        assert_eq!(whole.bytes().await?, content());
     }
     Ok(())
 }
 
 /// AC3, ADR-0011 R10: in redirect mode the bearer token goes to `/content` and not to the
 /// redirected download origin, which still gets the `Range`; in direct mode the token is
-/// sent to `/content` and no other origin is contacted.
+/// sent to `/content` and no other origin is contacted. Every request asks for the
+/// identity encoding.
 #[tokio::test]
 async fn ac3_adr_0011_r10_no_bearer_token_to_redirect_host() -> TestResult {
     for mode in MODES {
         let (sim, drive, root) =
             sim_with(DriveType::Personal, options(mode, RangeMode::Honoured)).await;
         let file = sim.create_file(&drive, &root, "f", content())?;
-        client(&sim)
-            .download(&drive, &file, ByteRange::new(0, 10))
-            .await?
-            .bytes()
-            .await?;
+        read_all(
+            client(&sim)
+                .download(&drive, &file, SIZE, ByteRange::new(0, 10))
+                .await?,
+        )
+        .await?;
         let log = sim.requests();
         let bearer = format!("Bearer {}", sim.token());
         let graph: Vec<_> = log.iter().filter(|r| r.origin == Origin::Graph).collect();
@@ -146,17 +181,16 @@ async fn ac3_adr_0011_r10_no_bearer_token_to_redirect_host() -> TestResult {
 }
 
 /// Drains a download chunk by chunk, returning the bytes that arrived and how it ended.
-async fn drain(
-    mut download: mydrive_graph::client::Download,
-) -> (usize, Result<(), mydrive_graph::GraphError>) {
+async fn drain(download: Download) -> (usize, Result<(), GraphError>) {
+    let mut body = body(download);
     let mut received = 0;
     loop {
-        match download.chunk().await {
+        match body.chunk().await {
             Ok(Some(chunk)) => received += chunk.len(),
             Ok(None) => return (received, Ok(())),
             Err(e) => {
                 // Every later read fails too: a failed download never turns into an end.
-                assert!(download.chunk().await.is_err());
+                assert!(body.chunk().await.is_err());
                 return (received, Err(e));
             }
         }
@@ -177,9 +211,8 @@ async fn ac6_truncated_body_is_an_error() -> TestResult {
                 DownloadMode::Direct => "/content",
             };
             sim.push_fault(Fault::truncate_body(100).on_path(path));
-            let download = client(&sim).download(&drive, &file, range).await?;
-            let expected = if range.is_some() { 1000 } else { 4096 };
-            assert_eq!(download.expected_len(), Some(expected));
+            let download = client(&sim).download(&drive, &file, SIZE, range).await?;
+            let expected = if range.is_some() { 1000 } else { SIZE };
             let (received, ended) = drain(download).await;
             assert_eq!(received, 100, "{mode:?} {range:?}");
             let err = ended.expect_err("a truncated body must not read as complete");
@@ -221,7 +254,7 @@ async fn rejected_download_url_is_not_a_token_refresh() -> TestResult {
     let tokens = FakeTokens::new(sim.token());
     sim.push_fault(Fault::status(StatusCode::UNAUTHORIZED).on_path("/download"));
     let err = client_with(&sim, tokens.clone())
-        .download(&drive, &file, None)
+        .download(&drive, &file, SIZE, None)
         .await
         .unwrap_err();
     assert!(
@@ -245,7 +278,7 @@ async fn download_errors_are_typed() -> TestResult {
     let client = client(&sim);
 
     let missing = client
-        .download(&drive, &"nope".parse()?, None)
+        .download(&drive, &"nope".parse()?, SIZE, None)
         .await
         .unwrap_err();
     assert!(
@@ -254,7 +287,10 @@ async fn download_errors_are_typed() -> TestResult {
     );
 
     sim.push_fault(Fault::status(StatusCode::FORBIDDEN).on_path("/download"));
-    let forbidden = client.download(&drive, &file, None).await.unwrap_err();
+    let forbidden = client
+        .download(&drive, &file, SIZE, None)
+        .await
+        .unwrap_err();
     match forbidden.kind() {
         GraphErrorKind::Forbidden { codes } => assert_eq!(codes.primary(), Some("accessDenied")),
         other => panic!("{other}"),
@@ -265,14 +301,17 @@ async fn download_errors_are_typed() -> TestResult {
             .retry_after(4)
             .on_path("/download"),
     );
-    let throttled = client.download(&drive, &file, None).await.unwrap_err();
+    let throttled = client
+        .download(&drive, &file, SIZE, None)
+        .await
+        .unwrap_err();
     assert!(
-        matches!(throttled.kind(), GraphErrorKind::Throttled { status: 503, retry_after: Some(d) } if d.as_secs() == 4),
+        matches!(throttled.kind(), GraphErrorKind::Throttled { status: 503, retry_after: Some(d), .. } if d.as_secs() == 4),
         "{throttled}"
     );
 
     let outside = client
-        .download(&drive, &file, ByteRange::new(5000, 10))
+        .download(&drive, &file, SIZE, ByteRange::new(5000, 10))
         .await
         .unwrap_err();
     assert!(
@@ -298,7 +337,7 @@ async fn content_etag_header_is_reported() -> TestResult {
         let file = sim.create_file(&drive, &root, "f", content())?;
         let client = client(&sim);
         let item = client.get_item(&drive, &file).await?;
-        let download = client.download(&drive, &file, None).await?;
+        let download = body(client.download(&drive, &file, SIZE, None).await?);
         if with_etag {
             assert_eq!(download.etag(), item.etag.as_deref());
         } else {

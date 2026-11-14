@@ -10,10 +10,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mydrive_core::ids::{AccountId, DriveId, ItemId};
-use mydrive_graph::GraphClient;
 use mydrive_graph::auth::{AccessToken, BoxFuture, TokenError, TokenProvider};
-use mydrive_graph::client::UserAgent;
+use mydrive_graph::client::{Body, Download, UserAgent};
 use mydrive_graph::model::{DeltaContinuation, DeltaLink, DriveItem};
+use mydrive_graph::{GraphClient, GraphError};
 use mydrive_graph_sim::{DriveOptions, DriveType, GraphSim, Origin};
 
 pub(crate) type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -164,6 +164,19 @@ pub(crate) async fn full_delta(
         }
     }
     panic!("delta did not reach a delta link within {MAX_PAGES} pages");
+}
+
+/// The body of a download, whichever coverage it has. Only for tests that do not care;
+/// tests about coverage match on [`Download`] themselves.
+pub(crate) fn body(download: Download) -> Body {
+    match download {
+        Download::Range { body, .. } | Download::WholeFile { body } => body,
+    }
+}
+
+/// The whole body of a download, whichever coverage it has.
+pub(crate) async fn read_all(download: Download) -> Result<Vec<u8>, GraphError> {
+    body(download).bytes().await
 }
 
 /// The IDs of `items`, in order.

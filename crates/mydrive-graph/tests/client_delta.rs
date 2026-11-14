@@ -306,7 +306,7 @@ async fn adr_0011_r8_every_request_carries_user_agent() -> TestResult {
     let client = client(&sim);
     client.get_drive(&drive).await?;
     full_delta(&client, &drive, None).await;
-    client.download(&drive, &file, None).await?.bytes().await?;
+    support::read_all(client.download(&drive, &file, 8, None).await?).await?;
     let _ = client.get_item(&drive, &"missing".parse()?).await;
 
     let log = sim.requests();

@@ -159,16 +159,20 @@ pub enum GraphErrorKind {
         /// the client's own Graph origin. Without it, restart from the drive root.
         restart: Option<DeltaLink>,
     },
-    /// `429 Too Many Requests` or `503 Service Unavailable`. The client does not wait or
-    /// retry; the tenant's scheduler decides (ADR-0011 R6).
+    /// `429 Too Many Requests` (always), or `503 Service Unavailable` with a
+    /// `Retry-After` header. The client does not wait or retry; the tenant's scheduler
+    /// decides (ADR-0011 R6). RateLimit headers are not read (ADR-0011 R7).
     #[error("throttled (HTTP {status}){}", retry_after.map(|d| format!(", retry after {} s", d.as_secs())).unwrap_or_default())]
     Throttled {
         /// `429` or `503`.
         status: u16,
-        /// `Retry-After` in seconds, if the response carried a usable one.
+        /// `Retry-After` as delta-seconds, if the response carried that form.
         retry_after: Option<Duration>,
+        /// The raw `Retry-After` value when it is present but not delta-seconds (for
+        /// example an HTTP-date), so the scheduler can interpret it against its clock.
+        retry_after_raw: Option<String>,
     },
-    /// Another `5xx`.
+    /// Another `5xx`, or a `503` without `Retry-After`.
     #[error("Graph server error (HTTP {status}, {codes})")]
     ServerError {
         /// The status.
@@ -195,6 +199,24 @@ pub enum GraphErrorKind {
         expected: u64,
         /// The bytes that arrived.
         received: u64,
+    },
+    /// The download response's size does not match the item's expected size: a `200`
+    /// whose `Content-Length` or body length differs, or a `206` whose `Content-Range`
+    /// total differs or is unknown. The file may have changed remotely; refetch its
+    /// metadata. Never a success.
+    #[error("the content size does not match the expected {expected} bytes (server reported {})", reported.map_or_else(|| "no size".to_owned(), |n| n.to_string()))]
+    SizeMismatch {
+        /// The size the caller expected.
+        expected: u64,
+        /// The size the response announced or delivered, if any.
+        reported: Option<u64>,
+    },
+    /// The download response is content-encoded (for example gzip by a proxy), so its
+    /// bytes are not the file's bytes. The client asks for `identity` only.
+    #[error("the content arrived with Content-Encoding {encoding:?}, not identity")]
+    UnsupportedEncoding {
+        /// The `Content-Encoding` value, cut to printable ASCII.
+        encoding: String,
     },
     /// The response is not what Graph documents for this call.
     #[error("malformed response: {0}")]

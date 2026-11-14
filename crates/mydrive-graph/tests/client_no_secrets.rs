@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use mydrive_graph::client::ByteRange;
 use mydrive_graph_sim::{DownloadMode, DriveOptions, DriveType, Fault, GraphSim, StatusCode};
-use support::{FakeTokens, TestResult, client_with, full_delta};
+use support::{FakeTokens, TestResult, client_with, full_delta, read_all};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
@@ -86,21 +86,24 @@ async fn scenario(sim: &GraphSim) -> Result<String, Box<dyn std::error::Error + 
     let client = client_with(sim, tokens);
     let _ = writeln!(seen, "{client:?}");
     let download = client
-        .download(&redirect, &r_file, ByteRange::new(0, 100))
+        .download(&redirect, &r_file, 4096, ByteRange::new(0, 100))
         .await?;
     let _ = writeln!(seen, "{download:?}");
-    download.bytes().await?;
-    let download = client.download(&direct, &d_file, None).await?;
+    read_all(download).await?;
+    let download = client.download(&direct, &d_file, 4096, None).await?;
     let _ = writeln!(seen, "{download:?}");
-    download.bytes().await?;
+    read_all(download).await?;
 
     // A truncated redirected download, and a refused pre-authenticated URL.
     sim.push_fault(Fault::truncate_body(10).on_path("/download"));
-    let download = client.download(&redirect, &r_file, None).await?;
-    let err = download.bytes().await.unwrap_err();
+    let download = client.download(&redirect, &r_file, 4096, None).await?;
+    let err = read_all(download).await.unwrap_err();
     let _ = writeln!(seen, "{err:?} {err}");
     sim.push_fault(Fault::status(StatusCode::UNAUTHORIZED).on_path("/download"));
-    let err = client.download(&redirect, &r_file, None).await.unwrap_err();
+    let err = client
+        .download(&redirect, &r_file, 4096, None)
+        .await
+        .unwrap_err();
     let _ = writeln!(seen, "{err:?} {err}");
 
     // Items whose JSON carries @microsoft.graph.downloadUrl, and delta.
@@ -124,7 +127,7 @@ async fn scenario(sim: &GraphSim) -> Result<String, Box<dyn std::error::Error + 
     let bad = FakeTokens::new(STALE);
     bad.refresh_to("another-stale-secret");
     let err = client_with(sim, bad)
-        .download(&redirect, &r_file, None)
+        .download(&redirect, &r_file, 4096, None)
         .await
         .unwrap_err();
     let _ = writeln!(seen, "{err:?} {err}");

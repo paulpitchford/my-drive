@@ -7,7 +7,7 @@ mod support;
 use mydrive_graph::GraphErrorKind;
 use mydrive_graph::auth::{TokenError, TokenRequestError};
 use mydrive_graph_sim::{DownloadMode, DriveOptions, DriveType, Fault, Origin, StatusCode};
-use support::{FakeTokens, TestResult, account, client_with, count, sim_with};
+use support::{FakeTokens, TestResult, account, client_with, count, read_all, sim_with};
 
 /// AC5: a rejected token is refreshed once and the request retried once with the new
 /// token, which succeeds.
@@ -88,11 +88,12 @@ async fn ac5_download_refreshes_once() -> TestResult {
     let file = sim.create_file(&drive, &root, "f", vec![5; 64])?;
     let tokens = FakeTokens::new("stale-token");
     tokens.refresh_to(sim.token());
-    let body = client_with(&sim, tokens.clone())
-        .download(&drive, &file, None)
-        .await?
-        .bytes()
-        .await?;
+    let body = read_all(
+        client_with(&sim, tokens.clone())
+            .download(&drive, &file, 64, None)
+            .await?,
+    )
+    .await?;
     assert_eq!(body, vec![5; 64]);
     assert_eq!(tokens.rejected(), ["stale-token"]);
     assert_eq!(count(&sim, Origin::Graph), 2);
@@ -137,7 +138,7 @@ async fn ac5_provider_error_is_returned_not_retried() -> TestResult {
         assert!(tokens.rejected().is_empty());
 
         tokens.access_fails(error.clone());
-        let err = client.download(&drive, &file, None).await.unwrap_err();
+        let err = client.download(&drive, &file, 1, None).await.unwrap_err();
         assert!(matches!(err.kind(), GraphErrorKind::Token(_)), "{err}");
     }
     assert!(sim.requests().is_empty(), "no request without a token");

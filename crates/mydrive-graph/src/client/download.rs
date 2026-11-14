@@ -1,4 +1,17 @@
 //! A content download in progress, and what it covers.
+//!
+//! The caller always passes the item's expected size (from its metadata), and every
+//! response is checked against it and against the requested range before any byte is
+//! handed out:
+//!
+//! - A content-encoded response (gzip from a proxy, say) is refused: its bytes are not
+//!   the file's bytes.
+//! - `200` is the whole file from offset 0, and must total exactly the expected size.
+//! - `206` must confirm the requested start, end no later than the requested end, and
+//!   state the expected size as its total. It may end early only at the last byte of the
+//!   file.
+//! - The body must deliver exactly the length promised; ending early is
+//!   [`GraphErrorKind::Truncated`], never a short success.
 
 use std::fmt;
 
@@ -53,48 +66,41 @@ impl ByteRange {
     }
 }
 
-/// What a download response actually carries. Never assume it is what was requested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Coverage {
-    /// `206 Partial Content`: bytes `start..=end` of the file, as the server's
-    /// `Content-Range` confirmed. `start` is the requested start; `end` may be earlier
-    /// than requested when the file is shorter.
+/// A download whose head has arrived and been checked. Match on it: what arrived is not
+/// necessarily what was requested (ADR-0011 R11).
+#[derive(Debug)]
+#[must_use = "a download must be matched: it may be the whole file instead of the range"]
+pub enum Download {
+    /// `206 Partial Content`: bytes `start..=end` of the file. `start` is the requested
+    /// start; `end` is the requested end, or the file's last byte if the request went
+    /// past it.
     Range {
         /// The first byte.
         start: u64,
         /// The last byte, inclusive.
         end: u64,
-        /// The file's total length, if the server stated it.
-        total: Option<u64>,
+        /// The bytes.
+        body: Body,
     },
     /// `200 OK`: the whole file from offset 0, whether or not a range was requested; a
-    /// server may ignore `Range` (ADR-0011 R11).
+    /// server may ignore `Range` (ADR-0011 R11). It totals exactly the expected size.
     WholeFile {
-        /// The announced length, if any. Compare it with the expected item size before
-        /// trusting the content.
-        length: Option<u64>,
+        /// The bytes.
+        body: Body,
     },
 }
 
-impl Coverage {
-    /// Whether this is the whole file from offset 0.
-    #[must_use]
-    pub fn is_whole_file(&self) -> bool {
-        matches!(self, Self::WholeFile { .. })
-    }
-}
-
-/// A download whose head has arrived. Read the body with [`Download::chunk`].
+/// The body of a checked download. Read it with [`Body::chunk`].
 ///
-/// The body is checked against its announced length: if it ends early,
-/// [`Download::chunk`] fails with [`GraphErrorKind::Truncated`] (or a transport error),
-/// never `Ok(None)`. Bytes already returned were real bytes of the stated coverage, but
-/// the download as a whole has failed.
-pub struct Download {
+/// If it ends before its promised length, [`Body::chunk`] fails with
+/// [`GraphErrorKind::Truncated`] (or a transport error), never `Ok(None)`. Bytes already
+/// returned were real bytes of the stated coverage, but the download as a whole has
+/// failed.
+pub struct Body {
     operation: Operation,
-    coverage: Coverage,
     etag: Option<String>,
-    expected: Option<u64>,
+    expected: u64,
+    whole_file: bool,
     received: u64,
     state: ReadState,
     response: Response,
@@ -107,12 +113,11 @@ enum ReadState {
     Failed,
 }
 
-impl fmt::Debug for Download {
+impl fmt::Debug for Body {
     // The response is left out: its `Debug` shows the URL, which may be pre-authenticated.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Download")
+        f.debug_struct("Body")
             .field("operation", &self.operation)
-            .field("coverage", &self.coverage)
             .field("expected", &self.expected)
             .field("received", &self.received)
             .finish_non_exhaustive()
@@ -134,86 +139,133 @@ fn content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
     Some((start, end, total))
 }
 
+/// Refuses a response whose `Content-Encoding` is anything but absent or `identity`.
+pub(super) fn require_identity(headers: &HeaderMap) -> Result<(), GraphErrorKind> {
+    let Some(value) = headers.get(header::CONTENT_ENCODING) else {
+        return Ok(());
+    };
+    let text = String::from_utf8_lossy(value.as_bytes());
+    if text.trim().eq_ignore_ascii_case("identity") {
+        return Ok(());
+    }
+    let encoding = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(64)
+        .collect();
+    Err(GraphErrorKind::UnsupportedEncoding { encoding })
+}
+
 impl Download {
     pub(super) fn new(
         operation: Operation,
         response: Response,
         requested: Option<ByteRange>,
+        expected_size: u64,
     ) -> Result<Self, GraphError> {
-        let fail = |op: Operation, reason: &str| {
-            Err(GraphError::new(
-                op,
-                GraphErrorKind::Malformed(reason.into()),
-            ))
-        };
+        match Self::check(&response, requested, expected_size) {
+            Ok(coverage) => {
+                let etag = response
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                tracing::debug!(
+                    operation = %operation,
+                    status = response.status().as_u16(),
+                    whole_file = coverage.is_none(),
+                    range_requested = requested.is_some(),
+                    "download started"
+                );
+                let (expected, whole_file) = match coverage {
+                    Some((start, end)) => (end - start + 1, false),
+                    None => (expected_size, true),
+                };
+                let body = Body {
+                    operation,
+                    etag,
+                    expected,
+                    whole_file,
+                    received: 0,
+                    state: ReadState::Reading,
+                    response,
+                };
+                Ok(match coverage {
+                    Some((start, end)) => Self::Range { start, end, body },
+                    None => Self::WholeFile { body },
+                })
+            }
+            Err(kind) => Err(GraphError::new(operation, kind)),
+        }
+    }
+
+    /// Checks the head. `Some((start, end))` for a confirmed range, `None` for the whole
+    /// file.
+    fn check(
+        response: &Response,
+        requested: Option<ByteRange>,
+        expected_size: u64,
+    ) -> Result<Option<(u64, u64)>, GraphErrorKind> {
+        let malformed = |reason: &str| Err(GraphErrorKind::Malformed(reason.into()));
         let headers = response.headers();
-        let length = match content_length(headers) {
-            Ok(length) => length,
-            Err(kind) => return Err(GraphError::new(operation, kind)),
-        };
-        let etag = headers
-            .get(header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
-        let (coverage, expected) = match response.status() {
-            StatusCode::OK => (Coverage::WholeFile { length }, length),
+        require_identity(headers)?;
+        let length = content_length(headers)?;
+        match response.status() {
+            StatusCode::OK => {
+                if let Some(announced) = length
+                    && announced != expected_size
+                {
+                    return Err(GraphErrorKind::SizeMismatch {
+                        expected: expected_size,
+                        reported: Some(announced),
+                    });
+                }
+                Ok(None)
+            }
             StatusCode::PARTIAL_CONTENT => {
                 let Some(requested) = requested else {
-                    return fail(operation, "206 Partial Content to a request without Range");
+                    return malformed("206 Partial Content to a request without Range");
                 };
                 let Some((start, end, total)) = content_range(headers) else {
-                    return fail(operation, "206 without a single-range Content-Range");
+                    return malformed("206 without a single-range Content-Range");
                 };
-                // Anything but the requested start, or bytes past the requested end, is
-                // not what was asked for and must not be reported as it.
+                if total != Some(expected_size) {
+                    return Err(GraphErrorKind::SizeMismatch {
+                        expected: expected_size,
+                        reported: total,
+                    });
+                }
+                // Anything but the requested start, bytes past the requested end, or an
+                // early end that is not the end of the file, is not what was asked for
+                // and must not be reported as it.
                 if start != requested.start()
                     || end < start
+                    || end >= expected_size
                     || end > requested.end_inclusive()
-                    || total.is_some_and(|t| end >= t)
+                    || (end < requested.end_inclusive() && end + 1 != expected_size)
                 {
-                    return fail(operation, "206 for a different range than requested");
+                    return malformed("206 for a different range than requested");
                 }
-                let span = end - start + 1;
-                if length.is_some_and(|n| n != span) {
-                    return fail(operation, "206 whose Content-Length differs from its range");
+                if length.is_some_and(|n| n != end - start + 1) {
+                    return malformed("206 whose Content-Length differs from its range");
                 }
-                (Coverage::Range { start, end, total }, Some(span))
+                Ok(Some((start, end)))
             }
-            _ => return fail(operation, "a download response that is neither 200 nor 206"),
-        };
-        tracing::debug!(
-            operation = %operation,
-            status = response.status().as_u16(),
-            whole_file = coverage.is_whole_file(),
-            range_requested = requested.is_some(),
-            "download started"
-        );
-        Ok(Self {
-            operation,
-            coverage,
-            etag,
-            expected,
-            received: 0,
-            state: ReadState::Reading,
-            response,
-        })
+            _ => malformed("a download response that is neither 200 nor 206"),
+        }
     }
+}
 
-    /// What this response carries.
-    #[must_use]
-    pub fn coverage(&self) -> &Coverage {
-        &self.coverage
-    }
-
+impl Body {
     /// The response's `ETag` header, if any. Whether Graph sends one is part of gate G1.
     #[must_use]
     pub fn etag(&self) -> Option<&str> {
         self.etag.as_deref()
     }
 
-    /// The number of body bytes this response must deliver, if known.
+    /// The number of body bytes this response must deliver.
     #[must_use]
-    pub fn expected_len(&self) -> Option<u64> {
+    pub fn expected_len(&self) -> u64 {
         self.expected
     }
 
@@ -233,10 +285,11 @@ impl Download {
     ///
     /// # Errors
     ///
-    /// [`GraphErrorKind::Truncated`] if the body ends before its announced length,
+    /// [`GraphErrorKind::Truncated`] if the body ends before its promised length,
     /// [`GraphErrorKind::Transport`] if the connection fails otherwise, and
-    /// [`GraphErrorKind::Malformed`] if more bytes arrive than announced. After an error,
-    /// every later call fails too.
+    /// [`GraphErrorKind::SizeMismatch`] (whole file) or [`GraphErrorKind::Malformed`]
+    /// (range) if more bytes arrive than promised. After an error, every later call
+    /// fails too.
     pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, GraphError> {
         match self.state {
             ReadState::Done => return Ok(None),
@@ -247,19 +300,22 @@ impl Download {
             }
             ReadState::Reading => {}
         }
-        let result = self.response.chunk().await;
-        let short = |received: u64, expected: Option<u64>| {
-            expected
-                .filter(|&e| received < e)
-                .map(|expected| GraphErrorKind::Truncated { expected, received })
+        let short = |received: u64, expected: u64| {
+            (received < expected).then_some(GraphErrorKind::Truncated { expected, received })
         };
-        match result {
+        match self.response.chunk().await {
             Ok(Some(chunk)) => {
                 self.received += chunk.len() as u64;
-                if self.expected.is_some_and(|e| self.received > e) {
-                    return Err(self.fail(GraphErrorKind::Malformed(
-                        "more body bytes than announced".into(),
-                    )));
+                if self.received > self.expected {
+                    let kind = if self.whole_file {
+                        GraphErrorKind::SizeMismatch {
+                            expected: self.expected,
+                            reported: Some(self.received),
+                        }
+                    } else {
+                        GraphErrorKind::Malformed("more body bytes than the range".into())
+                    };
+                    return Err(self.fail(kind));
                 }
                 Ok(Some(chunk.into()))
             }
@@ -281,7 +337,7 @@ impl Download {
     ///
     /// # Errors
     ///
-    /// As for [`Download::chunk`].
+    /// As for [`Body::chunk`].
     pub async fn bytes(mut self) -> Result<Vec<u8>, GraphError> {
         let mut out = Vec::new();
         while let Some(chunk) = self.chunk().await? {
@@ -331,6 +387,24 @@ mod tests {
         for bad in ["bytes */100", "items 0-9/100", "bytes 0-9", "bytes a-9/100"] {
             h.insert(header::CONTENT_RANGE, bad.parse().unwrap());
             assert_eq!(content_range(&h), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_identity_encoding_is_accepted() {
+        let mut h = HeaderMap::new();
+        assert!(require_identity(&h).is_ok());
+        h.insert(header::CONTENT_ENCODING, "Identity".parse().unwrap());
+        assert!(require_identity(&h).is_ok());
+        for bad in ["gzip", "br", "identity, gzip", ""] {
+            h.insert(header::CONTENT_ENCODING, bad.parse().unwrap());
+            assert!(
+                matches!(
+                    require_identity(&h),
+                    Err(GraphErrorKind::UnsupportedEncoding { .. })
+                ),
+                "{bad:?}"
+            );
         }
     }
 }
