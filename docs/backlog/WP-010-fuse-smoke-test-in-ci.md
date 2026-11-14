@@ -6,7 +6,8 @@
 - **Depends on:** —
 - **Gates:** —
 - **Owned paths:** `crates/mydrive-vfs/**`, `.github/workflows/ci.yml`,
-  `docs/process/ci-fuse.md`
+  `docs/process/ci-fuse.md`, `Cargo.lock` (only as a result of adding `fuser` and `tempfile`
+  to this crate)
 - **ADRs:** ADR-0005, ADR-0017, ADR-0003
 - **Flows / journeys:** —
 

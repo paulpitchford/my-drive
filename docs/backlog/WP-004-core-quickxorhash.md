@@ -37,8 +37,8 @@ the same.
 - AC3: Feeding the same bytes in any chunking produces the same digest.
 - AC4: Base64 encoding and decoding round-trip, and malformed or wrong-length base64 is
   rejected with a typed error.
-- AC5: No `unsafe`, no dependency beyond the workspace's `base64` (add it to this crate's
-  manifest via the lead if needed; say so in your report rather than editing `Cargo.toml`).
+- AC5: No `unsafe`, and no dependency beyond `base64`, which the lead has already added to
+  this crate's manifest.
 
 ## Required tests
 
