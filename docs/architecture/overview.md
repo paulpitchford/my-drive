@@ -232,7 +232,7 @@ the local bytes.
 Newline-delimited JSON-RPC 2.0 over the Unix socket. The first call on a connection is
 `hello`, which negotiates a protocol version. Clients can subscribe to a change stream so
 adapters never poll the daemon per file. Large listings are paginated with a cursor, and
-modifiers travel as a list of strings. Details in ADR-0009, ADR-0019 and `docs/protocol/`.
+modifiers travel as a list of strings. Details in ADR-0009, ADR-0019, ADR-0020 and `docs/protocol/`.
 
 ## CLI surface
 
@@ -279,6 +279,7 @@ Each row is an ADR in `docs/adr/`. The ADR is authoritative for detail.
 | 0017 | Testing: a Graph simulator, fault injection, journey-based acceptance tests |
 | 0018 | Development process: work packages built by agents, reviewed independently, gated by CI |
 | 0019 | Protocol v1 paginates large results and declares which value sets are open (amends 0009) |
+| 0020 | Every protocol message is bounded; cursors stay correct while a directory changes (extends 0019) |
 
 ## Validation gates
 
