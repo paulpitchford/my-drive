@@ -131,8 +131,9 @@ Planned for M1 simulator work packages (WP-007 out of scope):
   fragments, `nextExpectedRanges`, `uploadUrl` with or without `Authorization`,
   `deferCommit`), `If-Match`/`If-None-Match` and `412`, `@microsoft.graph.conflictBehavior`,
   `409 nameAlreadyExists`, `507` quota.
-- `410 Gone` resync with `resyncChangesApplyDifferences` and
-  `resyncChangesUploadDifferences` and a `Location` nextLink.
+- `410 Gone` resync as delta behaviour (a token that expires on its own). The response
+  itself, with `resyncChangesApplyDifferences` or `resyncChangesUploadDifferences` and a
+  `Location` restart link, can be scripted with a status fault (see Faults above).
 - A throttling model (resource units per request, per-user and per-tenant limits). Only
   scripted 429/503 faults exist now.
 - Ancestor folders appearing in delta when a child changes, and the `deltaExcludeParent`

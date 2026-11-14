@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use mydrive_core::ids::{AccountId, DriveId, ItemId};
 use mydrive_graph::auth::{AccessToken, BoxFuture, TokenError, TokenProvider};
 use mydrive_graph::client::{Body, Download, UserAgent};
-use mydrive_graph::model::{DeltaContinuation, DeltaLink, DriveItem};
+use mydrive_graph::model::{DeltaContinuation, DeltaEntry, DeltaLink, DriveItem};
 use mydrive_graph::{GraphClient, GraphError};
 use mydrive_graph_sim::{DriveOptions, DriveType, GraphSim, Origin};
 
@@ -155,7 +155,14 @@ pub(crate) async fn full_delta(
         Some(link) => client.delta_from_link(drive, link).await.unwrap(),
     };
     for pages in 1..=MAX_PAGES {
-        items.append(&mut page.items);
+        for entry in std::mem::take(&mut page.entries) {
+            match entry {
+                DeltaEntry::Item(item) => items.push(*item),
+                DeltaEntry::Problem(problem) => {
+                    panic!("the simulator sent an unusable entry: {problem:?}")
+                }
+            }
+        }
         match page.continuation {
             DeltaContinuation::DeltaLink(link) => return (items, link, pages),
             DeltaContinuation::NextLink(next) => {
@@ -169,6 +176,13 @@ pub(crate) async fn full_delta(
 /// The body of a download, whichever coverage it has. Only for tests that do not care;
 /// tests about coverage match on [`Download`] themselves.
 pub(crate) fn body(download: Download) -> Body {
+    match download {
+        Download::Range { body, .. } | Download::WholeFile { body } => body,
+    }
+}
+
+/// A reference to the body of a download, whichever coverage it has.
+pub(crate) fn body_ref(download: &Download) -> &Body {
     match download {
         Download::Range { body, .. } | Download::WholeFile { body } => body,
     }

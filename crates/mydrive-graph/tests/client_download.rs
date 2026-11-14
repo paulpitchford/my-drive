@@ -310,6 +310,8 @@ async fn download_errors_are_typed() -> TestResult {
         "{throttled}"
     );
 
+    // Outside the expected size: refused before any request.
+    sim.clear_requests();
     let outside = client
         .download(&drive, &file, SIZE, ByteRange::new(5000, 10))
         .await
@@ -317,9 +319,30 @@ async fn download_errors_are_typed() -> TestResult {
     assert!(
         matches!(
             outside.kind(),
-            GraphErrorKind::UnexpectedStatus { status: 416, .. }
+            GraphErrorKind::RangeOutsideFile {
+                start: 5000,
+                size: SIZE
+            }
         ),
         "{outside}"
+    );
+    assert!(sim.requests().is_empty());
+
+    // Inside a stale, larger expected size but outside the real file: the simulator's
+    // 416 names the real size, which is a size mismatch.
+    let stale = client
+        .download(&drive, &file, 10_000, ByteRange::new(5000, 10))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            stale.kind(),
+            GraphErrorKind::SizeMismatch {
+                expected: 10_000,
+                reported: Some(SIZE)
+            }
+        ),
+        "{stale}"
     );
     Ok(())
 }

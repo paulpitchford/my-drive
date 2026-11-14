@@ -5,13 +5,16 @@
 //! handed out:
 //!
 //! - A content-encoded response (gzip from a proxy, say) is refused: its bytes are not
-//!   the file's bytes.
+//!   the file's bytes. Only `chunked` is accepted as a `Transfer-Encoding`.
 //! - `200` is the whole file from offset 0, and must total exactly the expected size.
 //! - `206` must confirm the requested start, end no later than the requested end, and
 //!   state the expected size as its total. It may end early only at the last byte of the
 //!   file.
-//! - The body must deliver exactly the length promised; ending early is
-//!   [`GraphErrorKind::Truncated`], never a short success.
+//! - The body must deliver exactly the length promised; it never ends in a short
+//!   success. How it fails tells the engine what to do with bytes already handed out:
+//!   [`GraphErrorKind::Truncated`] (keep them) only after a verified head and a
+//!   connection failure, [`GraphErrorKind::SizeMismatch`] (discard them all) otherwise.
+//!   See [`Body`].
 
 use std::fmt;
 
@@ -83,7 +86,7 @@ pub enum Download {
         body: Body,
     },
     /// `200 OK`: the whole file from offset 0, whether or not a range was requested; a
-    /// server may ignore `Range` (ADR-0011 R11). It totals exactly the expected size.
+    /// server may ignore `Range` (ADR-0011 R11). It must total exactly the expected size.
     WholeFile {
         /// The bytes.
         body: Body,
@@ -92,15 +95,29 @@ pub enum Download {
 
 /// The body of a checked download. Read it with [`Body::chunk`].
 ///
-/// If it ends before its promised length, [`Body::chunk`] fails with
-/// [`GraphErrorKind::Truncated`] (or a transport error), never `Ok(None)`. Bytes already
-/// returned were real bytes of the stated coverage, but the download as a whole has
-/// failed.
+/// It never ends in a short success: `Ok(None)` comes only after exactly the promised
+/// number of bytes. When it fails, the error kind decides what happens to the bytes
+/// already returned:
+///
+/// - [`GraphErrorKind::Truncated`]: the head was **verified** (a `200` whose
+///   `Content-Length` equals the expected size, without `Transfer-Encoding`, or a `206`
+///   whose `Content-Range` matched the request and the expected size) and the connection
+///   then failed. The bytes already returned are valid bytes of the expected version at
+///   their offsets and may be kept.
+/// - [`GraphErrorKind::SizeMismatch`]: the content is not the expected version, or
+///   cannot be shown to be. That covers a body that ends cleanly short of its length
+///   (a chunked terminator, or a close with no framing), a body longer than promised,
+///   and any early end after a head that could not be verified (no `Content-Length`).
+///   **Every byte returned by this download must be discarded**, and the item's
+///   metadata refetched.
+/// - [`GraphErrorKind::Transport`] only for a connection failure after all promised
+///   bytes arrived.
 pub struct Body {
     operation: Operation,
     etag: Option<String>,
     expected: u64,
-    whole_file: bool,
+    /// Whether the head was verified against the expected size; see the type's docs.
+    verified: bool,
     received: u64,
     state: ReadState,
     response: Response,
@@ -119,6 +136,7 @@ impl fmt::Debug for Body {
         f.debug_struct("Body")
             .field("operation", &self.operation)
             .field("expected", &self.expected)
+            .field("verified", &self.verified)
             .field("received", &self.received)
             .finish_non_exhaustive()
     }
@@ -139,21 +157,60 @@ fn content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
     Some((start, end, total))
 }
 
+/// The size a `416` names in `Content-Range: bytes */N`, if any.
+pub(super) fn unsatisfied_range_size(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get(header::CONTENT_RANGE)?.to_str().ok()?;
+    value.trim().strip_prefix("bytes */")?.trim().parse().ok()
+}
+
+/// Printable ASCII of a header value, at most 64 characters.
+fn printable(value: &[u8]) -> String {
+    String::from_utf8_lossy(value)
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(64)
+        .collect()
+}
+
 /// Refuses a response whose `Content-Encoding` is anything but absent or `identity`.
 pub(super) fn require_identity(headers: &HeaderMap) -> Result<(), GraphErrorKind> {
     let Some(value) = headers.get(header::CONTENT_ENCODING) else {
         return Ok(());
     };
-    let text = String::from_utf8_lossy(value.as_bytes());
-    if text.trim().eq_ignore_ascii_case("identity") {
+    if String::from_utf8_lossy(value.as_bytes())
+        .trim()
+        .eq_ignore_ascii_case("identity")
+    {
         return Ok(());
     }
-    let encoding = text
-        .chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(64)
-        .collect();
-    Err(GraphErrorKind::UnsupportedEncoding { encoding })
+    Err(GraphErrorKind::UnsupportedEncoding {
+        encoding: printable(value.as_bytes()),
+    })
+}
+
+/// Refuses a `Transfer-Encoding` other than `chunked`. Returns whether one is present.
+fn transfer_encoding(headers: &HeaderMap) -> Result<bool, GraphErrorKind> {
+    let Some(value) = headers.get(header::TRANSFER_ENCODING) else {
+        return Ok(false);
+    };
+    if String::from_utf8_lossy(value.as_bytes())
+        .trim()
+        .eq_ignore_ascii_case("chunked")
+    {
+        Ok(true)
+    } else {
+        Err(GraphErrorKind::UnsupportedTransferEncoding {
+            encoding: printable(value.as_bytes()),
+        })
+    }
+}
+
+/// What a checked head promises.
+struct Head {
+    /// `Some((start, end))` for a confirmed range, `None` for the whole file.
+    range: Option<(u64, u64)>,
+    /// Whether the head is verified (see [`Body`]).
+    verified: bool,
 }
 
 impl Download {
@@ -163,53 +220,57 @@ impl Download {
         requested: Option<ByteRange>,
         expected_size: u64,
     ) -> Result<Self, GraphError> {
-        match Self::check(&response, requested, expected_size) {
-            Ok(coverage) => {
-                let etag = response
-                    .headers()
-                    .get(header::ETAG)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-                tracing::debug!(
-                    operation = %operation,
-                    status = response.status().as_u16(),
-                    whole_file = coverage.is_none(),
-                    range_requested = requested.is_some(),
-                    "download started"
-                );
-                let (expected, whole_file) = match coverage {
-                    Some((start, end)) => (end - start + 1, false),
-                    None => (expected_size, true),
-                };
-                let body = Body {
-                    operation,
-                    etag,
-                    expected,
-                    whole_file,
-                    received: 0,
-                    state: ReadState::Reading,
-                    response,
-                };
-                Ok(match coverage {
-                    Some((start, end)) => Self::Range { start, end, body },
-                    None => Self::WholeFile { body },
-                })
-            }
-            Err(kind) => Err(GraphError::new(operation, kind)),
-        }
+        let head = match Self::check(&response, requested, expected_size) {
+            Ok(head) => head,
+            Err(kind) => return Err(GraphError::new(operation, kind)),
+        };
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        tracing::debug!(
+            operation = %operation,
+            status = response.status().as_u16(),
+            whole_file = head.range.is_none(),
+            verified = head.verified,
+            range_requested = requested.is_some(),
+            "download started"
+        );
+        let expected = match head.range {
+            Some((start, end)) => end - start + 1,
+            None => expected_size,
+        };
+        let body = Body {
+            operation,
+            etag,
+            expected,
+            verified: head.verified,
+            received: 0,
+            state: ReadState::Reading,
+            response,
+        };
+        Ok(match head.range {
+            Some((start, end)) => Self::Range { start, end, body },
+            None => Self::WholeFile { body },
+        })
     }
 
-    /// Checks the head. `Some((start, end))` for a confirmed range, `None` for the whole
-    /// file.
     fn check(
         response: &Response,
         requested: Option<ByteRange>,
         expected_size: u64,
-    ) -> Result<Option<(u64, u64)>, GraphErrorKind> {
+    ) -> Result<Head, GraphErrorKind> {
         let malformed = |reason: &str| Err(GraphErrorKind::Malformed(reason.into()));
         let headers = response.headers();
         require_identity(headers)?;
-        let length = content_length(headers)?;
+        let chunked = transfer_encoding(headers)?;
+        // With a Transfer-Encoding, a Content-Length says nothing about the framing.
+        let length = if chunked {
+            None
+        } else {
+            content_length(headers)?
+        };
         match response.status() {
             StatusCode::OK => {
                 if let Some(announced) = length
@@ -220,7 +281,10 @@ impl Download {
                         reported: Some(announced),
                     });
                 }
-                Ok(None)
+                Ok(Head {
+                    range: None,
+                    verified: length == Some(expected_size),
+                })
             }
             StatusCode::PARTIAL_CONTENT => {
                 let Some(requested) = requested else {
@@ -249,7 +313,10 @@ impl Download {
                 if length.is_some_and(|n| n != end - start + 1) {
                     return malformed("206 whose Content-Length differs from its range");
                 }
-                Ok(Some((start, end)))
+                Ok(Head {
+                    range: Some((start, end)),
+                    verified: true,
+                })
             }
             _ => malformed("a download response that is neither 200 nor 206"),
         }
@@ -269,6 +336,13 @@ impl Body {
         self.expected
     }
 
+    /// Whether the head was verified, so that a [`GraphErrorKind::Truncated`] failure
+    /// is possible; see the type's documentation.
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.verified
+    }
+
     /// The body bytes delivered so far.
     #[must_use]
     pub fn received(&self) -> u64 {
@@ -285,11 +359,9 @@ impl Body {
     ///
     /// # Errors
     ///
-    /// [`GraphErrorKind::Truncated`] if the body ends before its promised length,
-    /// [`GraphErrorKind::Transport`] if the connection fails otherwise, and
-    /// [`GraphErrorKind::SizeMismatch`] (whole file) or [`GraphErrorKind::Malformed`]
-    /// (range) if more bytes arrive than promised. After an error, every later call
-    /// fails too.
+    /// [`GraphErrorKind::Truncated`] or [`GraphErrorKind::SizeMismatch`] as the type's
+    /// documentation sets out, or [`GraphErrorKind::Transport`]. After an error, every
+    /// later call fails too.
     pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, GraphError> {
         match self.state {
             ReadState::Done => return Ok(None),
@@ -300,34 +372,38 @@ impl Body {
             }
             ReadState::Reading => {}
         }
-        let short = |received: u64, expected: u64| {
-            (received < expected).then_some(GraphErrorKind::Truncated { expected, received })
+        let mismatch = |expected: u64, received: u64| GraphErrorKind::SizeMismatch {
+            expected,
+            reported: Some(received),
         };
         match self.response.chunk().await {
             Ok(Some(chunk)) => {
                 self.received += chunk.len() as u64;
                 if self.received > self.expected {
-                    let kind = if self.whole_file {
-                        GraphErrorKind::SizeMismatch {
-                            expected: self.expected,
-                            reported: Some(self.received),
-                        }
-                    } else {
-                        GraphErrorKind::Malformed("more body bytes than the range".into())
-                    };
-                    return Err(self.fail(kind));
+                    return Err(self.fail(mismatch(self.expected, self.received)));
                 }
                 Ok(Some(chunk.into()))
             }
             Ok(None) => {
-                if let Some(kind) = short(self.received, self.expected) {
-                    return Err(self.fail(kind));
+                // A clean end (chunked terminator, or a close without framing) short of
+                // the promised length: the server sent something complete but different.
+                if self.received < self.expected {
+                    return Err(self.fail(mismatch(self.expected, self.received)));
                 }
                 self.state = ReadState::Done;
                 Ok(None)
             }
             Err(e) => {
-                let kind = short(self.received, self.expected).unwrap_or_else(|| transport(e));
+                let kind = if self.received >= self.expected {
+                    transport(e)
+                } else if self.verified {
+                    GraphErrorKind::Truncated {
+                        expected: self.expected,
+                        received: self.received,
+                    }
+                } else {
+                    mismatch(self.expected, self.received)
+                };
                 Err(self.fail(kind))
             }
         }
@@ -352,6 +428,7 @@ impl Body {
             operation = %self.operation,
             received = self.received,
             expected = self.expected,
+            verified = self.verified,
             "download body failed"
         );
         self.error(kind)
@@ -388,6 +465,8 @@ mod tests {
             h.insert(header::CONTENT_RANGE, bad.parse().unwrap());
             assert_eq!(content_range(&h), None, "{bad}");
         }
+        h.insert(header::CONTENT_RANGE, "bytes */100".parse().unwrap());
+        assert_eq!(unsatisfied_range_size(&h), Some(100));
     }
 
     #[test]
@@ -402,6 +481,24 @@ mod tests {
                 matches!(
                     require_identity(&h),
                     Err(GraphErrorKind::UnsupportedEncoding { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_chunked_transfer_encoding_is_accepted() {
+        let mut h = HeaderMap::new();
+        assert_eq!(transfer_encoding(&h).ok(), Some(false));
+        h.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        assert_eq!(transfer_encoding(&h).ok(), Some(true));
+        for bad in ["gzip, chunked", "gzip", "identity"] {
+            h.insert(header::TRANSFER_ENCODING, bad.parse().unwrap());
+            assert!(
+                matches!(
+                    transfer_encoding(&h),
+                    Err(GraphErrorKind::UnsupportedTransferEncoding { .. })
                 ),
                 "{bad:?}"
             );

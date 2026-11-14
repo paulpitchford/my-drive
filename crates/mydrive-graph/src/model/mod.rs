@@ -1,22 +1,27 @@
 //! Graph response types: drive, drive item and delta page.
 //!
-//! Each type is parsed from a private wire shape that accepts unknown fields and treats
-//! everything Graph may omit as optional: no cTag on business drives, no hashes on some
-//! files, no name or size on deleted items, no `parentReference.path` in delta, and the
-//! root item's `parentReference` without an `id`. At this boundary drive IDs are normalised
-//! through [`DriveId`], item IDs are kept exactly as received, timestamps are truncated to
-//! whole seconds (ADR-0011 R5) and quickXorHash is decoded. Only `quickXorHash` is read
-//! from `hashes`; `sha1Hash`, `crc32Hash` and `sha256Hash` are ignored (ADR-0011 R4).
+//! Responses are read field by field from parsed JSON, accepting unknown fields and
+//! treating everything Graph may omit as optional: no cTag on business drives, no hashes
+//! on some files, no name or size on deleted items, no `parentReference.path` in delta,
+//! and the root item's `parentReference` without an `id`. At this boundary drive IDs are
+//! normalised through [`DriveId`], item IDs are kept exactly as received, timestamps are
+//! truncated to whole seconds (ADR-0011 R5) and quickXorHash is decoded. Only
+//! `quickXorHash` is read from `hashes`; `sha1Hash`, `crc32Hash` and `sha256Hash` are
+//! ignored (ADR-0011 R4).
 //!
 //! One bad item never fails a delta page, so it cannot stall a mount's delta forever:
 //!
 //! - A quickXorHash or timestamp that cannot be read is left `None`, and the item carries
 //!   an [`ItemWarning`] saying so. A missing hash must never be read as "unchanged".
 //! - An item that has an ID but whose shape cannot be used (for example an empty parent
-//!   ID, or a field of the wrong type) goes into [`DeltaPage::problems`] with its ID and
-//!   the reason, so the engine can mark it and move on.
-//! - Only a page that is not JSON, lacks its next or delta link, or has an item without a
-//!   readable ID fails as a whole.
+//!   ID, or a field of the wrong type) becomes a [`DeltaEntry::Problem`] in its place in
+//!   the feed, with its ID, whether it carried the `deleted` facet, and the reason.
+//! - Only a page that is not JSON, lacks its next or delta link, or has an entry without
+//!   a readable ID fails as a whole.
+//!
+//! Every reason and message here names a field and a fixed problem; none repeats a value
+//! from the response, so nothing the server sends (names, URLs, tokens) reaches an error
+//! or a log line through this module.
 //!
 //! `@microsoft.graph.downloadUrl` is never read: the client downloads through `/content`
 //! (ADR-0011 R10), and a pre-authenticated URL kept in a value could leak through `Debug`.
@@ -27,9 +32,7 @@ use std::fmt;
 
 use mydrive_core::hash::QuickXorHash;
 use mydrive_core::ids::{DriveId, ItemId};
-use serde::Deserialize;
-use serde::de::IgnoredAny;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub use time::{Timestamp, TimestampError};
 
@@ -47,12 +50,12 @@ pub enum DriveType {
 }
 
 impl DriveType {
-    fn from_wire(value: String) -> Self {
-        match value.as_str() {
+    fn from_wire(value: &str) -> Self {
+        match value {
             "personal" => Self::Personal,
             "business" => Self::Business,
             "documentLibrary" => Self::DocumentLibrary,
-            _ => Self::Other(value),
+            _ => Self::Other(value.to_owned()),
         }
     }
 }
@@ -82,7 +85,7 @@ pub struct Drive {
     pub drive_type: Option<DriveType>,
     /// The drive's display name, if reported.
     pub name: Option<String>,
-    /// The quota, if reported in a usable shape. A quota that cannot be read is left out
+    /// The quota, if reported as an object. A quota field that cannot be read is `None`
     /// rather than failing the whole drive.
     pub quota: Option<Quota>,
 }
@@ -94,7 +97,8 @@ pub struct ParentReference {
     pub drive_id: Option<DriveId>,
     /// The type of that drive.
     pub drive_type: Option<DriveType>,
-    /// The parent folder's item ID. Absent on the root item.
+    /// The parent folder's item ID. Absent on the root item; its absence on any other
+    /// item does **not** make that item the root.
     pub id: Option<ItemId>,
     /// The parent's percent-encoded path. Delta never includes it, and it must never be
     /// used to identify an item (ADR-0011 R1); it is informational only.
@@ -113,7 +117,8 @@ pub enum ItemKind {
     /// plain folder.
     Package(PackageFacet),
     /// None of those facets was present, for example a deleted item whose facets Graph
-    /// omitted, or a shortcut described only by `remoteItem`.
+    /// omitted, or a shortcut described only by `remoteItem`. Never materialise it as an
+    /// empty file or an empty folder.
     Unknown,
 }
 
@@ -189,6 +194,16 @@ impl fmt::Display for ItemWarning {
 /// Content equality is decided by [`etag`](Self::etag), [`size`](Self::size) and the
 /// quickXorHash (ADR-0011 R4). [`ctag`](Self::ctag) is kept because the store records it,
 /// but it is absent on business delta and must not be used for that decision.
+///
+/// What the engine must not assume from what is missing:
+///
+/// - An [`ItemKind::Unknown`] item is never materialised as an empty file (or folder).
+/// - A non-root item without a parent ID (`parent` absent or its `id` absent) is not the
+///   root and is not in the root; only [`root`](Self::root) marks the root.
+/// - A file without a [`size`](Self::size) has an unknown size, not size 0: fetch it with
+///   get-item before downloading, since a download needs the expected size.
+/// - A missing hash or timestamp (see [`warnings`](Self::warnings)) is unknown, not
+///   unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveItem {
     /// The item ID, exactly as received: never case-folded or otherwise changed.
@@ -249,13 +264,33 @@ impl DriveItem {
 /// An entry of a delta page that has an ID but could not be turned into a [`DriveItem`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemProblem {
-    /// The entry's position in the page's `value` array, so its order relative to other
-    /// occurrences of the same item is known (ADR-0011 R2).
-    pub index: usize,
     /// The item's ID, exactly as received.
     pub id: ItemId,
-    /// Why it could not be used. Names fields and positions, never the body.
+    /// Whether the entry carried the `deleted` facet: a delete was reported even though
+    /// the rest of the entry is unusable.
+    pub deleted: bool,
+    /// Why it could not be used: a field name and a fixed problem, never a value.
     pub reason: String,
+}
+
+/// One entry of a delta page, in feed order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaEntry {
+    /// A usable item.
+    Item(Box<DriveItem>),
+    /// An entry with an ID that could not be used.
+    Problem(ItemProblem),
+}
+
+impl DeltaEntry {
+    /// The entry's item ID.
+    #[must_use]
+    pub fn id(&self) -> &ItemId {
+        match self {
+            Self::Item(item) => &item.id,
+            Self::Problem(problem) => &problem.id,
+        }
+    }
 }
 
 /// An opaque delta link: an `@odata.nextLink` or `@odata.deltaLink` exactly as Graph sent
@@ -294,27 +329,42 @@ pub enum DeltaContinuation {
 
 /// One page of a delta feed.
 ///
-/// `items` keeps every usable entry in the order Graph sent it, repeats included: the
-/// same item may appear more than once, and only its last occurrence may be applied
-/// (ADR-0011 R2), which needs the whole round, not one page. Entries that could not be
-/// used are in `problems`, with their position.
+/// `entries` keeps every entry in the order Graph sent it, repeats included, usable or
+/// not: the same item may appear more than once, and only its last occurrence may be
+/// applied (ADR-0011 R2), which needs the whole round, not one page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeltaPage {
-    /// The usable items, in feed order.
-    pub items: Vec<DriveItem>,
-    /// The entries with an ID that could not be used, in feed order.
-    pub problems: Vec<ItemProblem>,
+    /// The entries, in feed order.
+    pub entries: Vec<DeltaEntry>,
     /// The next link or the delta link.
     pub continuation: DeltaContinuation,
 }
 
-/// Why a response body could not be turned into a model value.
+impl DeltaPage {
+    /// The usable items, in feed order.
+    pub fn items(&self) -> impl Iterator<Item = &DriveItem> {
+        self.entries.iter().filter_map(|e| match e {
+            DeltaEntry::Item(item) => Some(item.as_ref()),
+            DeltaEntry::Problem(_) => None,
+        })
+    }
+
+    /// The unusable entries, in feed order.
+    pub fn problems(&self) -> impl Iterator<Item = &ItemProblem> {
+        self.entries.iter().filter_map(|e| match e {
+            DeltaEntry::Problem(problem) => Some(problem),
+            DeltaEntry::Item(_) => None,
+        })
+    }
+}
+
+/// Why a response body could not be turned into a model value. Messages name fields and
+/// fixed problems only.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
-    /// The body is not JSON of the expected shape. The reason is serde's, which names a
-    /// field or position.
-    #[error("the JSON does not have the expected shape: {0}")]
-    Shape(String),
+    /// The body is not JSON of the expected shape.
+    #[error("the body is not the expected JSON: {0}")]
+    Shape(&'static str),
     /// An identifier is missing, empty or not a string.
     #[error("the {field} is missing, empty or not a string")]
     MissingId {
@@ -326,142 +376,62 @@ pub enum ModelError {
     Item {
         /// The item.
         id: ItemId,
-        /// Why.
+        /// Why: a field name and a fixed problem.
         reason: String,
     },
-    /// A delta page carries neither a next link nor a delta link, or both.
+    /// A delta page carries neither a next link nor a delta link, or both, or a link
+    /// that is not a string.
     #[error("the delta page carries {0}")]
     Continuation(&'static str),
 }
 
-// ---- wire shapes ------------------------------------------------------------------------
+// ---- field readers ----------------------------------------------------------------------
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireQuota {
-    total: Option<i64>,
-    used: Option<i64>,
-    remaining: Option<i64>,
-    deleted: Option<i64>,
-    state: Option<String>,
+type Obj = Map<String, Value>;
+
+/// A field's value, treating JSON `null` as absent.
+fn get<'a>(obj: &'a Obj, key: &str) -> Option<&'a Value> {
+    obj.get(key).filter(|v| !v.is_null())
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireDrive {
-    id: String,
-    drive_type: Option<String>,
-    name: Option<String>,
-    quota: Option<Value>,
+fn opt_str(obj: &Obj, key: &str, path: &'static str) -> Result<Option<String>, String> {
+    match get(obj, key) {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("{path} is not a string")),
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireParent {
-    drive_id: Option<String>,
-    drive_type: Option<String>,
-    id: Option<String>,
-    path: Option<String>,
+fn opt_u64(obj: &Obj, key: &str, path: &'static str) -> Result<Option<u64>, String> {
+    match get(obj, key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("{path} is not a non-negative integer")),
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireHashes {
-    // A `Value`, so an unreadable hash is a warning, not an unusable item.
-    quick_xor_hash: Option<Value>,
+fn opt_obj<'a>(obj: &'a Obj, key: &str, path: &'static str) -> Result<Option<&'a Obj>, String> {
+    match get(obj, key) {
+        None => Ok(None),
+        Some(Value::Object(o)) => Ok(Some(o)),
+        Some(_) => Err(format!("{path} is not an object")),
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireFile {
-    mime_type: Option<String>,
-    hashes: Option<WireHashes>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireFolder {
-    child_count: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct WirePackage {
-    #[serde(rename = "type")]
-    package_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireFileSystemInfo {
-    created_date_time: Option<Value>,
-    last_modified_date_time: Option<Value>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireRemote {
-    id: String,
-    name: Option<String>,
-    size: Option<u64>,
-    file: Option<WireFile>,
-    folder: Option<WireFolder>,
-    package: Option<WirePackage>,
-    parent_reference: Option<WireParent>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WireItem {
-    name: Option<String>,
-    #[serde(rename = "eTag")]
-    etag: Option<String>,
-    #[serde(rename = "cTag")]
-    ctag: Option<String>,
-    size: Option<u64>,
-    created_date_time: Option<Value>,
-    last_modified_date_time: Option<Value>,
-    file_system_info: Option<WireFileSystemInfo>,
-    parent_reference: Option<WireParent>,
-    file: Option<WireFile>,
-    folder: Option<WireFolder>,
-    package: Option<WirePackage>,
-    deleted: Option<IgnoredAny>,
-    root: Option<IgnoredAny>,
-    shared: Option<IgnoredAny>,
-    remote_item: Option<WireRemote>,
-}
-
-#[derive(Deserialize)]
-struct WireDeltaPage {
-    value: Vec<Value>,
-    #[serde(rename = "@odata.nextLink")]
-    next_link: Option<String>,
-    #[serde(rename = "@odata.deltaLink")]
-    delta_link: Option<String>,
-}
-
-// ---- conversion -------------------------------------------------------------------------
-
-fn shape(e: &serde_json::Error) -> ModelError {
-    ModelError::Shape(e.to_string())
-}
-
-/// Why one item could not be parsed.
-enum ItemFailure {
-    /// No readable ID: the page cannot be trusted.
-    NoId,
-    /// An ID, but the rest cannot be used.
-    Problem { id: ItemId, reason: String },
+/// Whether a facet is present (any non-null value).
+fn present(obj: &Obj, key: &str) -> bool {
+    get(obj, key).is_some()
 }
 
 /// Collects warnings while one item is converted.
 struct Warnings(Vec<ItemWarning>);
 
 impl Warnings {
-    fn timestamp(&mut self, raw: Option<Value>, field: &'static str) -> Option<Timestamp> {
-        let parsed = match raw? {
-            Value::Null => return None,
-            Value::String(text) => Timestamp::parse_rfc3339(&text).ok(),
+    fn timestamp(&mut self, obj: &Obj, key: &str, field: &'static str) -> Option<Timestamp> {
+        let parsed = match get(obj, key)? {
+            Value::String(text) => Timestamp::parse_rfc3339(text).ok(),
             _ => None,
         };
         if parsed.is_none() {
@@ -473,10 +443,9 @@ impl Warnings {
         parsed
     }
 
-    fn hash(&mut self, raw: Option<Value>, field: &'static str) -> Option<QuickXorHash> {
-        let parsed = match raw? {
-            Value::Null => return None,
-            Value::String(text) => QuickXorHash::from_base64(&text).ok(),
+    fn hash(&mut self, obj: &Obj, field: &'static str) -> Option<QuickXorHash> {
+        let parsed = match get(obj, "quickXorHash")? {
+            Value::String(text) => QuickXorHash::from_base64(text).ok(),
             _ => None,
         };
         if parsed.is_none() {
@@ -489,145 +458,186 @@ impl Warnings {
     }
 }
 
-fn drive_id(raw: String, field: &'static str) -> Result<DriveId, String> {
-    DriveId::new(raw).map_err(|_| format!("{field} is empty"))
+/// The JSON paths used for a parent reference, which differ under `remoteItem`.
+struct ParentPaths {
+    drive_id: &'static str,
+    drive_type: &'static str,
+    id: &'static str,
+    path: &'static str,
 }
 
-fn item_id(raw: String, field: &'static str) -> Result<ItemId, String> {
-    ItemId::new(raw).map_err(|_| format!("{field} is empty"))
-}
+const ITEM_PARENT: ParentPaths = ParentPaths {
+    drive_id: "parentReference.driveId",
+    drive_type: "parentReference.driveType",
+    id: "parentReference.id",
+    path: "parentReference.path",
+};
 
-impl From<WireQuota> for Quota {
-    fn from(w: WireQuota) -> Self {
-        Self {
-            total: w.total,
-            used: w.used,
-            remaining: w.remaining,
-            deleted: w.deleted,
-            state: w.state,
-        }
-    }
-}
+const REMOTE_PARENT: ParentPaths = ParentPaths {
+    drive_id: "remoteItem.parentReference.driveId",
+    drive_type: "remoteItem.parentReference.driveType",
+    id: "remoteItem.parentReference.id",
+    path: "remoteItem.parentReference.path",
+};
 
-impl WireParent {
-    fn convert(self) -> Result<ParentReference, String> {
-        Ok(ParentReference {
-            drive_id: self
-                .drive_id
-                .map(|d| drive_id(d, "parentReference.driveId"))
-                .transpose()?,
-            drive_type: self.drive_type.map(DriveType::from_wire),
-            id: self
-                .id
-                .map(|i| item_id(i, "parentReference.id"))
-                .transpose()?,
-            path: self.path,
-        })
-    }
-}
-
-fn kind(
-    file: Option<WireFile>,
-    folder: Option<WireFolder>,
-    package: Option<WirePackage>,
-    warnings: &mut Warnings,
-    hash_field: &'static str,
-) -> ItemKind {
-    if let Some(package) = package {
-        return ItemKind::Package(PackageFacet {
-            package_type: package.package_type,
-        });
-    }
-    if let Some(folder) = folder {
-        return ItemKind::Folder(FolderFacet {
-            child_count: folder.child_count,
-        });
-    }
-    let Some(file) = file else {
-        return ItemKind::Unknown;
-    };
-    let quick_xor_hash = warnings.hash(file.hashes.and_then(|h| h.quick_xor_hash), hash_field);
-    ItemKind::File(FileFacet {
-        mime_type: file.mime_type,
-        quick_xor_hash,
+fn parent(obj: &Obj, paths: &ParentPaths) -> Result<ParentReference, String> {
+    let drive_id = opt_str(obj, "driveId", paths.drive_id)?
+        .map(|d| DriveId::new(d).map_err(|_| format!("{} is empty", paths.drive_id)))
+        .transpose()?;
+    let id = opt_str(obj, "id", paths.id)?
+        .map(|i| ItemId::new(i).map_err(|_| format!("{} is empty", paths.id)))
+        .transpose()?;
+    Ok(ParentReference {
+        drive_id,
+        drive_type: opt_str(obj, "driveType", paths.drive_type)?
+            .as_deref()
+            .map(DriveType::from_wire),
+        id,
+        path: opt_str(obj, "path", paths.path)?,
     })
 }
 
-impl WireRemote {
-    fn convert(self, warnings: &mut Warnings) -> Result<RemoteItem, String> {
-        let id = item_id(self.id, "remoteItem.id")?;
-        let kind = kind(
-            self.file,
-            self.folder,
-            self.package,
-            warnings,
-            "remoteItem.file.hashes.quickXorHash",
-        );
-        Ok(RemoteItem {
-            kind,
-            name: self.name,
-            size: self.size,
-            parent: self.parent_reference.map(WireParent::convert).transpose()?,
-            id,
-        })
-    }
+/// The JSON paths used for facets, which differ under `remoteItem`.
+struct KindPaths {
+    file: &'static str,
+    mime: &'static str,
+    hashes: &'static str,
+    hash: &'static str,
+    folder: &'static str,
+    child_count: &'static str,
+    package: &'static str,
+    package_type: &'static str,
 }
 
-impl WireItem {
-    fn convert(self, id: ItemId) -> Result<DriveItem, String> {
-        let mut w = Warnings(Vec::new());
-        let kind = kind(
-            self.file,
-            self.folder,
-            self.package,
-            &mut w,
-            "file.hashes.quickXorHash",
-        );
-        let created = w.timestamp(self.created_date_time, "createdDateTime");
-        let last_modified = w.timestamp(self.last_modified_date_time, "lastModifiedDateTime");
-        let file_system_info = self.file_system_info.map(|fs| FileSystemInfo {
-            created: w.timestamp(fs.created_date_time, "fileSystemInfo.createdDateTime"),
+const ITEM_KIND: KindPaths = KindPaths {
+    file: "file",
+    mime: "file.mimeType",
+    hashes: "file.hashes",
+    hash: "file.hashes.quickXorHash",
+    folder: "folder",
+    child_count: "folder.childCount",
+    package: "package",
+    package_type: "package.type",
+};
+
+const REMOTE_KIND: KindPaths = KindPaths {
+    file: "remoteItem.file",
+    mime: "remoteItem.file.mimeType",
+    hashes: "remoteItem.file.hashes",
+    hash: "remoteItem.file.hashes.quickXorHash",
+    folder: "remoteItem.folder",
+    child_count: "remoteItem.folder.childCount",
+    package: "remoteItem.package",
+    package_type: "remoteItem.package.type",
+};
+
+fn kind(obj: &Obj, paths: &KindPaths, w: &mut Warnings) -> Result<ItemKind, String> {
+    if let Some(package) = opt_obj(obj, "package", paths.package)? {
+        return Ok(ItemKind::Package(PackageFacet {
+            package_type: opt_str(package, "type", paths.package_type)?,
+        }));
+    }
+    if let Some(folder) = opt_obj(obj, "folder", paths.folder)? {
+        return Ok(ItemKind::Folder(FolderFacet {
+            child_count: opt_u64(folder, "childCount", paths.child_count)?,
+        }));
+    }
+    let Some(file) = opt_obj(obj, "file", paths.file)? else {
+        return Ok(ItemKind::Unknown);
+    };
+    let quick_xor_hash = match opt_obj(file, "hashes", paths.hashes)? {
+        Some(hashes) => w.hash(hashes, paths.hash),
+        None => None,
+    };
+    Ok(ItemKind::File(FileFacet {
+        mime_type: opt_str(file, "mimeType", paths.mime)?,
+        quick_xor_hash,
+    }))
+}
+
+fn remote(obj: &Obj, w: &mut Warnings) -> Result<RemoteItem, String> {
+    let id = match get(obj, "id") {
+        Some(Value::String(s)) => {
+            ItemId::new(s.clone()).map_err(|_| "remoteItem.id is empty".to_owned())?
+        }
+        _ => return Err("remoteItem.id is missing or not a string".to_owned()),
+    };
+    Ok(RemoteItem {
+        kind: kind(obj, &REMOTE_KIND, w)?,
+        name: opt_str(obj, "name", "remoteItem.name")?,
+        size: opt_u64(obj, "size", "remoteItem.size")?,
+        parent: opt_obj(obj, "parentReference", "remoteItem.parentReference")?
+            .map(|p| parent(p, &REMOTE_PARENT))
+            .transpose()?,
+        id,
+    })
+}
+
+fn item_body(obj: &Obj, id: ItemId) -> Result<DriveItem, String> {
+    let mut w = Warnings(Vec::new());
+    let kind = kind(obj, &ITEM_KIND, &mut w)?;
+    let created = w.timestamp(obj, "createdDateTime", "createdDateTime");
+    let last_modified = w.timestamp(obj, "lastModifiedDateTime", "lastModifiedDateTime");
+    let file_system_info =
+        opt_obj(obj, "fileSystemInfo", "fileSystemInfo")?.map(|fs| FileSystemInfo {
+            created: w.timestamp(fs, "createdDateTime", "fileSystemInfo.createdDateTime"),
             last_modified: w.timestamp(
-                fs.last_modified_date_time,
+                fs,
+                "lastModifiedDateTime",
                 "fileSystemInfo.lastModifiedDateTime",
             ),
         });
-        let parent = self.parent_reference.map(WireParent::convert).transpose()?;
-        let remote_item = self.remote_item.map(|r| r.convert(&mut w)).transpose()?;
-        Ok(DriveItem {
-            id,
-            name: self.name,
-            etag: self.etag,
-            ctag: self.ctag,
-            size: self.size,
-            created,
-            last_modified,
-            file_system_info,
-            parent,
-            kind,
-            deleted: self.deleted.is_some(),
-            root: self.root.is_some(),
-            shared: self.shared.is_some(),
-            remote_item,
-            warnings: w.0,
-        })
-    }
+    let parent = opt_obj(obj, "parentReference", "parentReference")?
+        .map(|p| parent(p, &ITEM_PARENT))
+        .transpose()?;
+    let remote_item = opt_obj(obj, "remoteItem", "remoteItem")?
+        .map(|r| remote(r, &mut w))
+        .transpose()?;
+    Ok(DriveItem {
+        id,
+        name: opt_str(obj, "name", "name")?,
+        etag: opt_str(obj, "eTag", "eTag")?,
+        ctag: opt_str(obj, "cTag", "cTag")?,
+        size: opt_u64(obj, "size", "size")?,
+        created,
+        last_modified,
+        file_system_info,
+        parent,
+        kind,
+        deleted: present(obj, "deleted"),
+        root: present(obj, "root"),
+        shared: present(obj, "shared"),
+        remote_item,
+        warnings: w.0,
+    })
 }
 
-/// Parses one item from its JSON value. Its ID is read first, so every later failure
-/// can name it.
-fn parse_item(value: Value) -> Result<DriveItem, ItemFailure> {
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .and_then(|raw| ItemId::new(raw).ok())
-        .ok_or(ItemFailure::NoId)?;
-    let wire = WireItem::deserialize(value).map_err(|e| ItemFailure::Problem {
-        id: id.clone(),
-        reason: e.to_string(),
-    })?;
-    wire.convert(id.clone())
-        .map_err(|reason| ItemFailure::Problem { id, reason })
+/// Why one item could not be parsed.
+enum ItemFailure {
+    /// No readable ID: the page cannot be trusted.
+    NoId,
+    /// An ID, but the rest cannot be used.
+    Problem(ItemProblem),
+}
+
+/// Parses one item. Its ID is read first, so every later failure can name it.
+fn parse_item(value: &Value) -> Result<DriveItem, ItemFailure> {
+    let obj = value.as_object().ok_or(ItemFailure::NoId)?;
+    let id = match get(obj, "id") {
+        Some(Value::String(s)) => ItemId::new(s.clone()).map_err(|_| ItemFailure::NoId)?,
+        _ => return Err(ItemFailure::NoId),
+    };
+    item_body(obj, id.clone()).map_err(|reason| {
+        ItemFailure::Problem(ItemProblem {
+            id,
+            deleted: present(obj, "deleted"),
+            reason,
+        })
+    })
+}
+
+fn parse_json(body: &[u8]) -> Result<Value, ModelError> {
+    serde_json::from_slice(body).map_err(|_| ModelError::Shape("the body is not valid JSON"))
 }
 
 impl Drive {
@@ -635,17 +645,34 @@ impl Drive {
     ///
     /// # Errors
     ///
-    /// [`ModelError`] if the body is not a drive resource or its ID is unusable.
+    /// [`ModelError`] if the body is not a JSON object or its ID is unusable. Other
+    /// fields of the wrong type are left `None`.
     pub fn from_json(body: &[u8]) -> Result<Self, ModelError> {
-        let wire: WireDrive = serde_json::from_slice(body).map_err(|e| shape(&e))?;
+        let value = parse_json(body)?;
+        let obj = value
+            .as_object()
+            .ok_or(ModelError::Shape("the drive is not an object"))?;
+        let id = match get(obj, "id") {
+            Some(Value::String(s)) => DriveId::new(s.clone()).ok(),
+            _ => None,
+        }
+        .ok_or(ModelError::MissingId { field: "drive id" })?;
+        let text = |key| get(obj, key).and_then(Value::as_str);
+        let quota = get(obj, "quota").and_then(Value::as_object).map(|q| {
+            let num = |key| get(q, key).and_then(Value::as_i64);
+            Quota {
+                total: num("total"),
+                used: num("used"),
+                remaining: num("remaining"),
+                deleted: num("deleted"),
+                state: get(q, "state").and_then(Value::as_str).map(str::to_owned),
+            }
+        });
         Ok(Self {
-            id: DriveId::new(wire.id).map_err(|_| ModelError::MissingId { field: "drive id" })?,
-            drive_type: wire.drive_type.map(DriveType::from_wire),
-            name: wire.name,
-            quota: wire
-                .quota
-                .and_then(|q| WireQuota::deserialize(q).ok())
-                .map(Quota::from),
+            id,
+            drive_type: text("driveType").map(DriveType::from_wire),
+            name: text("name").map(str::to_owned),
+            quota,
         })
     }
 }
@@ -658,11 +685,21 @@ impl DriveItem {
     /// [`ModelError`] if the body is not JSON, has no readable ID, or the item cannot be
     /// used. Unreadable hashes and timestamps are warnings, not errors.
     pub fn from_json(body: &[u8]) -> Result<Self, ModelError> {
-        let value: Value = serde_json::from_slice(body).map_err(|e| shape(&e))?;
-        parse_item(value).map_err(|failure| match failure {
+        parse_item(&parse_json(body)?).map_err(|failure| match failure {
             ItemFailure::NoId => ModelError::MissingId { field: "item id" },
-            ItemFailure::Problem { id, reason } => ModelError::Item { id, reason },
+            ItemFailure::Problem(p) => ModelError::Item {
+                id: p.id,
+                reason: p.reason,
+            },
         })
+    }
+}
+
+fn link(obj: &Obj, key: &str) -> Result<Option<DeltaLink>, ModelError> {
+    match get(obj, key) {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(DeltaLink(s.clone()))),
+        Some(_) => Err(ModelError::Continuation("a link that is not a string")),
     }
 }
 
@@ -673,12 +710,18 @@ impl DeltaPage {
     ///
     /// [`ModelError`] if the body is not a delta page, an entry has no readable ID, or
     /// the page does not carry exactly one of `@odata.nextLink` and `@odata.deltaLink`.
-    /// Other problems with single entries are reported in [`DeltaPage::problems`].
+    /// Other problems with single entries become [`DeltaEntry::Problem`].
     pub fn from_json(body: &[u8]) -> Result<Self, ModelError> {
-        let wire: WireDeltaPage = serde_json::from_slice(body).map_err(|e| shape(&e))?;
-        let continuation = match (wire.next_link, wire.delta_link) {
-            (Some(next), None) => DeltaContinuation::NextLink(DeltaLink(next)),
-            (None, Some(delta)) => DeltaContinuation::DeltaLink(DeltaLink(delta)),
+        let value = parse_json(body)?;
+        let obj = value
+            .as_object()
+            .ok_or(ModelError::Shape("the delta page is not an object"))?;
+        let continuation = match (
+            link(obj, "@odata.nextLink")?,
+            link(obj, "@odata.deltaLink")?,
+        ) {
+            (Some(next), None) => DeltaContinuation::NextLink(next),
+            (None, Some(delta)) => DeltaContinuation::DeltaLink(delta),
             (None, None) => {
                 return Err(ModelError::Continuation(
                     "neither @odata.nextLink nor @odata.deltaLink",
@@ -690,24 +733,23 @@ impl DeltaPage {
                 ));
             }
         };
-        let mut items = Vec::with_capacity(wire.value.len());
-        let mut problems = Vec::new();
-        for (index, value) in wire.value.into_iter().enumerate() {
-            match parse_item(value) {
-                Ok(item) => items.push(item),
-                Err(ItemFailure::Problem { id, reason }) => {
-                    problems.push(ItemProblem { index, id, reason });
-                }
+        let values = get(obj, "value")
+            .and_then(Value::as_array)
+            .ok_or(ModelError::Shape("the delta page's value is not an array"))?;
+        let mut entries = Vec::with_capacity(values.len());
+        for value in values {
+            entries.push(match parse_item(value) {
+                Ok(item) => DeltaEntry::Item(Box::new(item)),
+                Err(ItemFailure::Problem(problem)) => DeltaEntry::Problem(problem),
                 Err(ItemFailure::NoId) => {
                     return Err(ModelError::MissingId {
                         field: "id of a delta entry",
                     });
                 }
-            }
+            });
         }
         Ok(Self {
-            items,
-            problems,
+            entries,
             continuation,
         })
     }
@@ -736,15 +778,27 @@ mod tests {
         let extra = item(
             r#"{"id":"x","futureFacet":{"a":[1,2]},"webUrl":"https://example.invalid/x",
                 "createdBy":{"user":{"displayName":"Someone"}},"file":{"newThing":true},
-                "parentReference":{"siteId":"s","driveId":"D","unknown":1}}"#,
+                "parentReference":{"siteId":"s","driveId":"D","unknown":1},"name":null}"#,
         );
         assert!(extra.is_file());
         assert_eq!(extra.quick_xor_hash(), None);
+        assert_eq!(extra.name, None, "null is absent");
         assert_eq!(
             extra.parent.unwrap().drive_id.unwrap().as_str(),
             "d",
             "drive IDs go through DriveId"
         );
+    }
+
+    /// A `parentReference` with no `driveId` parses, with the drive ID absent.
+    #[test]
+    fn parent_reference_without_drive_id_parses() {
+        let parsed = item(r#"{"id":"x","parentReference":{"id":"p","path":"/drive/root:"}}"#);
+        let parent = parsed.parent.unwrap();
+        assert_eq!(parent.drive_id, None);
+        assert_eq!(parent.id.unwrap().as_str(), "p");
+        let empty = item(r#"{"id":"x","parentReference":{}}"#);
+        assert_eq!(empty.parent.unwrap(), ParentReference::default());
     }
 
     /// AC9: item IDs are kept exactly as received, drive IDs are lowercased (ADR-0007 R1).
@@ -903,9 +957,9 @@ mod tests {
         assert_eq!(quota.remaining, Some(-5));
         assert_eq!(quota.used, Some(15));
         let odd = Drive::from_json(br#"{"id":"d","quota":{"total":"lots"}}"#).unwrap();
-        assert!(odd.quota.is_none());
-        let odd = Drive::from_json(br#"{"id":"d","quota":7}"#).unwrap();
-        assert!(odd.quota.is_none());
+        assert_eq!(odd.quota.unwrap().total, None);
+        let odd = Drive::from_json(br#"{"id":"d","quota":7,"name":3}"#).unwrap();
+        assert!(odd.quota.is_none() && odd.name.is_none());
     }
 
     #[test]
@@ -919,45 +973,100 @@ mod tests {
             br#"{"@odata.context":"c","value":[{"id":"a"},{"id":"a"}],"@odata.deltaLink":"d"}"#,
         )
         .unwrap();
-        assert_eq!(done.items.len(), 2, "repeats are kept for ADR-0011 R2");
-        assert!(DeltaPage::from_json(br#"{"value":[]}"#).is_err());
-        assert!(
-            DeltaPage::from_json(br#"{"value":[],"@odata.nextLink":"n","@odata.deltaLink":"d"}"#)
-                .is_err()
-        );
-        assert!(DeltaPage::from_json(b"not json").is_err());
+        assert_eq!(done.entries.len(), 2, "repeats are kept for ADR-0011 R2");
+        for bad in [
+            &br#"{"value":[]}"#[..],
+            br#"{"value":[],"@odata.nextLink":"n","@odata.deltaLink":"d"}"#,
+            br#"{"value":[],"@odata.deltaLink":5}"#,
+            br#"{"value":{},"@odata.deltaLink":"d"}"#,
+            b"not json",
+        ] {
+            assert!(DeltaPage::from_json(bad).is_err());
+        }
     }
 
     /// One bad item does not fail the page: unreadable hashes and timestamps are
-    /// warnings, an unusable entry with an ID is a problem with its position, and only an
-    /// entry without a readable ID fails the page.
+    /// warnings, an unusable entry with an ID is a problem in its place in the feed (with
+    /// its `deleted` facet noted), and only an entry without a readable ID fails the page.
     #[test]
     fn one_bad_item_does_not_fail_the_page() {
         let page = DeltaPage::from_json(
             br#"{"value":[
                 {"id":"good"},
                 {"id":"badhash","file":{"hashes":{"quickXorHash":"nope"}},"lastModifiedDateTime":"x"},
-                {"id":"noparent","parentReference":{"id":""}},
+                {"id":"noparent","parentReference":{"id":""},"deleted":{}},
                 {"id":"wrongtype","size":"big"},
+                {"id":"good"},
                 {"id":"good2","remoteItem":{"id":""}}
             ],"@odata.deltaLink":"d"}"#,
         )
         .unwrap();
-        let ids: Vec<_> = page.items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, ["good", "badhash"]);
-        assert_eq!(page.items[1].warnings.len(), 2);
-        let problems: Vec<_> = page
-            .problems
+        let order: Vec<_> = page
+            .entries
             .iter()
-            .map(|p| (p.index, p.id.as_str()))
+            .map(|e| (e.id().as_str(), matches!(e, DeltaEntry::Item(_))))
             .collect();
-        assert_eq!(problems, [(2, "noparent"), (3, "wrongtype"), (4, "good2")]);
-        assert!(page.problems.iter().all(|p| !p.reason.is_empty()));
+        assert_eq!(
+            order,
+            [
+                ("good", true),
+                ("badhash", true),
+                ("noparent", false),
+                ("wrongtype", false),
+                ("good", true),
+                ("good2", false)
+            ]
+        );
+        assert_eq!(page.items().nth(1).unwrap().warnings.len(), 2);
+        let problems: Vec<_> = page
+            .problems()
+            .map(|p| (p.id.as_str(), p.deleted))
+            .collect();
+        assert_eq!(
+            problems,
+            [("noparent", true), ("wrongtype", false), ("good2", false)]
+        );
+        assert!(page.problems().all(|p| !p.reason.is_empty()));
 
         assert!(matches!(
             DeltaPage::from_json(br#"{"value":[{"id":"a"},{"name":"x"}],"@odata.deltaLink":"d"}"#),
             Err(ModelError::MissingId { .. })
         ));
+    }
+
+    /// Reasons and messages name the field and never repeat a value from the response.
+    #[test]
+    fn reasons_never_echo_values() {
+        let secret = "https://h.invalid/x?access_token=SECRET\nfake log line";
+        let json = serde_json::json!({
+            "value": [
+                {"id": "a", "size": secret},
+                {"id": "b", "name": {"x": secret}},
+                {"id": "c", "parentReference": secret},
+                {"id": "d", "remoteItem": {"id": secret.len()}},
+                {"id": "e", "file": {"mimeType": [secret]}},
+            ],
+            "@odata.deltaLink": "d"
+        });
+        let page = DeltaPage::from_json(json.to_string().as_bytes()).unwrap();
+        assert_eq!(page.problems().count(), 5);
+        let reasons: Vec<_> = page.problems().map(|p| p.reason.clone()).collect();
+        assert_eq!(reasons[0], "size is not a non-negative integer");
+        for reason in &reasons {
+            assert!(
+                !reason.contains("SECRET") && !reason.contains('\n'),
+                "{reason}"
+            );
+        }
+        let err = DriveItem::from_json(
+            serde_json::json!({"id": "a", "eTag": [secret]})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains("SECRET"), "{err}");
+        let err = DeltaPage::from_json(format!("{{\"x\": \"{secret}").as_bytes()).unwrap_err();
+        assert!(!err.to_string().contains("SECRET"), "{err}");
     }
 
     /// The pre-authenticated `@microsoft.graph.downloadUrl` is not kept, so it cannot

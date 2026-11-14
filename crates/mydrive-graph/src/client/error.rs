@@ -61,14 +61,35 @@ impl fmt::Display for Operation {
     }
 }
 
+/// The longest error code kept, in characters.
+pub const MAX_CODE_LEN: usize = 64;
+
+/// The most error-code levels kept.
+pub const MAX_CODES: usize = 8;
+
 /// The Graph error codes of an error response: `error.code` and each nested
 /// `innerError.code`, outermost first. Empty if the body had none (or was not JSON).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorCodes(Vec<String>);
 
 impl ErrorCodes {
+    /// Keeps each code in a short printable form: control and non-ASCII characters
+    /// dropped, at most [`MAX_CODE_LEN`] characters, empty codes skipped, at most
+    /// [`MAX_CODES`] levels. A code is a server string that will be logged.
     pub(crate) fn new(codes: Vec<String>) -> Self {
-        Self(codes)
+        Self(
+            codes
+                .into_iter()
+                .map(|code| {
+                    code.chars()
+                        .filter(char::is_ascii_graphic)
+                        .take(MAX_CODE_LEN)
+                        .collect::<String>()
+                })
+                .filter(|code| !code.is_empty())
+                .take(MAX_CODES)
+                .collect(),
+        )
     }
 
     /// The outermost code, `error.code`.
@@ -192,23 +213,40 @@ pub enum GraphErrorKind {
     /// response. The error has had its URL removed.
     #[error("transport error: {0}")]
     Transport(#[source] reqwest::Error),
-    /// The body ended before the announced length. Never reported as a short read.
+    /// The connection failed part-way through a body whose head was **verified**: a
+    /// `200` with a `Content-Length` equal to the expected size (and no
+    /// `Transfer-Encoding`), or a `206` whose `Content-Range` matched the request and
+    /// stated the expected size as its total. For a download, bytes already handed out
+    /// are valid bytes of the expected version at their stated offsets and may be kept;
+    /// the rest can be fetched again. For a JSON body nothing was handed out.
+    ///
+    /// The opposite of [`GraphErrorKind::SizeMismatch`]: never returned when the content
+    /// cannot be shown to be the expected version.
     #[error("the response body ended after {received} of {expected} bytes")]
     Truncated {
-        /// The length the response announced.
+        /// The length the verified head promised.
         expected: u64,
         /// The bytes that arrived.
         received: u64,
     },
-    /// The download response's size does not match the item's expected size: a `200`
-    /// whose `Content-Length` or body length differs, or a `206` whose `Content-Range`
-    /// total differs or is unknown. The file may have changed remotely; refetch its
-    /// metadata. Never a success.
-    #[error("the content size does not match the expected {expected} bytes (server reported {})", reported.map_or_else(|| "no size".to_owned(), |n| n.to_string()))]
+    /// The content is not the expected version, or cannot be shown to be. **Every byte
+    /// from this download must be discarded** and the item's metadata refetched (the
+    /// file may have changed remotely). Returned when:
+    ///
+    /// - the head states another size: a `200` whose `Content-Length` differs, a `206`
+    ///   whose `Content-Range` total differs or is unknown, a `416` whose
+    ///   `Content-Range: bytes */N` names another size;
+    /// - the body ends cleanly (chunked terminator, or a close with no framing) short of
+    ///   the promised length, or runs past it;
+    /// - the head could not be verified (no `Content-Length`: chunked or unframed) and
+    ///   the body ended early, by a clean end or a connection failure.
+    ///
+    /// Never a success, and never to be retried as a network drop with the bytes kept.
+    #[error("the content does not match the expected {expected} bytes (server reported {})", reported.map_or_else(|| "no size".to_owned(), |n| n.to_string()))]
     SizeMismatch {
-        /// The size the caller expected.
+        /// The size the caller expected (for a range: the bytes the range promised).
         expected: u64,
-        /// The size the response announced or delivered, if any.
+        /// The size the response announced, or the bytes it delivered, if known.
         reported: Option<u64>,
     },
     /// The download response is content-encoded (for example gzip by a proxy), so its
@@ -217,6 +255,21 @@ pub enum GraphErrorKind {
     UnsupportedEncoding {
         /// The `Content-Encoding` value, cut to printable ASCII.
         encoding: String,
+    },
+    /// The download response uses a `Transfer-Encoding` other than `chunked`.
+    #[error("the content arrived with Transfer-Encoding {encoding:?}, not chunked")]
+    UnsupportedTransferEncoding {
+        /// The `Transfer-Encoding` value, cut to printable ASCII.
+        encoding: String,
+    },
+    /// The requested range starts at or past the end of the file (any range on an empty
+    /// file). Refused without a request.
+    #[error("the range starting at byte {start} is outside a file of {size} bytes")]
+    RangeOutsideFile {
+        /// The range's first byte.
+        start: u64,
+        /// The expected size.
+        size: u64,
     },
     /// The response is not what Graph documents for this call.
     #[error("malformed response: {0}")]

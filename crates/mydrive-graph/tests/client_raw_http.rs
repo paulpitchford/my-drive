@@ -13,7 +13,8 @@ mod support;
 use std::sync::Arc;
 
 use mydrive_core::ids::{DriveId, ItemId};
-use mydrive_graph::client::{ByteRange, Download};
+use mydrive_graph::client::{ByteRange, Download, MAX_CODE_LEN, MAX_RETRY_AFTER};
+use mydrive_graph::model::DeltaEntry;
 use mydrive_graph::{GraphClient, GraphErrorKind};
 use raw::{RawServer, json, response};
 use support::{FakeTokens, TestResult, read_all, test_user_agent};
@@ -67,7 +68,7 @@ async fn adr_0011_r7_ratelimit_headers_change_nothing() -> TestResult {
         r#"{"value":[{"id":"a"}],"@odata.deltaLink":"x"}"#,
     ));
     let page = client.delta_from_root(&drive()).await?;
-    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items().count(), 1);
 
     server.push(json("429 Too Many Requests", &RATELIMIT, "{}"));
     let err = client.get_drive(&drive()).await.unwrap_err();
@@ -153,27 +154,153 @@ async fn content_encoded_download_is_refused() -> TestResult {
     Ok(())
 }
 
-/// A whole-file body with no length that stops after 10 of 4096 bytes (connection
-/// closed, not chunked) is truncated against the expected size, never complete.
+/// Reads a download to its end and returns the error and the bytes handed out first.
+async fn fail_after(download: Download) -> (u64, mydrive_graph::GraphError) {
+    let mut body = support::body(download);
+    let mut handed_out = 0;
+    loop {
+        match body.chunk().await {
+            Ok(Some(chunk)) => handed_out += chunk.len() as u64,
+            Ok(None) => panic!("a short body must not end in success"),
+            Err(e) => return (handed_out, e),
+        }
+    }
+}
+
+fn chunked(body: &[u8], terminator: bool) -> Vec<u8> {
+    let mut out = format!("{:x}\r\n", body.len()).into_bytes();
+    out.extend_from_slice(body);
+    out.extend_from_slice(b"\r\n");
+    if terminator {
+        out.extend_from_slice(b"0\r\n\r\n");
+    }
+    out
+}
+
+/// The `Truncated` / `SizeMismatch` contract. A chunked body with a proper terminator
+/// that is shorter than the expected size is a complete, different version: every byte
+/// must be discarded, so it is `SizeMismatch`, never `Truncated`. The same for a short
+/// unframed body (a close with no length), and for a chunked body longer than expected.
 #[tokio::test]
-async fn unframed_short_whole_file_is_truncated() -> TestResult {
+async fn short_or_long_unverified_bodies_are_size_mismatches() -> TestResult {
     let (server, client, _) = setup().await;
-    server.push(response("200 OK", &[], &[7u8; 10]));
+    let te = [("Transfer-Encoding", "chunked")];
+
+    // v2 of 3000 bytes served for an expected v1 of 4096, chunked with a terminator.
+    server.push(response("200 OK", &te, &chunked(&[2u8; 3000], true)));
     let download = client.download(&drive(), &item(), SIZE, None).await?;
-    let Download::WholeFile { body } = download else {
-        panic!("{download:?}");
-    };
-    let err = body.bytes().await.unwrap_err();
+    assert!(matches!(&download, Download::WholeFile { body } if !body.is_verified()));
+    let (_, err) = fail_after(download).await;
     assert!(
         matches!(
             err.kind(),
-            GraphErrorKind::Truncated {
+            GraphErrorKind::SizeMismatch {
                 expected: SIZE,
-                received: 10
+                reported: Some(3000)
             }
         ),
         "{err}"
     );
+
+    // Chunked, cut off without a terminator: not verified, so still SizeMismatch.
+    server.push(response("200 OK", &te, &chunked(&[2u8; 100], false)));
+    let (_, err) = fail_after(client.download(&drive(), &item(), SIZE, None).await?).await;
+    assert!(
+        matches!(err.kind(), GraphErrorKind::SizeMismatch { .. }),
+        "{err}"
+    );
+
+    // Unframed (no length, connection closed) and short.
+    server.push(response("200 OK", &[], &[7u8; 10]));
+    let (_, err) = fail_after(client.download(&drive(), &item(), SIZE, None).await?).await;
+    assert!(
+        matches!(
+            err.kind(),
+            GraphErrorKind::SizeMismatch {
+                expected: SIZE,
+                reported: Some(10)
+            }
+        ),
+        "{err}"
+    );
+
+    // Chunked and longer than expected.
+    server.push(response("200 OK", &te, &chunked(&[2u8; 5000], true)));
+    let (_, err) = fail_after(client.download(&drive(), &item(), SIZE, None).await?).await;
+    assert!(
+        matches!(
+            err.kind(),
+            GraphErrorKind::SizeMismatch { expected: SIZE, .. }
+        ),
+        "{err}"
+    );
+
+    // A 206 whose chunked body ends cleanly short of its range.
+    server.push(response(
+        "206 Partial Content",
+        &[
+            ("Transfer-Encoding", "chunked"),
+            ("Content-Range", "bytes 0-99/4096"),
+        ],
+        &chunked(&[1u8; 50], true),
+    ));
+    let (_, err) = fail_after(
+        client
+            .download(&drive(), &item(), SIZE, ByteRange::new(0, 100))
+            .await?,
+    )
+    .await;
+    assert!(
+        matches!(
+            err.kind(),
+            GraphErrorKind::SizeMismatch { expected: 100, .. }
+        ),
+        "{err}"
+    );
+
+    // An unframed body of exactly the expected size is fine.
+    server.push(response("200 OK", &[], &[7u8; 10]));
+    assert_eq!(
+        read_all(client.download(&drive(), &item(), 10, None).await?).await?,
+        [7u8; 10]
+    );
+    Ok(())
+}
+
+/// A verified head (matching `Content-Length`, or a matching `Content-Range`) followed
+/// by a connection failure is `Truncated`: the bytes handed out may be kept.
+#[tokio::test]
+async fn verified_head_then_reset_is_truncated() -> TestResult {
+    let (server, client, _) = setup().await;
+    for range in [None, ByteRange::new(0, 4096)] {
+        let mut headers = vec![("Content-Length", "4096")];
+        let status = if range.is_some() {
+            headers.push(("Content-Range", "bytes 0-4095/4096"));
+            "206 Partial Content"
+        } else {
+            "200 OK"
+        };
+        // A clean close after part of a verified body: hyper reports the early end.
+        server.push(response(status, &headers, &[9u8; 100]));
+        let download = client.download(&drive(), &item(), SIZE, range).await?;
+        assert!(support::body_ref(&download).is_verified());
+        let (handed_out, err) = fail_after(download).await;
+        assert!(
+            matches!(
+                err.kind(),
+                GraphErrorKind::Truncated { expected: SIZE, received } if *received == handed_out
+            ),
+            "{range:?}: {err}"
+        );
+    }
+    Ok(())
+}
+
+/// An unframed body of exactly the expected size is accepted; one longer than the
+/// expected size is a size mismatch.
+#[tokio::test]
+async fn unframed_long_whole_file_is_a_mismatch() -> TestResult {
+    let (server, client, _) = setup().await;
     // The same response is fine for a file that really is 10 bytes.
     server.push(response("200 OK", &[], &[7u8; 10]));
     assert_eq!(
@@ -455,10 +582,167 @@ async fn delta_page_with_a_bad_item_still_arrives() -> TestResult {
             {"id":"odd","file":{"hashes":{"quickXorHash":"zz"}}}],"@odata.deltaLink":"d"}"#,
     ));
     let page = client.delta_from_root(&drive()).await?;
-    assert_eq!(page.items.len(), 2);
-    assert_eq!(page.items[1].warnings.len(), 1);
-    assert_eq!(page.problems.len(), 1);
-    assert_eq!(page.problems[0].id.as_str(), "bad");
-    assert_eq!(page.problems[0].index, 1);
+    let order: Vec<_> = page
+        .entries
+        .iter()
+        .map(|e| (e.id().as_str(), matches!(e, DeltaEntry::Item(_))))
+        .collect();
+    assert_eq!(order, [("ok", true), ("bad", false), ("odd", true)]);
+    assert_eq!(page.items().nth(1).unwrap().warnings.len(), 1);
+    let problem = page.problems().next().unwrap();
+    assert_eq!(problem.id.as_str(), "bad");
+    assert!(!problem.deleted);
+    Ok(())
+}
+
+/// Server strings never reach errors verbatim: a field holding a URL with a token-like
+/// query is named, not echoed, and an error code with a newline and a fake log line is
+/// reduced to a short printable form.
+#[tokio::test]
+async fn server_strings_are_not_echoed_into_errors() -> TestResult {
+    let (server, client, _) = setup().await;
+    let secret = "https://h.invalid/x?access_token=SECRETVALUE";
+    server.push(json(
+        "200 OK",
+        &[],
+        &serde_json::json!({"id": "x", "size": secret}).to_string(),
+    ));
+    let err = client.get_item(&drive(), &item()).await.unwrap_err();
+    let text = format!("{err} {err:?}");
+    assert!(text.contains("size"), "{text}");
+    assert!(!text.contains("SECRETVALUE"), "{text}");
+
+    server.push(json(
+        "200 OK",
+        &[],
+        &serde_json::json!({"value": [{"id": "x", "size": secret}], "@odata.deltaLink": "d"})
+            .to_string(),
+    ));
+    let page = client.delta_from_root(&drive()).await?;
+    let problem = page.problems().next().unwrap();
+    assert!(
+        !problem.reason.contains("SECRETVALUE"),
+        "{}",
+        problem.reason
+    );
+
+    let code = "notFound\n2026-11-14T00:00:00Z ERROR mydrive: fake line SECRETVALUE";
+    server.push(json(
+        "404 Not Found",
+        &[],
+        &serde_json::json!({"error": {"code": code}}).to_string(),
+    ));
+    let err = client.get_drive(&drive()).await.unwrap_err();
+    let GraphErrorKind::NotFound { codes } = err.kind() else {
+        panic!("{err}");
+    };
+    let kept = codes.primary().unwrap();
+    assert!(
+        !kept.contains('\n') && kept.len() <= MAX_CODE_LEN,
+        "{kept:?}"
+    );
+    assert!(!err.to_string().contains('\n'));
+    Ok(())
+}
+
+/// A range starting at or past the expected size, or any range of an empty file, is
+/// refused without a request; a 416 naming another size is a size mismatch.
+#[tokio::test]
+async fn range_outside_the_file_is_refused() -> TestResult {
+    let (server, client, _) = setup().await;
+    for (size, start) in [(SIZE, SIZE), (SIZE, SIZE + 1), (0, 0)] {
+        let err = client
+            .download(&drive(), &item(), size, ByteRange::new(start, 10))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.kind(), GraphErrorKind::RangeOutsideFile { start: s, size: z } if *s == start && *z == size),
+            "{err}"
+        );
+    }
+    assert!(server.requests().is_empty());
+
+    server.push(json(
+        "416 Range Not Satisfiable",
+        &[("Content-Range", "bytes */100")],
+        "{}",
+    ));
+    let err = client
+        .download(&drive(), &item(), SIZE, ByteRange::new(200, 10))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            GraphErrorKind::SizeMismatch {
+                expected: SIZE,
+                reported: Some(100)
+            }
+        ),
+        "{err}"
+    );
+    server.push(json(
+        "416 Range Not Satisfiable",
+        &[("Content-Range", "bytes */4096")],
+        "{}",
+    ));
+    let err = client
+        .download(&drive(), &item(), SIZE, ByteRange::new(200, 10))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            GraphErrorKind::UnexpectedStatus { status: 416, .. }
+        ),
+        "{err}"
+    );
+    Ok(())
+}
+
+/// A `Transfer-Encoding` other than `chunked` is refused.
+#[tokio::test]
+async fn non_chunked_transfer_encoding_is_refused() -> TestResult {
+    let (server, client, _) = setup().await;
+    server.push(response(
+        "200 OK",
+        &[("Transfer-Encoding", "gzip, chunked")],
+        b"0\r\n\r\n",
+    ));
+    let err = client
+        .download(&drive(), &item(), 0, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            GraphErrorKind::UnsupportedTransferEncoding { .. }
+        ),
+        "{err}"
+    );
+    Ok(())
+}
+
+/// A `Retry-After` beyond one day is capped, with the raw value kept.
+#[tokio::test]
+async fn huge_retry_after_is_capped() -> TestResult {
+    let (server, client, _) = setup().await;
+    server.push(json(
+        "429 Too Many Requests",
+        &[("Retry-After", "999999999999999999999")],
+        "{}",
+    ));
+    let err = client.get_drive(&drive()).await.unwrap_err();
+    match err.kind() {
+        GraphErrorKind::Throttled {
+            retry_after: Some(d),
+            retry_after_raw: Some(raw),
+            ..
+        } => {
+            assert_eq!(*d, MAX_RETRY_AFTER);
+            assert_eq!(raw, "999999999999999999999");
+        }
+        other => panic!("{other}"),
+    }
     Ok(())
 }

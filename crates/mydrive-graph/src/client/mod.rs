@@ -43,7 +43,9 @@ use crate::auth::{AccessToken, TokenProvider};
 use crate::model::{DeltaLink, DeltaPage, Drive, DriveItem};
 
 pub use download::{Body, ByteRange, Download};
-pub use error::{ErrorCodes, GraphError, GraphErrorKind, Operation, Resync};
+pub use error::{
+    ErrorCodes, GraphError, GraphErrorKind, MAX_CODE_LEN, MAX_CODES, Operation, Resync,
+};
 
 /// Microsoft Graph v1.0, the production base URL.
 pub const GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
@@ -73,6 +75,10 @@ pub const MAX_REDIRECTS: usize = 5;
 
 /// The most error-body bytes read to find the Graph error code.
 const MAX_ERROR_BODY: usize = 64 * 1024;
+
+/// The longest `Retry-After` reported: one day. Larger values are capped to it, and the
+/// raw value is kept beside.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The longest raw `Retry-After` value kept.
 const MAX_RETRY_AFTER_RAW: usize = 128;
@@ -318,21 +324,33 @@ fn same_origin(a: &Url, b: &Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
-/// `Retry-After`: as delta-seconds when it is that form, and otherwise the raw value (for
-/// example an HTTP-date, which needs the wall clock to interpret), cut to printable ASCII.
-/// `None` for both if the header is absent.
+/// `Retry-After`: as delta-seconds when it is that form, capped at [`MAX_RETRY_AFTER`] so
+/// a scheduler adding it to an instant cannot overflow. The raw value (cut to printable
+/// ASCII) is kept when it is not delta-seconds (for example an HTTP-date, which needs the
+/// wall clock to interpret) or was capped. `None` if the header is absent.
 fn retry_after(headers: &HeaderMap) -> Option<(Option<Duration>, Option<String>)> {
     let value = headers.get(header::RETRY_AFTER)?;
     let text = String::from_utf8_lossy(value.as_bytes());
-    if let Ok(secs) = text.trim().parse::<u64>() {
-        return Some((Some(Duration::from_secs(secs)), None));
+    let raw = || {
+        let kept: String = text
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .take(MAX_RETRY_AFTER_RAW)
+            .collect();
+        Some(kept.trim().to_owned())
+    };
+    let trimmed = text.trim();
+    if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let max = MAX_RETRY_AFTER.as_secs();
+        // Digits too many for a u64 are certainly past the cap.
+        let secs = trimmed.parse::<u64>().unwrap_or(u64::MAX);
+        return Some(if secs > max {
+            (Some(MAX_RETRY_AFTER), raw())
+        } else {
+            (Some(Duration::from_secs(secs)), None)
+        });
     }
-    let raw: String = text
-        .chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .take(MAX_RETRY_AFTER_RAW)
-        .collect();
-    Some((None, Some(raw.trim().to_owned())))
+    Some((None, raw()))
 }
 
 /// Collects `error.code` and every nested `innerError.code` (Graph uses both spellings
@@ -513,7 +531,7 @@ impl GraphClient {
     ///
     /// Any [`GraphErrorKind`] except the download ones; [`GraphErrorKind::ResyncRequired`]
     /// on `410 Gone`. A single unusable item does not fail the page: see
-    /// [`DeltaPage::problems`].
+    /// [`DeltaEntry::Problem`](crate::model::DeltaEntry::Problem).
     pub async fn delta_from_root(&self, drive: &DriveId) -> Result<DeltaPage, GraphError> {
         let url = self.endpoint(&["drives", drive.as_str(), "root", "delta"]);
         self.delta_at(drive, &url).await
@@ -548,8 +566,8 @@ impl GraphClient {
         let page = DeltaPage::from_json(&body).map_err(|e| GraphError::new(op, e.into()))?;
         tracing::debug!(
             %drive,
-            items = page.items.len(),
-            problems = page.problems.len(),
+            entries = page.entries.len(),
+            problems = page.problems().count(),
             "delta page received"
         );
         Ok(page)
@@ -570,7 +588,9 @@ impl GraphClient {
     /// Any [`GraphErrorKind`] except the resync one; in particular
     /// [`GraphErrorKind::SizeMismatch`] if the response's size disagrees with
     /// `expected_size` (the file may have changed: refetch its metadata),
-    /// [`GraphErrorKind::UnsupportedEncoding`] for a content-encoded response, and
+    /// [`GraphErrorKind::UnsupportedEncoding`] for a content-encoded response,
+    /// [`GraphErrorKind::RangeOutsideFile`] without a request for a range starting at or
+    /// past `expected_size` (any range of an empty file), and
     /// [`GraphErrorKind::Malformed`] for a `206` that does not match the request.
     pub async fn download(
         &self,
@@ -583,8 +603,19 @@ impl GraphClient {
             drive: drive.clone(),
             item: item.clone(),
         };
+        if let Some(range) = range
+            && range.start() >= expected_size
+        {
+            return Err(GraphError::new(
+                op,
+                GraphErrorKind::RangeOutsideFile {
+                    start: range.start(),
+                    size: expected_size,
+                },
+            ));
+        }
         let url = self.endpoint(&["drives", drive.as_str(), "items", item.as_str(), "content"]);
-        match self.download_at(&op, url, range).await {
+        match self.download_at(&op, url, range, expected_size).await {
             Ok(response) => Download::new(op, response, range, expected_size),
             Err(kind) => Err(GraphError::new(op, kind)),
         }
@@ -595,6 +626,7 @@ impl GraphClient {
         op: &Operation,
         url: Url,
         range: Option<ByteRange>,
+        expected_size: u64,
     ) -> Result<Response, GraphErrorKind> {
         let mut call = Call::default();
         let mut current = url;
@@ -615,6 +647,15 @@ impl GraphClient {
                     StatusCode::OK | StatusCode::PARTIAL_CONTENT
                 ) {
                     Ok(response)
+                } else if response.status() == StatusCode::RANGE_NOT_SATISFIABLE
+                    && let Some(size) = download::unsatisfied_range_size(response.headers())
+                    && size != expected_size
+                {
+                    // The server's file is another size than the one the caller knows.
+                    Err(GraphErrorKind::SizeMismatch {
+                        expected: expected_size,
+                        reported: Some(size),
+                    })
                 } else {
                     Err(self.status_error(op, response, host).await)
                 };
@@ -862,5 +903,53 @@ mod tests {
             retry_after(&headers),
             Some((None, Some("Wed, 21 Oct 2015 07:28:00 GMT".to_owned())))
         );
+    }
+
+    /// `Retry-After` is capped at one day, keeping the raw value, so adding it to an
+    /// instant cannot overflow.
+    #[test]
+    fn retry_after_is_capped_at_one_day() {
+        let mut headers = HeaderMap::new();
+        for big in [
+            "86401",
+            "18446744073709551615",
+            "99999999999999999999999999",
+        ] {
+            headers.insert(header::RETRY_AFTER, big.parse().unwrap());
+            assert_eq!(
+                retry_after(&headers),
+                Some((Some(MAX_RETRY_AFTER), Some(big.to_owned()))),
+                "{big}"
+            );
+        }
+        headers.insert(header::RETRY_AFTER, "86400".parse().unwrap());
+        assert_eq!(retry_after(&headers), Some((Some(MAX_RETRY_AFTER), None)));
+        assert!(
+            std::time::Instant::now()
+                .checked_add(MAX_RETRY_AFTER)
+                .is_some()
+        );
+    }
+
+    /// Error codes are server strings that get logged: kept short and printable.
+    #[test]
+    fn error_codes_are_short_and_printable() {
+        let long = "x".repeat(500);
+        let body = serde_json::json!({"error": {
+            "code": "bad\ncode\r\n2026-01-01 ERROR fake log line\u{1b}[31m",
+            "innerError": {"code": long, "innerError": {"code": "\n\t"}}
+        }});
+        let codes = error_codes(body.to_string().as_bytes());
+        assert_eq!(codes.all().len(), 2, "{codes:?}");
+        for code in codes.all() {
+            assert!(code.len() <= MAX_CODE_LEN, "{code}");
+            assert!(code.chars().all(|c| c.is_ascii_graphic()), "{code:?}");
+        }
+        let deep = (0..20).fold(
+            serde_json::json!({"code": "leaf"}),
+            |inner, n| serde_json::json!({"code": format!("c{n}"), "innerError": inner}),
+        );
+        let codes = error_codes(serde_json::json!({ "error": deep }).to_string().as_bytes());
+        assert_eq!(codes.all().len(), MAX_CODES);
     }
 }

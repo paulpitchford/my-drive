@@ -8,6 +8,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "client_raw_server.rs"]
+mod raw;
 #[path = "client_support.rs"]
 mod support;
 
@@ -131,6 +133,41 @@ async fn scenario(sim: &GraphSim) -> Result<String, Box<dyn std::error::Error + 
         .await
         .unwrap_err();
     let _ = writeln!(seen, "{err:?} {err}");
+
+    // A transport error at the pre-authenticated download host: a redirect to a port
+    // nothing listens on.
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.local_addr()?.port()
+    };
+    let server = raw::RawServer::start().await;
+    let preauth = format!("http://127.0.0.1:{closed}/download?tempauth=RAWSECRETKEY");
+    server.push(raw::response(
+        "302 Found",
+        &[("Location", preauth.as_str()), ("Content-Length", "0")],
+        b"",
+    ));
+    let raw_client = mydrive_graph::GraphClient::new(
+        &server.base_url(),
+        FakeTokens::new(STALE),
+        support::test_user_agent(),
+    )?;
+    let err = raw_client
+        .download(&redirect, &r_file, 4096, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.kind(), mydrive_graph::GraphErrorKind::Transport(_)),
+        "{err}"
+    );
+    let _ = writeln!(seen, "{err:?} {err}");
+    let _ = writeln!(seen, "{raw_client:?}");
+    // The connect error names the socket address it tried, never the URL or its query.
+    let shown = format!("{err:?} {err}");
+    assert!(
+        !shown.contains("RAWSECRETKEY") && !shown.contains("/download"),
+        "{shown}"
+    );
     Ok(seen)
 }
 
@@ -171,6 +208,7 @@ fn ac7_no_token_or_preauthenticated_url_in_logs_or_debug() -> TestResult {
             STALE,
             "another-stale-secret",
             "tempauth",
+            "RAWSECRETKEY",
             download_origin.as_str(),
             "Bearer",
         ] {
