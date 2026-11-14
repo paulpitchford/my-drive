@@ -44,6 +44,11 @@ From `docs/architecture/overview.md`. A gate is an experiment, not a code delive
 | G4 Per-file status in Files | Issue on omacom/folio | Owner approves the wording before it is posted | open |
 | G5 Device-code sign-in for personal accounts | WP-011 | App registration; owner signs in | open |
 
+## Milestone M1: Engine (draft plan)
+
+A draft plan with the lead's rulings is in [drafts/M1-plan.md](drafts/M1-plan.md). It is not yet
+a set of work packages, and M1 needs the owner's go-ahead.
+
 ## Later milestones (outline, not yet specified)
 
 These become WPs when the milestone before them is nearly done, so they can use what was
