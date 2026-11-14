@@ -1,6 +1,6 @@
 # WP-011: Gate experiments G1 and G5
 
-- **Status:** blocked on wave 3 and on the owner (app registration)
+- **Status:** blocked on the owner (app registration)
 - **Milestone:** M0
 - **Wave:** 4
 - **Depends on:** WP-008, WP-009

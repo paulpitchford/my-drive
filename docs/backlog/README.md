@@ -24,12 +24,12 @@ answered. No daemon yet.
 | [WP-007](WP-007-graph-simulator-core.md) | Graph simulator core | 2 | WP-001, WP-004 | done (#13) |
 | [WP-009](WP-009-graph-auth.md) | Sign-in and token storage | 2 | — | done (#16) |
 | [WP-012](WP-012-architecture-conformance-checks.md) | Architecture conformance checks | 2 | WP-010 | done (#9) |
-| [WP-008](WP-008-graph-client-foundations.md) | Graph client foundations | 3 | WP-001, WP-007, WP-009 | ready |
-| [WP-013](WP-013-wave-2-test-follow-ups.md) | Wave 2 test follow-ups | 3 | WP-005, WP-006, WP-009 | ready |
-| [WP-011](WP-011-gate-experiments-g1-g5.md) | Gate experiments G1 and G5 | 4 | WP-008, WP-009 | blocked on wave 3 and on the owner (app registration) |
+| [WP-008](WP-008-graph-client-foundations.md) | Graph client foundations | 3 | WP-001, WP-007, WP-009 | done (#23) |
+| [WP-013](WP-013-wave-2-test-follow-ups.md) | Wave 2 test follow-ups | 3 | WP-005, WP-006, WP-009 | done (#20, #21, #22) |
+| [WP-011](WP-011-gate-experiments-g1-g5.md) | Gate experiments G1 and G5 | 4 | WP-008, WP-009 | blocked on the owner (app registration) |
 
-Waves 1 and 2 are merged. What they taught is in `docs/process/orchestration.md`
-("Lessons from wave 1", "Lessons from wave 2"). Wave 3 needs the owner's go-ahead.
+Waves 1 to 3 are merged. What they taught is in `docs/process/orchestration.md`. Wave 4
+(WP-011) needs the owner to register the Microsoft app. Milestone M1 is next to be specified.
 
 ## Validation gates
 
