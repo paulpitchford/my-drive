@@ -49,14 +49,57 @@ impl<'de> Deserialize<'de> for JsonRpcVersion {
     }
 }
 
-/// A request ID: an integer or a string, chosen by the client and echoed in the response.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The longest string request ID accepted, in UTF-8 bytes. IDs are bounded so that every
+/// response that echoes one stays within the line limit (ADR-0020 R4).
+pub const MAX_ID_BYTES: usize = 128;
+
+/// A request ID: an integer in `i64` range, or a string of at most [`MAX_ID_BYTES`] bytes,
+/// chosen by the client and echoed in the response. Anything else is refused with
+/// `invalid-request`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(untagged)]
 pub enum Id {
     /// An integer ID.
     Number(i64),
     /// A string ID.
     String(String),
+}
+
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct IdVisitor;
+
+        impl Visitor<'_> for IdVisitor {
+            type Value = Id;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "an integer in i64 range or a string of at most {MAX_ID_BYTES} bytes"
+                )
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Id, E> {
+                Ok(Id::Number(v))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Id, E> {
+                i64::try_from(v)
+                    .map(Id::Number)
+                    .map_err(|_| E::invalid_value(de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Id, E> {
+                if v.len() <= MAX_ID_BYTES {
+                    Ok(Id::String(v.to_owned()))
+                } else {
+                    Err(E::invalid_length(v.len(), &self))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(IdVisitor)
+    }
 }
 
 impl fmt::Display for Id {
@@ -265,8 +308,9 @@ impl Message {
             Some(Value::String(v)) if v == JSONRPC_VERSION => {}
             _ => return Err(fail("\"jsonrpc\" must be \"2.0\"".into())),
         }
+        // A null `params` is treated as absent, like every other optional field.
         if let Some(params) = object.get("params")
-            && !matches!(params, Value::Object(_) | Value::Array(_))
+            && !matches!(params, Value::Object(_) | Value::Array(_) | Value::Null)
         {
             return Err(fail("\"params\" must be an object or an array".into()));
         }
@@ -274,7 +318,10 @@ impl Message {
         let message = if has("method") {
             if has("id") {
                 if id.is_none() {
-                    return Err(fail("\"id\" must be an integer or a string".into()));
+                    return Err(fail(format!(
+                        "\"id\" must be an integer in i64 range or a string of at most \
+                         {MAX_ID_BYTES} bytes"
+                    )));
                 }
                 decode(object, &fail).map(Self::Request)?
             } else {
@@ -356,6 +403,41 @@ mod tests {
         }
         let err = parse(json!({"jsonrpc":"1.0","id":9,"method":"hello"})).unwrap_err();
         assert_eq!(err.id, Some(Id::Number(9)));
+    }
+
+    /// ADR-0020 R4: request IDs are bounded, so no response echoing one can exceed the line.
+    #[test]
+    fn ids_are_bounded() {
+        let longest = "é".repeat(MAX_ID_BYTES / 2);
+        for ok in [json!(i64::MIN), json!(i64::MAX), json!(longest), json!("")] {
+            let msg = json!({"jsonrpc":"2.0","id":ok,"method":"daemon.status"});
+            assert!(parse(msg).is_ok(), "{ok}");
+        }
+        for bad in [
+            json!(u64::MAX),
+            json!(1e3),
+            json!("x".repeat(MAX_ID_BYTES + 1)),
+            json!([1]),
+            json!({"a": 1}),
+            json!(true),
+        ] {
+            let msg = json!({"jsonrpc":"2.0","id":bad,"method":"daemon.status"});
+            let err = parse(msg).unwrap_err();
+            assert_eq!(err.id, None, "{bad}");
+            assert_eq!(
+                err.to_response().error.kind(),
+                Some(ErrorCode::InvalidRequest)
+            );
+            let resp = json!({"jsonrpc":"2.0","id":bad,"result":{}});
+            assert!(parse(resp).is_err(), "response with id {bad}");
+        }
+        // A null `params` is treated as absent.
+        let Message::Request(req) =
+            parse(json!({"jsonrpc":"2.0","id":1,"method":"mount.list","params":null})).unwrap()
+        else {
+            panic!("not a request");
+        };
+        assert_eq!(req.params, None);
     }
 
     #[test]

@@ -10,11 +10,13 @@ use mydrive_ipc::envelope::{ErrorResponse, Message, Notification, Request, Succe
 use mydrive_ipc::error::{ErrorCode, RpcError};
 use mydrive_ipc::methods::{
     AccountInfo, AccountListResult, DaemonStatusResult, HelloParams, HelloResult, ItemActionResult,
-    ItemInfo, ItemPathsParams, ItemStatusParams, ItemStatusResult, MethodCall, MountInfo,
-    MountListResult, NoParams, StatusChangedParams, StatusSubscribeParams, StatusSubscribeResult,
-    method,
+    ItemInfo, ItemPathsParams, ItemStatusParams, ItemStatusResult, ListParams, MethodCall,
+    MountInfo, MountListResult, NoParams, StatusChangedParams, StatusSubscribeParams,
+    StatusSubscribeResult, method,
 };
-use mydrive_ipc::values::{BlockedReason, ReadOnlyReason, RefusalReason, VALUE_SETS};
+use mydrive_ipc::values::{
+    BlockedReason, InvalidParamsReason, ReadOnlyReason, RefusalReason, VALUE_SETS,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -141,9 +143,8 @@ fn params_round_trip(method_name: &str, params: Option<&Value>, what: &str) -> O
     let params = params?;
     Some(match method_name {
         method::HELLO => round_trip::<HelloParams>(params, what),
-        method::DAEMON_STATUS | method::ACCOUNT_LIST | method::MOUNT_LIST => {
-            round_trip::<NoParams>(params, what)
-        }
+        method::DAEMON_STATUS => round_trip::<NoParams>(params, what),
+        method::ACCOUNT_LIST | method::MOUNT_LIST => round_trip::<ListParams>(params, what),
         method::ITEM_STATUS => round_trip::<ItemStatusParams>(params, what),
         method::ITEM_PIN | method::ITEM_UNPIN | method::ITEM_HYDRATE | method::ITEM_DEHYDRATE => {
             round_trip::<ItemPathsParams>(params, what)
@@ -265,6 +266,14 @@ fn check_reason_codes(error: &RpcError, what: &str) {
         Some(ErrorCode::ReadOnly) => {
             assert!(known(error.reason_code(), ReadOnlyReason::KNOWN), "{what}");
         }
+        Some(ErrorCode::InvalidParams) => {
+            if let Some(reason) = error.reason_code() {
+                assert!(
+                    InvalidParamsReason::KNOWN.contains(&reason.as_str()),
+                    "{what}"
+                );
+            }
+        }
         _ => {}
     }
 }
@@ -307,6 +316,8 @@ fn every_catalogue_example_round_trips() {
     let mut answered = BTreeSet::new();
     let mut notified = BTreeSet::new();
     let mut codes = BTreeSet::new();
+    let mut top_level = BTreeSet::new();
+    let mut per_path = BTreeSet::new();
     let mut items = 0;
     let mut expected_error: Option<(usize, Request, RpcError)> = None;
 
@@ -320,7 +331,18 @@ fn every_catalogue_example_round_trips() {
             example.value,
             "{what}"
         );
-        inspect(&example.value, &mut codes, &mut items, &what);
+        // Error objects at the top of an error response are top-level; every other error
+        // object in an example (in an entry, an action result or a skipped item) is per path.
+        if let Message::Error(resp) = &message {
+            top_level.insert(resp.error.code);
+            codes.insert(resp.error.code);
+            check_reason_codes(&resp.error, &what);
+        } else {
+            let mut nested = BTreeSet::new();
+            inspect(&example.value, &mut nested, &mut items, &what);
+            codes.extend(&nested);
+            per_path.extend(nested);
+        }
 
         let mut words = example.label.split_whitespace();
         match (words.next(), words.next(), message) {
@@ -393,6 +415,49 @@ fn every_catalogue_example_round_trips() {
     let all_codes: BTreeSet<i64> = ErrorCode::ALL.iter().map(|c| c.code()).collect();
     assert_eq!(codes, all_codes, "every error code has an example");
     assert!(items >= 8, "only {items} item states in the examples");
+
+    // Each code appears only where the error table's "Where" column says it can.
+    let places = error_table_places(&catalogue_text());
+    for code in &top_level {
+        let place = places.get(code).map(String::as_str);
+        assert!(
+            matches!(place, Some("top level" | "both")),
+            "code {code} appears at the top level, but the table says {place:?}"
+        );
+    }
+    for code in &per_path {
+        let place = places.get(code).map(String::as_str);
+        assert!(
+            matches!(place, Some("per path" | "both")),
+            "code {code} appears per path, but the table says {place:?}"
+        );
+    }
+}
+
+/// The error table's "Where" column, by code.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn error_table_places(text: &str) -> std::collections::BTreeMap<i64, String> {
+    text.lines()
+        .filter_map(|l| {
+            let cells: Vec<&str> = l.split('|').map(str::trim).collect();
+            let code = cells.get(1)?.parse::<i64>().ok()?;
+            Some((code, (*cells.get(5)?).to_owned()))
+        })
+        .collect()
+}
+
+/// Every error code says where it can appear.
+#[test]
+fn error_table_says_where_each_code_appears() {
+    let places = error_table_places(&catalogue_text());
+    for code in ErrorCode::ALL {
+        let place = places.get(&code.code()).map(String::as_str);
+        assert!(
+            matches!(place, Some("top level" | "per path" | "both")),
+            "{}: Where is {place:?}",
+            code.name()
+        );
+    }
 }
 
 /// ADR-0009 R5, WP-005 AC5: unknown fields are ignored by every wire type. Each example is
@@ -549,13 +614,18 @@ fn accepts_unknown(field: &str) -> bool {
             error_with(ErrorCode::ReadOnly, reason).read_only_reason()
                 == Some(ReadOnlyReason::Other(UNKNOWN.into()))
         }
+        "invalid-params.data.reason" => {
+            error_with(ErrorCode::InvalidParams, reason).invalid_params_reason()
+                == Some(InvalidParamsReason::Other(UNKNOWN.into()))
+        }
         "refused.data.sync" => error_with(ErrorCode::Refused, json!({"sync": UNKNOWN}))
             .sync()
             .is_some_and(|s| s.as_str() == UNKNOWN),
         "hello.capabilities" => probe::<HelloResult>(
             json!({"protocol_version": 1, "capabilities": [],
                    "limits": {"max_line_bytes": 1, "max_action_paths": 1,
-                              "max_action_path_bytes": 1}}),
+                              "max_action_path_bytes": 1, "max_status_paths": 1,
+                              "max_status_path_bytes": 1}}),
             "capabilities",
             json!([UNKNOWN]),
         ),

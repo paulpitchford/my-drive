@@ -202,6 +202,17 @@ open_enum! {
     }
 }
 
+open_enum! {
+    /// What a client should do about an `invalid-params` error, when it can act on it. Open
+    /// set.
+    pub enum InvalidParamsReason, kind = "invalid-params reason" {
+        /// The cursor was not issued for these parameters, or is in a form or version this
+        /// daemon does not issue: start the listing again from the first page, without a
+        /// cursor.
+        RestartListing => "restart-listing",
+    }
+}
+
 /// Implements conversion between a closed `mydrive-core` axis and its open wire type.
 macro_rules! wire_axis {
     ($wire:ident, $core:ty) => {
@@ -417,6 +428,12 @@ pub const VALUE_SETS: &[ValueSet] = &[
         known: Some(ReadOnlyReason::KNOWN),
     },
     ValueSet {
+        fields: &["invalid-params.data.reason"],
+        type_name: "InvalidParamsReason",
+        open: true,
+        known: Some(InvalidParamsReason::KNOWN),
+    },
+    ValueSet {
         fields: &["error.code"],
         type_name: "i64",
         open: true,
@@ -477,6 +494,7 @@ mod tests {
         open_round_trip::<ItemReason>();
         open_round_trip::<Modifier>();
         open_round_trip::<ReadOnlyReason>();
+        open_round_trip::<InvalidParamsReason>();
         open_round_trip::<WireHydration>();
         open_round_trip::<WirePin>();
         open_round_trip::<WireEffectivePin>();

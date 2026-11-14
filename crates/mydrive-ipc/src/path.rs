@@ -33,6 +33,10 @@ pub enum PathProblem {
     /// The path is longer than [`MAX_PATH_BYTES`], the Linux `PATH_MAX`.
     #[error("it is longer than {MAX_PATH_BYTES} bytes")]
     TooLong,
+    /// The path has an empty component (`//`) or a trailing slash, so two spellings would
+    /// name one item.
+    #[error("it is not canonical: it has an empty component or a trailing slash")]
+    NotCanonical,
 }
 
 /// The longest protocol path, in bytes: Linux `PATH_MAX`. Bounding paths is what lets every
@@ -52,8 +56,9 @@ pub struct PathError {
 /// An absolute path as carried by the protocol.
 ///
 /// Built only through [`ProtocolPath::new`], which `serde` also uses, so a relative path can
-/// never be deserialised into one (WP-005 AC6). It is kept exactly as given: no
-/// normalisation, no case folding, no trailing-slash handling.
+/// never be deserialised into one (WP-005 AC6). Only canonical spellings are accepted (no
+/// `.`, `..`, empty component or trailing slash), so each item has one protocol path; it is
+/// kept exactly as given, with no case folding.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProtocolPath(String);
 
@@ -95,6 +100,10 @@ fn problem(path: &str) -> Option<PathProblem> {
     if path.split('/').any(|part| part == "." || part == "..") {
         return Some(PathProblem::DotComponent);
     }
+    // Canonical form: no empty component ("//") and no trailing slash, except "/" itself.
+    if path != "/" && path[1..].split('/').any(str::is_empty) {
+        return Some(PathProblem::NotCanonical);
+    }
     None
 }
 
@@ -133,9 +142,21 @@ mod tests {
             "/",
             "/home/u/OneDrive",
             "/home/u/OneDrive - Org/a b/ü.txt",
-            "/a//b/",
+            "/a/b",
         ] {
             assert!(ProtocolPath::new(ok).is_ok(), "{ok}");
+        }
+    }
+
+    /// Paths are canonical: an empty component or a trailing slash is rejected.
+    #[test]
+    fn rejects_non_canonical_paths() {
+        for bad in ["/a//b", "//a", "/a/", "/home/u/OneDrive/", "//"] {
+            assert_eq!(
+                ProtocolPath::new(bad).unwrap_err().problem,
+                PathProblem::NotCanonical,
+                "{bad}"
+            );
         }
     }
 

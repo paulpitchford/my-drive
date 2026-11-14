@@ -1,18 +1,24 @@
-//! Bounded results: pages of `item.status`, action results and change notifications that
-//! each fit one line (ADR-0020).
+//! Bounded results: pages of `item.status`, `mount.list` and `account.list`, and action
+//! results and change notifications that each fit one line (ADR-0020).
 //!
 //! # Cursors
 //!
 //! Cursors are keyset cursors (ADR-0020 R1 to R3). A directory cursor names the last child
-//! returned; the next page starts at the first child whose name sorts after it, by bytes. A
-//! batch cursor names a position in the request's list of paths. Either kind also carries a
-//! binding: a hash of the directory, or of the whole batch, so a cursor used with other
-//! parameters is refused with `invalid-params`. Cursors hold no daemon state and never go
-//! stale. To clients they are opaque, non-empty strings; this module accepts only cursors in
-//! the exact form it issues.
+//! returned; the next page starts at the first child whose name sorts after it, by bytes.
+//! Mount and account cursors work the same way over `mount_id` and `account_id`. A batch
+//! cursor names a position in the request's list of paths. Directory and batch cursors also
+//! carry a binding: a hash of the directory path, or of the whole batch, so a cursor used
+//! with other parameters is refused with `invalid-params`. Cursors hold no daemon state and
+//! never go stale. To clients they are opaque, non-empty strings; this module accepts only
+//! cursors in the exact form and version it issues, and refuses anything else with
+//! `invalid-params` and reason `restart-listing`.
 //!
-//! The directory pager reads children through [`DirectorySource`], which the daemon backs
-//! with a store query ("children of this folder with name > X, ordered by name").
+//! The longest cursors: a directory cursor is 36 + 2 × (name bytes) bytes, so at most 546
+//! for a 255-byte name; a batch cursor at most 56 bytes; a mount cursor at most 131 bytes;
+//! an account cursor 3 + 2 × (account ID bytes).
+//!
+//! The pagers read through [`KeysetSource`], which the daemon backs with store queries
+//! ("children of this folder with name > X, ordered by name").
 
 use std::collections::VecDeque;
 
@@ -23,34 +29,33 @@ use crate::codec::MAX_LINE_BYTES;
 use crate::envelope::{Id, Notification, SuccessResponse};
 use crate::error::{ErrorCode, RpcError, truncate_to};
 use crate::methods::{
-    ActionOutcome, ItemActionEntry, ItemActionResult, ItemStatusEntry, ItemStatusResult,
-    SkippedItem, StatusChangedParams, method,
+    AccountInfo, AccountListResult, ActionOutcome, ItemActionEntry, ItemActionResult,
+    ItemStatusEntry, ItemStatusResult, MountInfo, MountListResult, SkippedItem,
+    StatusChangedParams, method,
 };
 use crate::path::ProtocolPath;
 
-/// How many children the directory pager asks its source for at a time.
+/// How many rows the pagers ask a source for at a time.
 const CHUNK: usize = 256;
 
 /// Bytes `,"next_cursor":""` adds to a result around the cursor text itself.
 const CURSOR_FIELD_BYTES: usize = r#","next_cursor":"""#.len();
 
-/// Reads a directory's children in name order, for the directory pager.
+/// Reads rows in ascending byte order of their key, for the keyset pagers.
 ///
-/// The daemon implements this over the state store's (parent, name) index; tests implement
-/// it over a sorted map.
-pub trait DirectorySource {
-    /// Up to `limit` children whose names sort strictly after `after` (every child when
-    /// `after` is `None`), in ascending byte order of name. Each entry's path is the
-    /// directory's path joined with the child's name.
+/// The key is a directory child's name, a mount's `mount_id` or an account's `account_id`.
+/// The daemon implements this over the state store's indexes; tests implement it over a
+/// sorted map.
+pub trait KeysetSource<T> {
+    /// Up to `limit` rows whose keys sort strictly after `after` (every row when `after` is
+    /// `None`), in ascending byte order of key. Returning fewer than `limit` rows does not
+    /// mean the end: the pager asks again, and only an empty batch ends the listing. For a
+    /// directory, each entry's path is the directory's path joined with the child's name.
     ///
     /// # Errors
     ///
-    /// Any error reading the children; it is returned to the client as is.
-    fn children_after(
-        &mut self,
-        after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<ItemStatusEntry>, RpcError>;
+    /// Any error reading the rows; it is returned to the client as is.
+    fn rows_after(&mut self, after: Option<&str>, limit: usize) -> Result<Vec<T>, RpcError>;
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -62,7 +67,8 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn from_hex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2)
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
         || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     {
         return None;
@@ -93,9 +99,44 @@ fn batch_binding(paths: &[ProtocolPath]) -> String {
     binding("paths", &parts)
 }
 
-/// A directory cursor; `bound` is [`directory_binding`] of the directory.
-fn directory_cursor(bound: &str, name: &str) -> String {
-    format!("d1.{bound}.{}", to_hex(name.as_bytes()))
+/// One kind of keyset cursor: `<prefix><hex of the key>`, where the prefix names the kind,
+/// the version and, for directories, the binding.
+struct KeyCursor {
+    prefix: String,
+}
+
+impl KeyCursor {
+    fn directory(directory: &ProtocolPath) -> Self {
+        Self {
+            prefix: format!("d1.{}.", directory_binding(directory)),
+        }
+    }
+
+    fn mounts() -> Self {
+        Self {
+            prefix: "m1.".to_owned(),
+        }
+    }
+
+    fn accounts() -> Self {
+        Self {
+            prefix: "a1.".to_owned(),
+        }
+    }
+
+    fn encode(&self, key: &str) -> String {
+        format!("{}{}", self.prefix, to_hex(key.as_bytes()))
+    }
+
+    /// The key a cursor names, accepting only the exact form [`KeyCursor::encode`] issues.
+    fn decode(&self, method: &str, cursor: &str) -> Result<String, RpcError> {
+        cursor
+            .strip_prefix(self.prefix.as_str())
+            .and_then(from_hex)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .filter(|key| self.encode(key) == cursor)
+            .ok_or_else(|| foreign_cursor(method, cursor))
+    }
 }
 
 /// A batch cursor; `bound` is [`batch_binding`] of the batch.
@@ -103,30 +144,15 @@ fn batch_cursor(bound: &str, index: usize) -> String {
     format!("p1.{bound}.{index}")
 }
 
-fn foreign_cursor(cursor: &str) -> RpcError {
-    RpcError::invalid_params(
-        method::ITEM_STATUS,
+fn foreign_cursor(method: &str, cursor: &str) -> RpcError {
+    RpcError::restart_listing(
+        method,
         format!(
-            "cursor {cursor:?} was not issued for these parameters; repeat the call with the \
-             same parameters and the cursor from its result, or start again without a cursor"
+            "cursor {:?} was not issued for these parameters, or by this version; start \
+             the listing again from the first page",
+            truncate_to(cursor, 64)
         ),
     )
-}
-
-/// The name after which a directory page starts, from a cursor issued for `directory`.
-fn decode_directory_cursor(bound: &str, cursor: &str) -> Result<String, RpcError> {
-    let decoded = cursor
-        .strip_prefix("d1.")
-        .and_then(|rest| rest.split_once('.'))
-        .filter(|(b, _)| *b == bound)
-        .and_then(|(_, hex)| from_hex(hex))
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .filter(|name| valid_name(name));
-    match decoded {
-        // Only the exact form this module issues is accepted.
-        Some(name) if directory_cursor(bound, &name) == cursor => Ok(name),
-        _ => Err(foreign_cursor(cursor)),
-    }
 }
 
 /// The batch index a page starts at, from a cursor issued for a batch of `len` paths.
@@ -140,7 +166,7 @@ fn decode_batch_cursor(bound: &str, len: usize, cursor: &str) -> Result<usize, R
         .filter(|&i| i >= 1 && i < len);
     match decoded {
         Some(index) if batch_cursor(bound, index) == cursor => Ok(index),
-        _ => Err(foreign_cursor(cursor)),
+        _ => Err(foreign_cursor(method::ITEM_STATUS, cursor)),
     }
 }
 
@@ -149,10 +175,10 @@ fn valid_name(name: &str) -> bool {
 }
 
 /// The child's name, checking that `entry` is a direct child of `directory`.
-fn child_name<'a>(directory: &ProtocolPath, entry: &'a ItemStatusEntry) -> Option<&'a str> {
+fn child_name(directory: &ProtocolPath, entry: &ItemStatusEntry) -> Option<String> {
     let dir = directory.as_str().trim_end_matches('/');
     let rest = entry.path.as_str().strip_prefix(dir)?.strip_prefix('/')?;
-    valid_name(rest).then_some(rest)
+    valid_name(rest).then(|| rest.to_owned())
 }
 
 fn internal(context: &str, e: impl std::fmt::Display) -> RpcError {
@@ -171,129 +197,145 @@ fn response_len(id: &Id, result: &impl Serialize) -> Result<usize, RpcError> {
     json_len(&response)
 }
 
-/// Fills one `item.status` page from a stream of entries. Exact byte accounting: `base` is
-/// the encoded response with no entries and no cursor.
-struct PageFill {
+/// Fills one page from a stream of rows. Exact byte accounting: `base` is the encoded
+/// response with no rows and no cursor, and the list is the last field before
+/// `next_cursor`.
+struct PageFill<T> {
     base: usize,
     used: usize,
-    entries: Vec<ItemStatusEntry>,
+    rows: Vec<T>,
 }
 
-impl PageFill {
-    /// Adds `entry` if the page still fits with it, reserving room for the cursor that would
-    /// follow it when more entries may come. Returns false (adding nothing) otherwise.
-    fn try_add(
-        &mut self,
-        entry: &ItemStatusEntry,
-        cursor_if_more: Option<&str>,
-    ) -> Result<bool, RpcError> {
-        let len = json_len(entry)? + usize::from(!self.entries.is_empty());
+impl<T: Serialize> PageFill<T> {
+    fn new(base: usize) -> Self {
+        Self {
+            base,
+            used: 0,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Adds `row` if the page still fits with it, reserving room for the cursor that would
+    /// follow it when more rows may come. Returns false (adding nothing) otherwise.
+    fn try_add(&mut self, row: T, cursor_if_more: Option<&str>) -> Result<Option<T>, RpcError> {
+        let len = json_len(&row)? + usize::from(!self.rows.is_empty());
         let reserve = cursor_if_more.map_or(0, |c| CURSOR_FIELD_BYTES + c.len());
         if self.base + self.used + len + reserve > MAX_LINE_BYTES {
-            return Ok(false);
+            return Ok(Some(row));
         }
         self.used += len;
-        self.entries.push(entry.clone());
-        Ok(true)
+        self.rows.push(row);
+        Ok(None)
     }
 }
 
-fn too_large(entry: &ItemStatusEntry) -> RpcError {
+fn too_large(what: &str) -> RpcError {
     RpcError::new(
         ErrorCode::Internal,
-        format!(
-            "the status entry for {} is too large to send in one {MAX_LINE_BYTES}-byte line",
-            entry.path
-        ),
+        format!("the entry for {what} is too large to send in one {MAX_LINE_BYTES}-byte line"),
     )
 }
 
 /// Encodes the finished page and confirms the line limit (ADR-0020 R4).
-fn checked(id: &Id, page: ItemStatusResult) -> Result<ItemStatusResult, RpcError> {
+fn checked<R: Serialize>(id: &Id, page: R) -> Result<R, RpcError> {
     let total = response_len(id, &page)?;
     if total > MAX_LINE_BYTES {
         return Err(RpcError::new(
             ErrorCode::Internal,
-            format!("item.status page is {total} bytes, over the {MAX_LINE_BYTES}-byte limit"),
+            format!("a result page is {total} bytes, over the {MAX_LINE_BYTES}-byte limit"),
         ));
     }
     Ok(page)
 }
 
+/// The keyset loop shared by every keyed listing: fills a page from `source` after `start`,
+/// looking one row ahead so a cursor is reserved only when more rows really follow, and
+/// ending only on an empty batch from the source.
+fn keyset_fill<T: Serialize>(
+    base: usize,
+    source: &mut impl KeysetSource<T>,
+    start: Option<String>,
+    key_of: impl Fn(&T) -> Option<String>,
+    cursor: &KeyCursor,
+) -> Result<(Vec<T>, Option<String>), RpcError> {
+    let mut fill = PageFill::new(base);
+    let mut buffer: VecDeque<(String, T)> = VecDeque::new();
+    let mut exhausted = false;
+    let mut fetched_after = start;
+    let mut last: Option<String> = None;
+    loop {
+        // Keep one row of lookahead, so we know whether more follow the current row.
+        while buffer.len() < 2 && !exhausted {
+            let batch = source.rows_after(fetched_after.as_deref(), CHUNK)?;
+            exhausted = batch.is_empty();
+            for row in batch {
+                let key = key_of(&row)
+                    .ok_or_else(|| internal("source returned a row with an invalid key", ""))?;
+                if fetched_after
+                    .as_deref()
+                    .is_some_and(|after| key.as_str() <= after)
+                {
+                    return Err(internal("source returned rows out of key order", &key));
+                }
+                fetched_after = Some(key.clone());
+                buffer.push_back((key, row));
+            }
+        }
+        let Some((key, row)) = buffer.pop_front() else {
+            return Ok((fill.rows, None));
+        };
+        let more = !buffer.is_empty() || !exhausted;
+        let cursor_after = more.then(|| cursor.encode(&key));
+        match fill.try_add(row, cursor_after.as_deref())? {
+            None => last = Some(key),
+            Some(_) if fill.rows.is_empty() => return Err(too_large(&key)),
+            Some(_) => {
+                let next = last.as_deref().map(|k| cursor.encode(k));
+                return Ok((fill.rows, next));
+            }
+        }
+    }
+}
+
 /// One page of `item.status` for a directory (ADR-0020 R1 to R4).
 ///
-/// `directory_entry` is the directory's own entry, repeated on every page. Children come from
-/// `source` in byte order of name, starting after the cursor's name. The page holds as many
-/// children as fit in one line with the response for request `id`; `next_cursor` is set
-/// exactly when more children remain, and a page is never empty while more remain.
+/// `directory_entry` is the directory's own entry, repeated on every page; `seq` is the
+/// change sequence number the page was read at. Children come from `source` in byte order of
+/// name, starting after the cursor's name. The page holds as many children as fit in one
+/// line with the response for request `id`; `next_cursor` is set exactly when more children
+/// remain, and a page is never empty while more remain. The cursor is bound to the
+/// directory's path.
 ///
 /// # Errors
 ///
-/// `invalid-params` for a cursor not issued for this directory; the source's error;
-/// `internal` if the source breaks its contract (order, or a path not directly under the
-/// directory) or a single child cannot fit in a line.
+/// `invalid-params` with reason `restart-listing` for a cursor not issued for this
+/// directory; the source's error; `internal` if the source breaks its contract (order, or a
+/// path not directly under the directory) or a single child cannot fit in a line.
 pub fn directory_page(
     directory: &ProtocolPath,
     directory_entry: &ItemStatusEntry,
-    source: &mut impl DirectorySource,
+    source: &mut impl KeysetSource<ItemStatusEntry>,
     cursor: Option<&str>,
+    seq: Option<u64>,
     id: &Id,
 ) -> Result<ItemStatusResult, RpcError> {
-    let bound = directory_binding(directory);
-    let mut last = cursor
-        .map(|c| decode_directory_cursor(&bound, c))
+    let keys = KeyCursor::directory(directory);
+    let start = cursor
+        .map(|c| keys.decode(method::ITEM_STATUS, c))
         .transpose()?;
+    if start.as_deref().is_some_and(|name| !valid_name(name)) {
+        return Err(foreign_cursor(method::ITEM_STATUS, cursor.unwrap_or("")));
+    }
     let mut page = ItemStatusResult {
         directory: Some(directory_entry.clone()),
+        seq,
         entries: Vec::new(),
         next_cursor: None,
     };
-    let mut fill = PageFill {
-        base: response_len(id, &page)?,
-        used: 0,
-        entries: Vec::new(),
-    };
-    let mut buffer: VecDeque<ItemStatusEntry> = VecDeque::new();
-    let mut exhausted = false;
-    let mut fetched_after = last.clone();
-    loop {
-        if buffer.len() < 2 && !exhausted {
-            let batch = source.children_after(fetched_after.as_deref(), CHUNK)?;
-            exhausted = batch.len() < CHUNK;
-            for entry in batch {
-                let name = child_name(directory, &entry).ok_or_else(|| {
-                    internal(
-                        "directory source returned an entry that is not a child",
-                        &entry.path,
-                    )
-                })?;
-                if fetched_after.as_deref().is_some_and(|after| name <= after) {
-                    return Err(internal(
-                        "directory source returned children out of name order",
-                        &entry.path,
-                    ));
-                }
-                fetched_after = Some(name.to_owned());
-                buffer.push_back(entry);
-            }
-        }
-        let Some(entry) = buffer.pop_front() else {
-            break;
-        };
-        let more = !buffer.is_empty() || !exhausted;
-        let name = child_name(directory, &entry).unwrap_or_default().to_owned();
-        let cursor_after = more.then(|| directory_cursor(&bound, &name));
-        if fill.try_add(&entry, cursor_after.as_deref())? {
-            last = Some(name);
-            continue;
-        }
-        if fill.entries.is_empty() {
-            return Err(too_large(&entry));
-        }
-        page.next_cursor = last.as_deref().map(|n| directory_cursor(&bound, n));
-        break;
-    }
-    page.entries = fill.entries;
+    let base = response_len(id, &page)?;
+    let (entries, next) = keyset_fill(base, source, start, |e| child_name(directory, e), &keys)?;
+    page.entries = entries;
+    page.next_cursor = next;
     checked(id, page)
 }
 
@@ -303,11 +345,12 @@ pub fn directory_page(
 ///
 /// # Errors
 ///
-/// `invalid-params` for a cursor not issued for this batch; `internal` if a single entry
-/// cannot fit in a line.
+/// `invalid-params` with reason `restart-listing` for a cursor not issued for this batch;
+/// `internal` if a single entry cannot fit in a line.
 pub fn batch_page(
     paths: &[ProtocolPath],
     cursor: Option<&str>,
+    seq: Option<u64>,
     id: &Id,
     mut lookup: impl FnMut(&ProtocolPath) -> ItemStatusEntry,
 ) -> Result<ItemStatusResult, RpcError> {
@@ -318,28 +361,79 @@ pub fn batch_page(
     };
     let mut page = ItemStatusResult {
         directory: None,
+        seq,
         entries: Vec::new(),
         next_cursor: None,
     };
-    let mut fill = PageFill {
-        base: response_len(id, &page)?,
-        used: 0,
-        entries: Vec::new(),
-    };
+    let mut fill = PageFill::new(response_len(id, &page)?);
     for (index, path) in paths.iter().enumerate().skip(start) {
-        let entry = lookup(path);
         let more = index + 1 < paths.len();
         let cursor_after = more.then(|| batch_cursor(&bound, index + 1));
-        if fill.try_add(&entry, cursor_after.as_deref())? {
-            continue;
+        if fill
+            .try_add(lookup(path), cursor_after.as_deref())?
+            .is_some()
+        {
+            if fill.rows.is_empty() {
+                return Err(too_large(path.as_str()));
+            }
+            page.next_cursor = Some(batch_cursor(&bound, index));
+            break;
         }
-        if fill.entries.is_empty() {
-            return Err(too_large(&entry));
-        }
-        page.next_cursor = Some(batch_cursor(&bound, index));
-        break;
     }
-    page.entries = fill.entries;
+    page.entries = fill.rows;
+    checked(id, page)
+}
+
+/// One page of `mount.list`, in byte order of `mount_id` (ADR-0020 R4).
+///
+/// # Errors
+///
+/// `invalid-params` with reason `restart-listing` for a cursor this daemon did not issue;
+/// the source's error; `internal` if the source breaks key order or one mount cannot fit.
+pub fn mount_page(
+    source: &mut impl KeysetSource<MountInfo>,
+    cursor: Option<&str>,
+    id: &Id,
+) -> Result<MountListResult, RpcError> {
+    let keys = KeyCursor::mounts();
+    let start = cursor
+        .map(|c| keys.decode(method::MOUNT_LIST, c))
+        .transpose()?;
+    let mut page = MountListResult {
+        mounts: Vec::new(),
+        next_cursor: None,
+    };
+    let base = response_len(id, &page)?;
+    let key = |m: &MountInfo| Some(m.mount_id.as_str().to_owned());
+    let (mounts, next) = keyset_fill(base, source, start, key, &keys)?;
+    page.mounts = mounts;
+    page.next_cursor = next;
+    checked(id, page)
+}
+
+/// One page of `account.list`, in byte order of `account_id` (ADR-0020 R4).
+///
+/// # Errors
+///
+/// As for [`mount_page`].
+pub fn account_page(
+    source: &mut impl KeysetSource<AccountInfo>,
+    cursor: Option<&str>,
+    id: &Id,
+) -> Result<AccountListResult, RpcError> {
+    let keys = KeyCursor::accounts();
+    let start = cursor
+        .map(|c| keys.decode(method::ACCOUNT_LIST, c))
+        .transpose()?;
+    let mut page = AccountListResult {
+        accounts: Vec::new(),
+        next_cursor: None,
+    };
+    let base = response_len(id, &page)?;
+    let key = |a: &AccountInfo| Some(a.account_id.as_str().to_owned());
+    let (accounts, next) = keyset_fill(base, source, start, key, &keys)?;
+    page.accounts = accounts;
+    page.next_cursor = next;
     checked(id, page)
 }
 
@@ -461,7 +555,8 @@ fn capped(mut error: RpcError, max: usize) -> RpcError {
     error
 }
 
-/// Splits one change into `status.changed` notifications that each fit one line
+/// Splits one change, at change sequence number `seq`, into `status.changed` notifications
+/// that each fit one line
 /// (ADR-0020 R4).
 ///
 /// Entries and `refresh` paths keep their order across the notifications. An entry too large
@@ -474,8 +569,10 @@ fn capped(mut error: RpcError, max: usize) -> RpcError {
 pub fn status_changed_notifications(
     entries: Vec<ItemStatusEntry>,
     refresh: Vec<ProtocolPath>,
+    seq: Option<u64>,
 ) -> Result<Vec<Notification>, RpcError> {
     let empty = |e: Vec<ItemStatusEntry>, r: Vec<ProtocolPath>| StatusChangedParams {
+        seq,
         entries: e,
         refresh: r,
     };
@@ -544,7 +641,7 @@ mod tests {
     use super::*;
     use crate::codec::encode_line;
     use crate::methods::ItemInfo;
-    use crate::values::{ItemReason, RefusalReason};
+    use crate::values::RefusalReason;
 
     fn info() -> ItemInfo {
         let state = ItemState {
@@ -560,10 +657,12 @@ mod tests {
     }
 
     /// An entry whose message pads it out, for exact sizing.
+    /// Messages are capped, so pad with an unknown modifier, an open value of any length that
+    /// grows the encoding byte for byte.
     fn padded(path: &str, pad: usize) -> ItemStatusEntry {
         let mut item = info();
-        item.reason = Some(ItemReason::DownloadFailed);
-        item.message = Some("m".repeat(pad));
+        item.modifiers =
+            crate::values::WireModifiers(vec![crate::values::Modifier::Other("m".repeat(pad))]);
         ItemStatusEntry::known(ProtocolPath::new(path).unwrap(), item)
     }
 
@@ -603,8 +702,8 @@ mod tests {
         }
     }
 
-    impl DirectorySource for MapDir {
-        fn children_after(
+    impl KeysetSource<ItemStatusEntry> for MapDir {
+        fn rows_after(
             &mut self,
             after: Option<&str>,
             limit: usize,
@@ -643,7 +742,7 @@ mod tests {
         let mut cursor: Option<String> = None;
         let mut pages = 0;
         loop {
-            let page = directory_page(&dir, &dir_entry, d, cursor.as_deref(), id).unwrap();
+            let page = directory_page(&dir, &dir_entry, d, cursor.as_deref(), None, id).unwrap();
             pages += 1;
             assert!(line_len(id, &page) <= MAX_LINE_BYTES);
             out.extend(page.entries.iter().cloned());
@@ -788,10 +887,17 @@ mod tests {
         let mut a = MapDir::new("/m/a", (0..20_000).map(|i| format!("n{i:05}")));
         let mut b = MapDir::new("/m/b", (0..20_000).map(|i| format!("n{i:05}")));
         let id = Id::Number(1);
-        let page = directory_page(&dir_path(&a), &entry("/m/a"), &mut a, None, &id).unwrap();
+        let page = directory_page(&dir_path(&a), &entry("/m/a"), &mut a, None, None, &id).unwrap();
         let cursor = page.next_cursor.unwrap();
-        let err =
-            directory_page(&dir_path(&b), &entry("/m/b"), &mut b, Some(&cursor), &id).unwrap_err();
+        let err = directory_page(
+            &dir_path(&b),
+            &entry("/m/b"),
+            &mut b,
+            Some(&cursor),
+            None,
+            &id,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
 
         let bound = directory_binding(&dir_path(&a));
@@ -814,21 +920,31 @@ mod tests {
             format!("{cursor}."),
         ];
         for bad in &forged {
-            let err =
-                directory_page(&dir_path(&a), &entry("/m/a"), &mut a, Some(bad), &id).unwrap_err();
+            let err = directory_page(&dir_path(&a), &entry("/m/a"), &mut a, Some(bad), None, &id)
+                .unwrap_err();
             assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{bad:?}");
         }
         // The real cursor still works.
-        assert!(directory_page(&dir_path(&a), &entry("/m/a"), &mut a, Some(&cursor), &id).is_ok());
+        assert!(
+            directory_page(
+                &dir_path(&a),
+                &entry("/m/a"),
+                &mut a,
+                Some(&cursor),
+                None,
+                &id
+            )
+            .is_ok()
+        );
 
         let batch: Vec<ProtocolPath> = (0..10_000)
             .map(|i| ProtocolPath::new(format!("/m/a/n{i:05}")).unwrap())
             .collect();
         let lookup = |p: &ProtocolPath| entry(p.as_str());
-        let page = batch_page(&batch, None, &id, lookup).unwrap();
+        let page = batch_page(&batch, None, None, &id, lookup).unwrap();
         let cursor = page.next_cursor.unwrap();
         let other: Vec<ProtocolPath> = batch.iter().rev().cloned().collect();
-        let err = batch_page(&other, Some(&cursor), &id, lookup).unwrap_err();
+        let err = batch_page(&other, Some(&cursor), None, &id, lookup).unwrap_err();
         assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
         let bound = batch_binding(&batch);
         for bad in [
@@ -838,15 +954,15 @@ mod tests {
             format!("p1.{bound}.+1"),
             format!("p1.{bound}.x"),
         ] {
-            let err = batch_page(&batch, Some(&bad), &id, lookup).unwrap_err();
+            let err = batch_page(&batch, Some(&bad), None, &id, lookup).unwrap_err();
             assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{bad}");
         }
         // A directory cursor is not a batch cursor, nor the reverse.
-        let dir_cursor = directory_page(&dir_path(&a), &entry("/m/a"), &mut a, None, &id)
+        let dir_cursor = directory_page(&dir_path(&a), &entry("/m/a"), &mut a, None, None, &id)
             .unwrap()
             .next_cursor
             .unwrap();
-        assert!(batch_page(&batch, Some(&dir_cursor), &id, lookup).is_err());
+        assert!(batch_page(&batch, Some(&dir_cursor), None, &id, lookup).is_err());
     }
 
     /// A batch of paths pages in request order, each path exactly once.
@@ -861,7 +977,8 @@ mod tests {
         let mut cursor: Option<String> = None;
         let mut pages = 0;
         loop {
-            let page = batch_page(&batch, cursor.as_deref(), &id, |p| entry(p.as_str())).unwrap();
+            let page =
+                batch_page(&batch, cursor.as_deref(), None, &id, |p| entry(p.as_str())).unwrap();
             pages += 1;
             assert!(line_len(&id, &page) <= MAX_LINE_BYTES);
             got.extend(page.entries.into_iter().map(|e| e.path));
@@ -884,42 +1001,43 @@ mod tests {
         d.add_entry("b", padded("/m/b", 0));
         let dir = dir_path(&d);
         let dir_entry = entry("/m");
-        let page = directory_page(&dir, &dir_entry, &mut d, None, &id).unwrap();
+        let page = directory_page(&dir, &dir_entry, &mut d, None, None, &id).unwrap();
         let shortfall = MAX_LINE_BYTES - line_len(&id, &page);
         d.add_entry("b", padded("/m/b", shortfall));
-        let page = directory_page(&dir, &dir_entry, &mut d, None, &id).unwrap();
+        let page = directory_page(&dir, &dir_entry, &mut d, None, None, &id).unwrap();
         assert_eq!(line_len(&id, &page), MAX_LINE_BYTES, "exactly at the limit");
         assert_eq!(page.entries.len(), 2);
         assert_eq!(page.next_cursor, None);
 
         // One byte over: "b" moves to a second page, and the first page carries a cursor.
         d.add_entry("b", padded("/m/b", shortfall + 1));
-        let page = directory_page(&dir, &dir_entry, &mut d, None, &id).unwrap();
+        let page = directory_page(&dir, &dir_entry, &mut d, None, None, &id).unwrap();
         assert_eq!(page.entries.len(), 1);
         let next = page.next_cursor.clone().unwrap();
-        let page2 = directory_page(&dir, &dir_entry, &mut d, Some(&next), &id).unwrap();
+        let page2 = directory_page(&dir, &dir_entry, &mut d, Some(&next), None, &id).unwrap();
         assert_eq!(page2.entries.len(), 1);
         assert_eq!(page2.next_cursor, None);
 
         // With a third child after "b", the cursor must fit too: exactly at the limit.
         d.add("c");
         d.add_entry("b", padded("/m/b", 0));
-        let probe = directory_page(&dir, &dir_entry, &mut d, None, &id).unwrap();
+        let probe = directory_page(&dir, &dir_entry, &mut d, None, None, &id).unwrap();
         assert_eq!(probe.entries.len(), 3);
         // Size "b" so that [a, b] plus the cursor after "b" is exactly the limit.
         let two = ItemStatusResult {
             directory: Some(dir_entry.clone()),
+            seq: None,
             entries: vec![entry("/m/a"), padded("/m/b", 0)],
-            next_cursor: Some(directory_cursor(&directory_binding(&dir), "b")),
+            next_cursor: Some(KeyCursor::directory(&dir).encode("b")),
         };
         let pad = MAX_LINE_BYTES - line_len(&id, &two);
         d.add_entry("b", padded("/m/b", pad));
-        let page = directory_page(&dir, &dir_entry, &mut d, None, &id).unwrap();
+        let page = directory_page(&dir, &dir_entry, &mut d, None, None, &id).unwrap();
         assert_eq!(line_len(&id, &page), MAX_LINE_BYTES);
         assert_eq!(page.entries.len(), 2);
         assert!(page.next_cursor.is_some());
         d.add_entry("b", padded("/m/b", pad + 1));
-        let page = directory_page(&dir, &dir_entry, &mut d, None, &id).unwrap();
+        let page = directory_page(&dir, &dir_entry, &mut d, None, None, &id).unwrap();
         assert_eq!(page.entries.len(), 1);
     }
 
@@ -928,12 +1046,25 @@ mod tests {
     fn cursor_form_is_stable() {
         let dir = ProtocolPath::new("/home/user/OneDrive/Pictures/2026").unwrap();
         assert_eq!(
-            directory_cursor(&directory_binding(&dir), "IMG_2002.jpg"),
+            KeyCursor::directory(&dir).encode("IMG_2002.jpg"),
             "d1.c8ab48c736ffc35c4d7698ae57bb450d.494d475f323030322e6a7067"
         );
-        let bound = directory_binding(&dir);
         assert_eq!(
-            decode_directory_cursor(&bound, &directory_cursor(&bound, "é x")).unwrap(),
+            KeyCursor::mounts().encode("example-site-documents"),
+            "m1.6578616d706c652d736974652d646f63756d656e7473"
+        );
+        // Longest cursors, as documented: 36 + 2 × name bytes, 56 for a batch, 131 for a
+        // mount.
+        assert_eq!(
+            KeyCursor::directory(&dir).encode(&"n".repeat(255)).len(),
+            546
+        );
+        assert_eq!(batch_cursor(&"f".repeat(32), usize::MAX).len(), 56);
+        assert_eq!(KeyCursor::mounts().encode(&"m".repeat(64)).len(), 131);
+        let keys = KeyCursor::directory(&dir);
+        assert_eq!(
+            keys.decode(method::ITEM_STATUS, &keys.encode("é x"))
+                .unwrap(),
             "é x"
         );
     }
@@ -941,8 +1072,8 @@ mod tests {
     #[test]
     fn source_contract_violations_are_internal_errors() {
         struct Bad(Vec<ItemStatusEntry>);
-        impl DirectorySource for Bad {
-            fn children_after(
+        impl KeysetSource<ItemStatusEntry> for Bad {
+            fn rows_after(
                 &mut self,
                 _: Option<&str>,
                 _: usize,
@@ -956,8 +1087,15 @@ mod tests {
             vec![entry("/other/a")],
             vec![entry("/m/a/b")],
         ] {
-            let err = directory_page(&dir, &entry("/m"), &mut Bad(children), None, &Id::Number(1))
-                .unwrap_err();
+            let err = directory_page(
+                &dir,
+                &entry("/m"),
+                &mut Bad(children),
+                None,
+                None,
+                &Id::Number(1),
+            )
+            .unwrap_err();
             assert_eq!(err.kind(), Some(ErrorCode::Internal));
         }
     }
@@ -1086,7 +1224,8 @@ mod tests {
         let refresh: Vec<ProtocolPath> = (0..300)
             .map(|i| ProtocolPath::new(format!("/m/r{i}/{}", "q".repeat(4000))).unwrap())
             .collect();
-        let notes = status_changed_notifications(entries.clone(), refresh.clone()).unwrap();
+        let notes =
+            status_changed_notifications(entries.clone(), refresh.clone(), Some(7)).unwrap();
         assert!(notes.len() > 2);
         let mut got_entries = Vec::new();
         let mut got_refresh = Vec::new();
@@ -1101,9 +1240,197 @@ mod tests {
         assert_eq!(got_entries, entries);
         assert_eq!(got_refresh, refresh);
         assert!(
-            status_changed_notifications(Vec::new(), Vec::new())
+            status_changed_notifications(Vec::new(), Vec::new(), None)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A source that returns at most `cap` rows per call, as a store with a page limit would.
+    struct Capped<'a> {
+        inner: &'a mut MapDir,
+        cap: usize,
+    }
+
+    impl KeysetSource<ItemStatusEntry> for Capped<'_> {
+        fn rows_after(
+            &mut self,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<ItemStatusEntry>, RpcError> {
+            self.inner.rows_after(after, limit.min(self.cap))
+        }
+    }
+
+    /// A short batch from the source is not the end of the listing: only an empty batch is.
+    #[test]
+    fn short_batches_from_the_source_do_not_end_the_listing() {
+        let mut d = MapDir::new("/m/dir", (0..1_000).map(|i| format!("f{i:04}")));
+        let expected: Vec<ItemStatusEntry> = d.children.values().cloned().collect();
+        let dir = dir_path(&d);
+        let dir_entry = entry("/m/dir");
+        for cap in [1, 7, 100] {
+            let mut source = Capped { inner: &mut d, cap };
+            let page = directory_page(&dir, &dir_entry, &mut source, None, Some(3), &Id::Number(1))
+                .unwrap();
+            assert_eq!(page.entries, expected, "cap {cap}");
+            assert_eq!(page.next_cursor, None);
+            assert_eq!(page.seq, Some(3));
+        }
+    }
+
+    /// Every refused cursor, including one of an unknown version, says to restart the
+    /// listing.
+    #[test]
+    fn refused_cursors_say_restart_listing() {
+        let mut d = MapDir::new("/m/a", (0..10).map(|i| format!("n{i}")));
+        let dir = dir_path(&d);
+        let keys = KeyCursor::directory(&dir);
+        let good = keys.encode("n3");
+        let old_version = good.replacen("d1.", "d0.", 1);
+        let future = good.replacen("d1.", "d9.", 1);
+        for bad in [old_version, future, "x".into(), "m1.6e33".into()] {
+            let err = directory_page(
+                &dir,
+                &entry("/m/a"),
+                &mut d,
+                Some(&bad),
+                None,
+                &Id::Number(1),
+            )
+            .unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{bad}");
+            assert_eq!(
+                err.invalid_params_reason(),
+                Some(crate::values::InvalidParamsReason::RestartListing),
+                "{bad}"
+            );
+        }
+        assert!(
+            directory_page(
+                &dir,
+                &entry("/m/a"),
+                &mut d,
+                Some(&good),
+                None,
+                &Id::Number(1)
+            )
+            .is_ok()
+        );
+        let err =
+            mount_page(&mut MountSource(Vec::new()), Some("m0.6d"), &Id::Number(1)).unwrap_err();
+        assert_eq!(err.reason_code().as_deref(), Some("restart-listing"));
+    }
+
+    struct MountSource(Vec<MountInfo>);
+
+    impl KeysetSource<MountInfo> for MountSource {
+        fn rows_after(
+            &mut self,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<MountInfo>, RpcError> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|m| after.is_none_or(|a| m.mount_id.as_str() > a))
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+    }
+
+    struct AccountSource(Vec<AccountInfo>);
+
+    impl KeysetSource<AccountInfo> for AccountSource {
+        fn rows_after(
+            &mut self,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<AccountInfo>, RpcError> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|a| after.is_none_or(|k| a.account_id.as_str() > k))
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn worst_mount(i: usize) -> MountInfo {
+        use mydrive_core::ids::{AccountId, DriveId, MountId};
+        MountInfo {
+            mount_id: MountId::new(format!("{i:06}{}", "m".repeat(58))).unwrap(),
+            account_id: AccountId::new(format!("acct-{i}-{}", "\u{1}".repeat(200))).unwrap(),
+            drive_id: DriveId::new(format!("b!{}", "\"".repeat(2_000))).unwrap(),
+            mount_point: ProtocolPath::new(format!("/{i:06}{}", "\"".repeat(4_089))).unwrap(),
+            state: crate::values::MountState::Blocked,
+            blocked_reason: Some(crate::values::BlockedReason::OrganisationPolicy),
+            blocked_message: Some("\u{1}".repeat(100_000)),
+            read_only: true,
+        }
+    }
+
+    /// ADR-0020 R4: `mount.list` is paginated, and `blocked_message` is capped, so 300 mounts
+    /// with worst-case fields come back in pages that each fit one line.
+    #[test]
+    fn mount_list_pages_fit_one_line() {
+        let mounts: Vec<MountInfo> = (0..300).map(worst_mount).collect();
+        let mut source = MountSource(mounts.clone());
+        let id = Id::String("\u{1}".repeat(crate::envelope::MAX_ID_BYTES));
+        let mut got = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = mount_page(&mut source, cursor.as_deref(), &id).unwrap();
+            pages += 1;
+            let line = encode_line(&SuccessResponse::new(id.clone(), &page).unwrap()).unwrap();
+            assert!(line.len() - 1 <= MAX_LINE_BYTES);
+            for m in &page.mounts {
+                let v = serde_json::to_value(m).unwrap();
+                assert!(v["blocked_message"].as_str().unwrap().len() <= 1024);
+            }
+            got.extend(page.mounts.into_iter().map(|m| m.mount_id));
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert!(pages > 1, "300 worst-case mounts need several pages");
+        let expected: Vec<_> = mounts.into_iter().map(|m| m.mount_id).collect();
+        assert_eq!(got, expected);
+    }
+
+    /// ADR-0020 R4: `account.list` is paginated the same way.
+    #[test]
+    fn account_list_pages_fit_one_line() {
+        use mydrive_core::ids::{AccountId, TenantId};
+        let accounts: Vec<AccountInfo> = (0..2_000)
+            .map(|i| AccountInfo {
+                account_id: AccountId::new(format!("{i:05}{}", "a".repeat(400))).unwrap(),
+                kind: crate::values::AccountKind::Work,
+                tenant_id: Some(TenantId::new("\"".repeat(400)).unwrap()),
+                state: crate::values::AccountState::NeedsSignIn,
+            })
+            .collect();
+        let mut source = AccountSource(accounts.clone());
+        let id = Id::Number(i64::MIN);
+        let mut got = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = account_page(&mut source, cursor.as_deref(), &id).unwrap();
+            pages += 1;
+            let line = encode_line(&SuccessResponse::new(id.clone(), &page).unwrap()).unwrap();
+            assert!(line.len() - 1 <= MAX_LINE_BYTES);
+            got.extend(page.accounts);
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert!(pages > 1);
+        assert_eq!(got, accounts);
     }
 }

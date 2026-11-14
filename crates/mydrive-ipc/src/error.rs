@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::values::{BlockedReason, ReadOnlyReason, RefusalReason, WireSync};
+use crate::values::{BlockedReason, InvalidParamsReason, ReadOnlyReason, RefusalReason, WireSync};
 
 /// Every error code this build defines, with its stable integer value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -142,6 +142,25 @@ pub fn cap_message(message: &str) -> String {
     truncate_to(message, MAX_MESSAGE_BYTES)
 }
 
+/// Serialises a human-readable message capped at [`MAX_MESSAGE_BYTES`].
+pub(crate) fn serialize_capped<S: serde::Serializer>(
+    message: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&cap_message(message))
+}
+
+/// Serialises an optional human-readable message capped at [`MAX_MESSAGE_BYTES`].
+pub(crate) fn serialize_capped_opt<S: serde::Serializer>(
+    message: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match message {
+        Some(m) => serializer.serialize_some(&cap_message(m)),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Truncates `text` to at most `max` bytes on a character boundary, ending a truncated text
 /// with `…` when there is room for it.
 pub(crate) fn truncate_to(text: &str, max: usize) -> String {
@@ -208,8 +227,10 @@ impl ErrorData {
 pub struct RpcError {
     /// The integer code; see [`ErrorCode`].
     pub code: i64,
-    /// A human-readable description that says what failed and why. Errors built here are
-    /// capped at [`MAX_MESSAGE_BYTES`].
+    /// A human-readable description that says what failed and why. Capped at
+    /// [`MAX_MESSAGE_BYTES`] when built and again when serialised, so no message longer than
+    /// that is ever sent.
+    #[serde(serialize_with = "serialize_capped")]
     pub message: String,
     /// Structured detail as received. Read it with the accessors ([`RpcError::reason_code`]
     /// and the typed ones), which return `None` for a missing or unexpected shape instead of
@@ -276,6 +297,23 @@ impl RpcError {
         (self.kind() == Some(ErrorCode::ReadOnly))
             .then(|| self.data_field("reason"))
             .flatten()
+    }
+
+    /// `data.reason` of an `invalid-params` error.
+    #[must_use]
+    pub fn invalid_params_reason(&self) -> Option<InvalidParamsReason> {
+        (self.kind() == Some(ErrorCode::InvalidParams))
+            .then(|| self.data_field("reason"))
+            .flatten()
+    }
+
+    /// `invalid-params` for a cursor this daemon did not issue for these parameters, with
+    /// reason `restart-listing`.
+    #[must_use]
+    pub fn restart_listing(method: &str, detail: impl fmt::Display) -> Self {
+        Self::invalid_params(method, detail).with_data(ErrorData::reason(
+            InvalidParamsReason::RestartListing.as_str(),
+        ))
     }
 
     /// `data.sync`, if present and a string. Unknown sync values are kept (ADR-0020 R7).
@@ -497,6 +535,11 @@ mod tests {
         }
         let err = RpcError::new(ErrorCode::Internal, "x".repeat(5_000));
         assert!(err.message.len() <= MAX_MESSAGE_BYTES);
+        // A message set directly is still capped on the wire.
+        let mut err = err;
+        err.message = "y".repeat(5_000);
+        let v = serde_json::to_value(&err).unwrap();
+        assert!(v["message"].as_str().unwrap().len() <= MAX_MESSAGE_BYTES);
         assert_eq!(truncate_to("abc", 0), "");
         assert_eq!(truncate_to("abcdef", 2), "ab");
     }

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::envelope::{Id, Request};
-use crate::error::{ErrorCode, RpcError, cap_message};
+use crate::error::{ErrorCode, RpcError, cap_message, serialize_capped_opt};
 use crate::path::ProtocolPath;
 use crate::values::{
     AccountKind, AccountState, BlockedReason, ItemReason, MountState, WireEffectivePin,
@@ -110,15 +110,29 @@ pub const MAX_ACTION_PATHS: u32 = 100;
 /// the line, so that one result entry per path always fits in the response line.
 pub const MAX_ACTION_PATH_BYTES: u64 = MAX_LINE_BYTES / 2;
 
-/// Limits returned by `hello` (ADR-0020 R5). New limits may be added as fields.
+/// The most paths one `item.status` batch may carry in protocol version 1.
+pub const MAX_STATUS_PATHS: u32 = 10_000;
+
+/// The most bytes the paths of one `item.status` batch may take, encoded as JSON strings.
+/// Half the line, so the request plus the longest batch cursor, the longest ID and the
+/// separators always fits in one line (ADR-0020 R4).
+pub const MAX_STATUS_PATH_BYTES: u64 = MAX_LINE_BYTES / 2;
+
+/// Limits returned by `hello` (ADR-0020 R5). New limits may be added as fields; a limit
+/// added in a later version may only constrain something new.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
     /// The longest line, in bytes, excluding the `\n`.
     pub max_line_bytes: u64,
     /// The most paths in one `item.pin`, `item.unpin`, `item.hydrate` or `item.dehydrate`.
     pub max_action_paths: u32,
-    /// The most bytes those paths may take together, each encoded as a JSON string.
+    /// The most bytes those paths may take together, each counted in its minimal JSON
+    /// string encoding.
     pub max_action_path_bytes: u64,
+    /// The most paths in one `item.status` batch.
+    pub max_status_paths: u32,
+    /// The most bytes those paths may take together, counted as for actions.
+    pub max_status_path_bytes: u64,
 }
 
 impl Limits {
@@ -127,7 +141,17 @@ impl Limits {
         max_line_bytes: MAX_LINE_BYTES,
         max_action_paths: MAX_ACTION_PATHS,
         max_action_path_bytes: MAX_ACTION_PATH_BYTES,
+        max_status_paths: MAX_STATUS_PATHS,
+        max_status_path_bytes: MAX_STATUS_PATH_BYTES,
     };
+}
+
+/// Parameters of `account.list` and `mount.list`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListParams {
+    /// The `next_cursor` of the previous page; absent for the first page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// Chooses the highest protocol major version both sides support (ADR-0009 R4).
@@ -169,11 +193,14 @@ pub struct AccountInfo {
     pub state: AccountState,
 }
 
-/// `account.list` result.
+/// `account.list` result: one page, in byte order of `account_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountListResult {
-    /// Every account the daemon knows.
+    /// This page's accounts.
     pub accounts: Vec<AccountInfo>,
+    /// Present while more accounts remain; see `item.status` for the cursor contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// One mount in `mount.list`.
@@ -192,18 +219,26 @@ pub struct MountInfo {
     /// Why it is blocked, as a code, when `state` is `blocked` (ADR-0019 R6). Open set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<BlockedReason>,
-    /// A human-readable explanation of the block, for display only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A human-readable explanation of the block, for display only. Capped at 1 KiB on the
+    /// wire, like every message.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_capped_opt"
+    )]
     pub blocked_message: Option<String>,
     /// True for a read-only library.
     pub read_only: bool,
 }
 
-/// `mount.list` result.
+/// `mount.list` result: one page, in byte order of `mount_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountListResult {
-    /// Every mount the daemon knows.
+    /// This page's mounts.
     pub mounts: Vec<MountInfo>,
+    /// Present while more mounts remain; see `item.status` for the cursor contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// What `item.status` asks about.
@@ -289,8 +324,12 @@ pub struct ItemInfo {
     /// Why the status is `error` or `blocked`, as a code (ADR-0019 R6). Open set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<ItemReason>,
-    /// A human-readable explanation to go with `reason`, for display only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// A human-readable explanation to go with `reason`, for display only. Capped at 1 KiB.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_capped_opt"
+    )]
     pub message: Option<String>,
 }
 
@@ -451,6 +490,11 @@ pub struct ItemStatusResult {
     /// For a `directory` request, the directory itself (on every page).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<ItemStatusEntry>,
+    /// The daemon-wide change sequence number this page was read at. A client holding state
+    /// for an entry keeps whichever came with the higher `seq`, from a page or from
+    /// `status.changed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     /// This page's entries: for `paths`, in request order; for `directory`, the children in
     /// name order.
     pub entries: Vec<ItemStatusEntry>,
@@ -545,7 +589,11 @@ struct ActionEntryWire {
     path: ProtocolPath,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<RpcError>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "null_as_default"
+    )]
     skipped: Vec<SkippedItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skipped_count: Option<u64>,
@@ -634,9 +682,20 @@ pub struct ItemActionResult {
 /// `status.subscribe` parameters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusSubscribeParams {
-    /// Mount points or folders to watch. Empty or absent means every mount.
-    #[serde(default)]
+    /// Mount points or folders to watch, each with its whole subtree. Empty, absent or null
+    /// means every mount.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub paths: Vec<ProtocolPath>,
+}
+
+/// Deserialises `null` as the type's default, so a null optional field means the same as an
+/// absent one.
+pub(crate) fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// `status.subscribe` result: an empty object. From then on the connection carries
@@ -647,14 +706,17 @@ pub struct StatusSubscribeResult {}
 /// `status.changed` notification parameters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusChangedParams {
+    /// The daemon-wide change sequence number of this change; see [`ItemStatusResult::seq`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     /// The new state of each changed item. An entry with error `unknown-path` means the item
     /// is gone.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub entries: Vec<ItemStatusEntry>,
     /// Paths whose state changed too much to enumerate (for example a renamed folder with
     /// many descendants). For each one the client discards what it has cached for that path
     /// and everything below it, and re-requests what it is showing (ADR-0020 R8).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub refresh: Vec<ProtocolPath>,
 }
 
@@ -666,9 +728,9 @@ pub enum MethodCall {
     /// `daemon.status`.
     DaemonStatus,
     /// `account.list`.
-    AccountList,
+    AccountList(ListParams),
     /// `mount.list`.
-    MountList,
+    MountList(ListParams),
     /// `item.status`.
     ItemStatus(ItemStatusParams),
     /// `item.pin`.
@@ -699,11 +761,9 @@ impl MethodCall {
             method::DAEMON_STATUS => {
                 decode::<NoParams>(method, params).map(|_| Self::DaemonStatus)?
             }
-            method::ACCOUNT_LIST => {
-                decode::<NoParams>(method, params).map(|_| Self::AccountList)?
-            }
-            method::MOUNT_LIST => decode::<NoParams>(method, params).map(|_| Self::MountList)?,
-            method::ITEM_STATUS => Self::ItemStatus(decode(method, params)?),
+            method::ACCOUNT_LIST => Self::AccountList(decode(method, params)?),
+            method::MOUNT_LIST => Self::MountList(decode(method, params)?),
+            method::ITEM_STATUS => Self::ItemStatus(decode_status(method, params)?),
             method::ITEM_PIN => Self::ItemPin(decode_action(method, params)?),
             method::ITEM_UNPIN => Self::ItemUnpin(decode_action(method, params)?),
             method::ITEM_HYDRATE => Self::ItemHydrate(decode_action(method, params)?),
@@ -729,8 +789,8 @@ impl MethodCall {
         match self {
             Self::Hello(_) => method::HELLO,
             Self::DaemonStatus => method::DAEMON_STATUS,
-            Self::AccountList => method::ACCOUNT_LIST,
-            Self::MountList => method::MOUNT_LIST,
+            Self::AccountList(_) => method::ACCOUNT_LIST,
+            Self::MountList(_) => method::MOUNT_LIST,
             Self::ItemStatus(_) => method::ITEM_STATUS,
             Self::ItemPin(_) => method::ITEM_PIN,
             Self::ItemUnpin(_) => method::ITEM_UNPIN,
@@ -748,7 +808,8 @@ impl MethodCall {
     pub fn params(&self) -> Result<Option<Value>, serde_json::Error> {
         let value = match self {
             Self::Hello(p) => serde_json::to_value(p)?,
-            Self::DaemonStatus | Self::AccountList | Self::MountList => return Ok(None),
+            Self::DaemonStatus => return Ok(None),
+            Self::AccountList(p) | Self::MountList(p) => serde_json::to_value(p)?,
             Self::ItemStatus(p) => serde_json::to_value(p)?,
             Self::ItemPin(p)
             | Self::ItemUnpin(p)
@@ -776,6 +837,34 @@ impl MethodCall {
 
 /// Decodes action parameters and enforces [`Limits::V1`] (ADR-0020 R5): a request over a
 /// limit is refused as a whole, before anything is done.
+/// Decodes `item.status` parameters and enforces the batch limits of [`Limits::V1`], sized so
+/// that the request plus the longest cursor always fits in one line (ADR-0020 R4).
+fn decode_status(method: &str, params: Option<&Value>) -> Result<ItemStatusParams, RpcError> {
+    let params: ItemStatusParams = decode(method, params)?;
+    if let ItemStatusTarget::Paths(paths) = &params.target {
+        if paths.len() > MAX_STATUS_PATHS as usize {
+            return Err(RpcError::invalid_params(
+                method,
+                format!(
+                    "{} paths given, the limit is {MAX_STATUS_PATHS}; split the batch",
+                    paths.len()
+                ),
+            ));
+        }
+        let bytes = encoded_path_bytes(paths);
+        if bytes > MAX_STATUS_PATH_BYTES {
+            return Err(RpcError::invalid_params(
+                method,
+                format!(
+                    "the paths take {bytes} bytes, the limit is {MAX_STATUS_PATH_BYTES}; split \
+                     the batch"
+                ),
+            ));
+        }
+    }
+    Ok(params)
+}
+
 fn decode_action(method: &str, params: Option<&Value>) -> Result<ItemPathsParams, RpcError> {
     let params: ItemPathsParams = decode(method, params)?;
     if params.paths.len() > MAX_ACTION_PATHS as usize {
@@ -800,7 +889,9 @@ fn decode_action(method: &str, params: Option<&Value>) -> Result<ItemPathsParams
     Ok(params)
 }
 
-/// The bytes `paths` take as JSON strings, the measure `max_action_path_bytes` limits.
+/// The bytes `paths` take in their minimal JSON string encoding (as `serde_json` writes them,
+/// quotes included): the measure the path-byte limits use. A client counting its own
+/// encoding never counts less.
 #[must_use]
 pub fn encoded_path_bytes(paths: &[ProtocolPath]) -> u64 {
     paths
@@ -1034,8 +1125,10 @@ mod tests {
         let calls = [
             MethodCall::Hello(hello(&[1])),
             MethodCall::DaemonStatus,
-            MethodCall::AccountList,
-            MethodCall::MountList,
+            MethodCall::AccountList(ListParams::default()),
+            MethodCall::MountList(ListParams {
+                cursor: Some("m1.6d31".into()),
+            }),
             MethodCall::ItemStatus(ItemStatusParams {
                 target: ItemStatusTarget::Paths(vec![p("/a"), p("/b")]),
                 cursor: None,
@@ -1119,7 +1212,9 @@ mod tests {
             .unwrap();
         session.subscribed();
         assert_eq!(session.phase(), Phase::Subscribed(1));
-        let err = session.admit(&MethodCall::MountList).unwrap_err();
+        let err = session
+            .admit(&MethodCall::MountList(ListParams::default()))
+            .unwrap_err();
         assert_eq!(err.kind(), Some(ErrorCode::InvalidRequest));
     }
 
@@ -1179,7 +1274,7 @@ mod tests {
         let hello: HelloResult = serde_json::from_value(json!({
             "protocol_version": 1, "capabilities": ["future-thing"], "motd": "hi",
             "limits": {"max_line_bytes": 1, "max_action_paths": 1, "max_action_path_bytes": 1,
-                       "max_new_thing": 3}
+                       "max_status_paths": 1, "max_status_path_bytes": 1, "max_new_thing": 3}
         }))
         .unwrap();
         assert_eq!(hello.capabilities, ["future-thing"]);
@@ -1272,7 +1367,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(result.limits).unwrap(),
             json!({"max_line_bytes": 1_048_576, "max_action_paths": 100,
-                   "max_action_path_bytes": 524_288})
+                   "max_action_path_bytes": 524_288, "max_status_paths": 10_000,
+                   "max_status_path_bytes": 524_288})
         );
         let at_limit: Vec<String> = (0..100).map(|i| format!("/m/f{i}")).collect();
         for m in [
@@ -1344,6 +1440,73 @@ mod tests {
             json!({"path": "/a", "error": {"code": 1004, "message": "open",
                    "data": {"reason": "in-use"}}})
         );
+    }
+
+    /// ADR-0020 R4: an `item.status` batch is limited so that the same request plus the
+    /// longest cursor still fits in one line; the probe that once broke a cursor loop (74,893
+    /// paths) is now refused up front.
+    #[test]
+    fn status_batches_are_limited_so_the_cursor_request_fits() {
+        let at_limit: Vec<String> = (0..MAX_STATUS_PATHS).map(|i| format!("/m/{i}")).collect();
+        let call =
+            MethodCall::parse(method::ITEM_STATUS, Some(&json!({"paths": at_limit}))).unwrap();
+        assert!(matches!(call, MethodCall::ItemStatus(_)));
+        let probe: Vec<String> = (0..74_893).map(|i| format!("/m/{i}")).collect();
+        let err =
+            MethodCall::parse(method::ITEM_STATUS, Some(&json!({"paths": probe}))).unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
+
+        // The heaviest batch the byte limit admits: 128 paths of 4,096 quote characters
+        // would exceed it, so fill exactly up to the limit with plain characters instead.
+        let per = 4_096;
+        let count = usize::try_from(MAX_STATUS_PATH_BYTES).unwrap() / (per + 2);
+        let heavy: Vec<String> = (0..count)
+            .map(|i| format!("/{i:04}{}", "a".repeat(per - 5)))
+            .collect();
+        let params =
+            json!({"paths": heavy, "cursor": format!("p1.{}.{}", "f".repeat(32), u64::MAX)});
+        let call = MethodCall::parse(method::ITEM_STATUS, Some(&params)).unwrap();
+        let worst_id = Id::String("\u{1}".repeat(crate::envelope::MAX_ID_BYTES));
+        let line = crate::codec::encode_line(&call.to_request(worst_id).unwrap())
+            .expect("the request with the longest cursor and ID fits one line");
+        assert!(line.len() - 1 <= crate::codec::MAX_LINE_BYTES);
+        let mut over = heavy.clone();
+        over.push(format!("/x{}", "a".repeat(per - 2)));
+        let err =
+            MethodCall::parse(method::ITEM_STATUS, Some(&json!({"paths": over}))).unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
+    }
+
+    /// A `null` optional field means the same as an absent one, everywhere.
+    #[test]
+    fn null_optional_fields_mean_absent() {
+        let sub: StatusSubscribeParams = serde_json::from_value(json!({"paths": null})).unwrap();
+        assert!(sub.paths.is_empty());
+        let changed: StatusChangedParams =
+            serde_json::from_value(json!({"entries": null, "refresh": null, "seq": null})).unwrap();
+        assert_eq!(changed, StatusChangedParams::default());
+        let entry: ItemActionEntry = serde_json::from_value(
+            json!({"path": "/a", "skipped": null, "skipped_count": null, "bytes_freed": null}),
+        )
+        .unwrap();
+        assert_eq!(entry, ItemActionEntry::accepted(p("/a")));
+        let status: ItemStatusParams =
+            serde_json::from_value(json!({"directory": "/a", "paths": null, "cursor": null}))
+                .unwrap();
+        assert_eq!(status.cursor, None);
+        let list: ListParams = serde_json::from_value(json!({"cursor": null})).unwrap();
+        assert_eq!(list, ListParams::default());
+        let mut item = info_json();
+        item["reason"] = Value::Null;
+        item["message"] = Value::Null;
+        assert!(serde_json::from_value::<ItemInfo>(item).is_ok());
+        let mount: MountInfo = serde_json::from_value(json!({
+            "mount_id": "m", "account_id": "a", "drive_id": "d", "mount_point": "/m",
+            "state": "active", "blocked_reason": null, "blocked_message": null,
+            "read_only": false
+        }))
+        .unwrap();
+        assert_eq!(mount.blocked_message, None);
     }
 
     /// ADR-0020 R6: an entry with `error` has no `skipped`, and `skipped` never holds more
