@@ -1,0 +1,256 @@
+//! Opening the database, connection settings and forward-only migrations (ADR-0006 R2, R3).
+//!
+//! The schema version lives in SQLite's `user_version`. Migrations are numbered from 1,
+//! each strictly greater than the one before, and there is no down-migration. All pending
+//! migrations run in one transaction together with the `user_version` update, so a crash
+//! leaves the database either at its old version, untouched, or fully migrated.
+//!
+//! A migration's SQL is frozen once released: a later change to the schema is a new
+//! migration, never an edit to an old one. `docs/architecture/store-schema.md` describes
+//! the resulting schema.
+
+use std::path::Path;
+use std::time::Duration;
+
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+
+use crate::error::{SqlContext, StoreError};
+
+/// The newest schema version this build understands.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// How long a statement waits for a lock held by another connection, such as `sqlite3`
+/// inspecting the file, before failing.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One forward-only migration.
+#[derive(Debug)]
+pub(crate) struct Migration {
+    /// The `user_version` the database has after this migration.
+    pub(crate) version: i64,
+    /// The statements to run. Frozen once released.
+    pub(crate) sql: &'static str,
+}
+
+/// Every migration, in order. `MIGRATIONS.last().version == SCHEMA_VERSION`.
+pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    sql: V1,
+}];
+
+/// Schema v1. The CHECK lists are the wire forms of `mydrive-core`'s state enums as of
+/// this migration; a test keeps them equal to `WIRE_FORMS`. Adding a state value needs a
+/// new migration.
+const V1: &str = r"
+CREATE TABLE accounts (
+    account_id TEXT PRIMARY KEY NOT NULL CHECK (account_id <> ''),
+    tenant_id  TEXT CHECK (tenant_id IS NULL OR tenant_id <> '')
+) STRICT;
+
+CREATE TABLE mounts (
+    mount_id       TEXT PRIMARY KEY NOT NULL CHECK (mount_id <> ''),
+    account_id     TEXT NOT NULL REFERENCES accounts (account_id),
+    drive_id       TEXT NOT NULL CHECK (drive_id <> '' AND drive_id = lower(drive_id)),
+    root_item_id   TEXT NOT NULL CHECK (root_item_id <> ''),
+    mount_point    TEXT NOT NULL CHECK (mount_point <> ''),
+    delta_token    TEXT,
+    read_only      INTEGER NOT NULL CHECK (read_only IN (0, 1)),
+    blocked_reason TEXT,
+    UNIQUE (drive_id, root_item_id)
+) STRICT;
+
+CREATE TABLE items (
+    drive_id       TEXT NOT NULL CHECK (drive_id <> '' AND drive_id = lower(drive_id)),
+    item_id        TEXT NOT NULL CHECK (item_id <> ''),
+    parent_item_id TEXT CHECK (parent_item_id IS NULL OR parent_item_id <> ''),
+    name           TEXT NOT NULL CHECK (name <> ''),
+    kind           TEXT NOT NULL CHECK (kind IN ('file', 'folder')),
+    size           INTEGER NOT NULL CHECK (size >= 0),
+    created_at     INTEGER NOT NULL,
+    modified_at    INTEGER NOT NULL,
+    etag           TEXT NOT NULL,
+    ctag           TEXT,
+    server_hash    TEXT,
+    local_hash     TEXT,
+    hydration      TEXT NOT NULL CHECK (hydration IN ('placeholder', 'partial', 'full')),
+    pin            TEXT NOT NULL CHECK (pin IN ('inherit', 'pinned', 'unpinned')),
+    sync           TEXT NOT NULL CHECK (sync IN ('in-sync', 'pending-download',
+                       'pending-upload', 'uploading', 'conflict', 'error', 'blocked')),
+    last_error     TEXT,
+    PRIMARY KEY (drive_id, item_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE INDEX items_by_parent ON items (drive_id, parent_item_id);
+CREATE INDEX items_by_sync ON items (sync);
+
+CREATE TABLE hydrated_ranges (
+    drive_id    TEXT NOT NULL,
+    item_id     TEXT NOT NULL,
+    range_start INTEGER NOT NULL CHECK (range_start >= 0),
+    range_end   INTEGER NOT NULL CHECK (range_end > range_start),
+    PRIMARY KEY (drive_id, item_id, range_start),
+    FOREIGN KEY (drive_id, item_id) REFERENCES items (drive_id, item_id)
+) STRICT, WITHOUT ROWID;
+";
+
+/// Opens (creating if needed) and migrates the database at `path`.
+pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
+    // Probe an existing file read-only first. A read-write connection to a WAL database
+    // checkpoints when it closes, which would write to a file we are about to refuse.
+    if path.exists() {
+        let probe = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ctx(|| {
+            format!(
+                "open {} read-only to check its schema version",
+                path.display()
+            )
+        })?;
+        check_openable(&probe, path)?;
+        probe
+            .close()
+            .map_err(|(_, source)| source)
+            .ctx(|| format!("close the read-only check of {}", path.display()))?;
+    }
+
+    let mut conn = Connection::open(path).ctx(|| format!("open state store {}", path.display()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .ctx(|| "set the busy timeout")?;
+    // Checked again on the connection we keep, before anything is written.
+    check_openable(&conn, path)?;
+
+    let mode: String = conn
+        .pragma_update_and_check(None, "journal_mode", "wal", |row| row.get(0))
+        .ctx(|| format!("switch {} to WAL mode", path.display()))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(StoreError::NotWal {
+            path: path.to_owned(),
+            mode,
+        });
+    }
+    // FULL: a commit is on disk before it returns, so the engine's durable dirty mark
+    // (ADR-0012 R3) survives power loss, not just a process crash.
+    conn.pragma_update(None, "synchronous", "FULL")
+        .ctx(|| "set synchronous=FULL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .ctx(|| "enable foreign keys")?;
+
+    migrate(&mut conn, path)?;
+    Ok(conn)
+}
+
+/// Refuses a database that is newer than this build or is not a state store. Reads only.
+fn check_openable(conn: &Connection, path: &Path) -> Result<i64, StoreError> {
+    let found = user_version(conn, path)?;
+    if found > SCHEMA_VERSION {
+        return Err(StoreError::SchemaTooNew {
+            path: path.to_owned(),
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if found < 0 || (found == 0 && has_schema_objects(conn, path)?) {
+        return Err(StoreError::NotAStateStore {
+            path: path.to_owned(),
+        });
+    }
+    Ok(found)
+}
+
+fn user_version(conn: &Connection, path: &Path) -> Result<i64, StoreError> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .ctx(|| format!("read the schema version of {}", path.display()))
+}
+
+fn has_schema_objects(conn: &Connection, path: &Path) -> Result<bool, StoreError> {
+    conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_schema)", [], |row| {
+        row.get(0)
+    })
+    .ctx(|| format!("check whether {} is empty", path.display()))
+}
+
+/// Applies every migration newer than the database, in one transaction.
+fn migrate(conn: &mut Connection, path: &Path) -> Result<(), StoreError> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .ctx(|| "begin the migration transaction")?;
+    // Read inside the write lock, so the version cannot change under us.
+    let from = check_openable(&tx, path)?;
+    let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > from).collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for migration in &pending {
+        tx.execute_batch(migration.sql)
+            .ctx(|| format!("apply migration {}", migration.version))?;
+        tx.pragma_update(None, "user_version", migration.version)
+            .ctx(|| format!("record schema version {}", migration.version))?;
+    }
+    tx.commit()
+        .ctx(|| format!("commit migrations from version {from} to {SCHEMA_VERSION}"))?;
+    tracing::info!(
+        from,
+        to = SCHEMA_VERSION,
+        path = %path.display(),
+        "migrated state store"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// WP-006 "In scope" and ADR-0006 R2: the connection the store keeps has WAL mode,
+    /// `synchronous=FULL` (2) and foreign keys on. The last two are per connection, so they
+    /// are read from the connection `open` returns.
+    #[test]
+    fn opened_connection_has_wal_full_sync_and_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("state.db")).unwrap();
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        let sync: i64 = conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))
+            .unwrap();
+        let fks: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        assert_eq!((mode.as_str(), sync, fks), ("wal", 2, 1));
+    }
+
+    /// The state CHECK lists in migration 1 hold exactly `mydrive-core`'s wire forms, so a
+    /// value core can produce is never refused and nothing else is accepted (WP-006 AC7).
+    #[test]
+    fn v1_check_lists_match_core_wire_forms() {
+        use mydrive_core::state::{Hydration, Pin, Sync as SyncState};
+        for (column, forms) in [
+            ("hydration", Hydration::WIRE_FORMS),
+            ("pin", Pin::WIRE_FORMS),
+            ("sync", SyncState::WIRE_FORMS),
+        ] {
+            let list = forms
+                .iter()
+                .map(|f| format!("'{f}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let normalised: String = V1.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected = format!("CHECK ({column} IN ({list}))");
+            assert!(normalised.contains(&expected), "missing {expected}");
+        }
+    }
+
+    /// ADR-0006 R3: each migration's number is greater than all previous ones, numbering
+    /// starts at 1 with no gaps, and the last one is the current schema version.
+    #[test]
+    fn migrations_are_strictly_increasing_and_end_at_current_version() {
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|m| m.version).collect();
+        let expected: Vec<i64> = (1..=SCHEMA_VERSION).collect();
+        assert_eq!(versions, expected);
+    }
+}
