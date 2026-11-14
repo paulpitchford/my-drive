@@ -1,6 +1,6 @@
 # WP-008: Graph client foundations
 
-- **Status:** ready
+- **Status:** done (#23)
 - **Milestone:** M0
 - **Wave:** 3
 - **Depends on:** WP-001, WP-007, WP-009
@@ -41,6 +41,13 @@ the engine never handles raw HTTP and cannot forget a rule.
   throttled (with `Retry-After` as a duration), server error, transport error, malformed
   response.
 - The `ISV|<company>|<app>/<version>` User-Agent on every request.
+
+As merged (three review rounds), the client also: sends `Accept-Encoding: identity` and
+refuses encoded downloads; takes the item's expected size and checks every download against
+it; returns a result the caller must match (ranged or whole file); distinguishes `Truncated`
+(head verified, bytes may be kept) from `SizeMismatch` (discard and refetch metadata);
+returns delta pages as one ordered list of items and problem entries; and never shows raw
+server strings in errors. Its module docs list what the engine must still do.
 
 ## Out of scope
 

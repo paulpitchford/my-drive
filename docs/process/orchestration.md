@@ -128,6 +128,37 @@ outcome for what they are, and it changes how to plan.
 - **Cost.** Five WPs used roughly 45 agent runs: 5 implementers resumed 17 times, 11 reviews
   and 17 verifications. Budget eight to ten agent runs for a foundation package.
 
+## Lessons from wave 3
+
+Wave 3 (WP-008 and the three parts of WP-013, 2026-11-14 to 15) confirmed the split the
+wave-2 lessons predicted: the three tests-only parts each took one verification and merged;
+the Graph client took three review rounds.
+
+- **Tests-only follow-up packages are cheap and worth doing.** One of them stopped on a real
+  defect (a forged cursor accepted) instead of working around it; another proved an existing
+  test could not fail. Split them by crate so they run in parallel.
+- **A reviewer with a raw socket finds what a simulator cannot.** Both blocking download
+  findings (compressed bodies passed off as content; a cut-off body with no length reported
+  as complete) needed a hand-written TCP server. For anything that parses a network protocol,
+  tell the reviewer and verifier to build one.
+- **Error kinds are an API contract when the caller's reaction differs.** "Cut off" and
+  "wrong version" need opposite reactions from the engine; giving them one label would have
+  caused silent corruption. Where two failures need different handling, make the distinction
+  a documented guarantee and test each side.
+- **Leniency must never guess.** Tolerant parsing stopped one bad item stalling sync, and then
+  returned a deleted item as not deleted. The rule that fixed it: an item that cannot be read
+  unambiguously becomes a flagged entry, never a best guess.
+- **Resume the verifier that found the problem.** The final verification of the client reused
+  the agent that had built the probes; it re-ran all of them in one pass.
+- **Read the last small diff yourself.** After a final verification leaves two or three narrow
+  items, a tests-plus-few-lines commit can be read by the lead and merged on green CI.
+- **Scratch builds belong on disk, not in `/tmp`.** A verifier's parallel build loop filled the
+  tmpfs and produced false failures. Tell agents to use `/var/tmp` for build copies.
+- **Agents leave wait-loops behind.** Two finished agents left shells polling forever (one
+  with `pgrep -f`, which matches itself). Tell agents to `wait` on PIDs and check for strays
+  after a wave.
+- **Cost.** About 20 agent runs: 4 implementers resumed 6 times, 2 reviews, 6 verifications.
+
 ## Scale
 
 Start small. The first wave is the test of this process as much as of the code: run it with

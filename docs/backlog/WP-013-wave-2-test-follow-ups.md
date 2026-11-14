@@ -1,6 +1,6 @@
 # WP-013: Wave 2 test follow-ups
 
-- **Status:** ready
+- **Status:** done (#20 store, #21 sign-in, #22 protocol)
 - **Milestone:** M0
 - **Wave:** 3
 - **Depends on:** WP-005, WP-006, WP-009
