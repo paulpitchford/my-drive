@@ -1,6 +1,6 @@
 # WP-002: Core state model
 
-- **Status:** ready
+- **Status:** done (#3)
 - **Milestone:** M0
 - **Wave:** 1
 - **Depends on:** —
@@ -39,7 +39,7 @@ types meaning exactly what `docs/architecture/overview.md` says.
 
 ## Acceptance criteria
 
-- AC1: For every one of the 63 combinations of the three axes and both effective pins, the
+- AC1: For every one of the 42 combinations of hydration, effective pin and sync, the
   derived display status matches the overview's table, including its priority order.
 - AC2: Effective pin: own `Pinned`/`Unpinned` wins; `Inherit` takes the nearest ancestor that
   is not `Inherit`; with none, the result is `Unpinned`.
@@ -47,7 +47,7 @@ types meaning exactly what `docs/architecture/overview.md` says.
   anything other than `InSync`; each refusal carries its reason.
 - AC4: Dehydration is never permitted for `PendingUpload`, `Uploading` or `Conflict`,
   whatever the other axes say.
-- AC5: Every enum value round-trips through its string form and through `serde_json`, and
+- AC5: Every enum value round-trips through its string form and through serde, and
   unknown strings are rejected with a typed error.
 - AC6: The display derivation exists in exactly one function.
 

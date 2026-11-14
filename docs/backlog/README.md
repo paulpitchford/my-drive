@@ -14,21 +14,21 @@ answered. No daemon yet.
 
 | WP | Title | Wave | Depends on | Status |
 |---|---|---|---|---|
-| [WP-001](WP-001-core-identifiers.md) | Core identifiers | 1 | — | ready |
-| [WP-002](WP-002-core-state-model.md) | Core state model | 1 | — | ready |
-| [WP-003](WP-003-core-name-validation.md) | Name and path validation | 1 | — | ready |
-| [WP-004](WP-004-core-quickxorhash.md) | quickXorHash | 1 | — | ready |
-| [WP-010](WP-010-fuse-smoke-test-in-ci.md) | FUSE smoke test in CI | 1 | — | ready |
-| [WP-005](WP-005-ipc-protocol-types.md) | IPC protocol types and framing | 2 | WP-001, WP-002 | blocked on wave 1 |
-| [WP-006](WP-006-store-schema.md) | State store schema v1 | 2 | WP-001, WP-002 | blocked on wave 1 |
-| [WP-007](WP-007-graph-simulator-core.md) | Graph simulator core | 2 | WP-001, WP-004 | blocked on wave 1 |
-| [WP-009](WP-009-graph-auth.md) | Sign-in and token storage | 2 | — | blocked on wave 1 (shares no code, held to keep wave 1 small) |
-| [WP-012](WP-012-architecture-conformance-checks.md) | Architecture conformance checks | 2 | WP-010 | blocked on wave 1 |
+| [WP-001](WP-001-core-identifiers.md) | Core identifiers | 1 | — | done (#4) |
+| [WP-002](WP-002-core-state-model.md) | Core state model | 1 | — | done (#3) |
+| [WP-003](WP-003-core-name-validation.md) | Name and path validation | 1 | — | done (#6) |
+| [WP-004](WP-004-core-quickxorhash.md) | quickXorHash | 1 | — | done (#5) |
+| [WP-010](WP-010-fuse-smoke-test-in-ci.md) | FUSE smoke test in CI | 1 | — | done (#2) |
+| [WP-005](WP-005-ipc-protocol-types.md) | IPC protocol types and framing | 2 | WP-001, WP-002 | ready |
+| [WP-006](WP-006-store-schema.md) | State store schema v1 | 2 | WP-001, WP-002 | ready |
+| [WP-007](WP-007-graph-simulator-core.md) | Graph simulator core | 2 | WP-001, WP-004 | ready |
+| [WP-009](WP-009-graph-auth.md) | Sign-in and token storage | 2 | — | ready |
+| [WP-012](WP-012-architecture-conformance-checks.md) | Architecture conformance checks | 2 | WP-010 | ready |
 | [WP-008](WP-008-graph-client-foundations.md) | Graph client foundations | 3 | WP-001, WP-007, WP-009 | blocked on wave 2 |
 | [WP-011](WP-011-gate-experiments-g1-g5.md) | Gate experiments G1 and G5 | 4 | WP-008, WP-009 | blocked on wave 3 and on the owner (app registration) |
 
-Wave 1 is deliberately small and low-risk. It is the first real run of the agent process;
-expect to adjust the process documents after it.
+Wave 1 was merged on 2026-11-14. What it taught is in
+`docs/process/orchestration.md` ("Lessons from wave 1"). Wave 2 needs the owner's go-ahead.
 
 ## Validation gates
 
@@ -36,6 +36,7 @@ From `docs/architecture/overview.md`. A gate is an experiment, not a code delive
 
 | Gate | How it is answered | Needs | Status |
 |---|---|---|---|
+| — FUSE in hosted CI | WP-010 | — | **answered: yes** (`docs/process/ci-fuse.md`) |
 | G1 Range on authenticated `/content` | WP-011 against a real personal account, then a work account | App registration; owner signs in | open |
 | G2 Policy errors and shortcut stubs | Manual experiment against a work tenant with unmanaged-device controls | A work tenant; owner | open |
 | G3 abraunegg FUSE ADR | Lead reads PR #3600 and its ADR, writes up findings | Nothing | open |

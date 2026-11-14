@@ -3,9 +3,10 @@
 Side project. This file is the entry point: read it first when coming back.
 
 **Status (2026-11-14):** research complete; architecture decided and documented; project
-infrastructure in place; no product code yet.
-**Next action:** owner review of the decisions, then wave 1 of the backlog
-(`docs/backlog/README.md`).
+infrastructure in place; wave 1 of milestone M0 merged (core identifiers, state model, name
+validation, quickXorHash, FUSE test in CI). No daemon yet.
+**Next action:** owner go-ahead for wave 2 (`docs/backlog/README.md`), and owner review of
+the decisions in `docs/architecture/open-questions.md`.
 
 ## Project documents
 

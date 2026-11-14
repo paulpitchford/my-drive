@@ -1,6 +1,6 @@
 # WP-009: Sign-in and token storage
 
-- **Status:** blocked on wave 1
+- **Status:** ready
 - **Milestone:** M0
 - **Wave:** 2
 - **Depends on:** —

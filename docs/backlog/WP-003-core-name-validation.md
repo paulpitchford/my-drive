@@ -1,6 +1,6 @@
 # WP-003: Name and path validation
 
-- **Status:** ready
+- **Status:** done (#6)
 - **Milestone:** M0
 - **Wave:** 1
 - **Depends on:** —
@@ -38,13 +38,13 @@ engine can show a clear error instead of looping on a failed upload.
 
 - AC1: Each forbidden character listed in the research note is rejected, with the error
   naming the character.
-- AC2: Reserved device names are rejected case-insensitively, with and without an extension
-  where the source says so.
+- AC2: Bare reserved device names are rejected case-insensitively; the same names with an
+  extension are accepted.
 - AC3: `forms` is rejected only at a library root in the work/SharePoint context.
 - AC4: A name valid on Linux and on the server (including non-ASCII, emoji, and names with
   internal spaces and dots) is accepted.
 - AC5: Path length is counted the way the source specifies; where the source does not
-  specify the counting rule, the function takes the already-encoded server path and the doc
+  specify the counting rule, the function takes the decoded server-relative path, counted in UTF-16 code units, and the doc
   comment says the rule is unverified.
 - AC6: Two names differing only by case are reported as a collision; the comparison is
   Unicode-aware simple case folding, documented as an approximation of the server's rule.
@@ -59,9 +59,11 @@ engine can show a clear error instead of looping on a failed upload.
 
 ## Notes
 
-If the research note and Microsoft's page disagree, or a rule is ambiguous (the note flags
-that how the 400-character limit is counted was not confirmed), implement the stricter
-reading, mark it in the doc comment, and list it in your report.
+Amended after review (2026-11-14). The server is the final authority: a wrongly accepted
+name fails visibly at upload, while a wrongly rejected one never syncs. So where the source
+is silent or ambiguous, accept the name and document the doubt. `#` and `%` are accepted
+unless the context says the tenant refuses them; a trailing period is accepted; only bare
+device names are reserved.
 
 ## Open questions
 

@@ -1,6 +1,6 @@
 # WP-001: Core identifiers
 
-- **Status:** ready
+- **Status:** done (#4)
 - **Milestone:** M0
 - **Wave:** 1
 - **Depends on:** —
@@ -17,12 +17,13 @@ compared in the wrong case.
 
 ## In scope
 
-- `DriveId`: a non-empty string normalised to lowercase on construction.
+- `DriveId`: a non-empty string whose ASCII letters are lowercased on construction.
 - `ItemId`: a non-empty opaque string, stored exactly as given.
 - `ItemKey { drive_id, item_id }`: the identity of an item everywhere in the system.
 - `AccountId`, `TenantId`, `MountId`: opaque newtypes. `MountId` is safe to use as a single
   directory name: 1 to 64 characters from `a-z`, `0-9` and `-`, not starting with `-`.
-- For each: fallible constructor returning a `thiserror` error, `as_str`, `Display`,
+- For each of the five string types (not `ItemKey`, which is a struct that serialises as
+  the object `{"drive_id", "item_id"}` and has no string form): fallible constructor returning a `thiserror` error, `as_str`, `Display`,
   `FromStr`, `Debug`, `Clone`, `Eq`, `Hash`, `Ord`, and transparent `serde` (a JSON string).
 
 ## Out of scope
@@ -38,7 +39,8 @@ compared in the wrong case.
 - AC3: Every constructor rejects the empty string with a typed error.
 - AC4: `MountId` rejects `/`, `.`, `..`, uppercase letters, whitespace, a leading `-`, and
   anything longer than 64 characters.
-- AC5: Every type round-trips through `serde_json` as a plain string, and deserialising goes
+- AC5: Every string type serialises as a plain string (tested with serde's own string
+  serializers; `serde_json` is not a dependency of this crate), and deserialising goes
   through the same validation and normalisation as the constructor.
 - AC6: `ItemKey` is usable as a `HashMap` and `BTreeMap` key.
 
