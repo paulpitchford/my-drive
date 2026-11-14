@@ -16,8 +16,14 @@
 //! - An item that has an ID but whose shape cannot be used (for example an empty parent
 //!   ID, or a field of the wrong type) becomes a [`DeltaEntry::Problem`] in its place in
 //!   the feed, with its ID, whether it carried the `deleted` facet, and the reason.
-//! - Only a page that is not JSON, lacks its next or delta link, or has an entry without
-//!   a readable ID fails as a whole.
+//! - Ambiguity about what an item *is* is never resolved silently: a facet (`deleted`,
+//!   `file`, `folder`, `package`, `root`, `shared`, `remoteItem`) present with a value
+//!   that is not an object (`null` included), more than one of `file`, `folder` and
+//!   `package`, any key repeated in the item's object, or a blank parent ID, makes the
+//!   entry a problem, so the engine refetches the item.
+//! - Only a page that is not JSON, lacks its next or delta link (or has an empty or
+//!   repeated one), or has an entry without an unambiguous, non-blank ID fails as a
+//!   whole. Duplicated keys are detected while parsing, not resolved by "last wins".
 //!
 //! Every reason and message here names a field and a fixed problem; none repeats a value
 //! from the response, so nothing the server sends (names, URLs, tokens) reaches an error
@@ -32,6 +38,7 @@ use std::fmt;
 
 use mydrive_core::hash::QuickXorHash;
 use mydrive_core::ids::{DriveId, ItemId};
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 pub use time::{Timestamp, TimestampError};
@@ -266,8 +273,8 @@ impl DriveItem {
 pub struct ItemProblem {
     /// The item's ID, exactly as received.
     pub id: ItemId,
-    /// Whether the entry carried the `deleted` facet: a delete was reported even though
-    /// the rest of the entry is unusable.
+    /// Whether the entry had a `deleted` key, whatever its value: a delete may have been
+    /// reported even though the rest of the entry is unusable. Refetch the item.
     pub deleted: bool,
     /// Why it could not be used: a field name and a fixed problem, never a value.
     pub reason: String,
@@ -385,11 +392,170 @@ pub enum ModelError {
     Continuation(&'static str),
 }
 
+// ---- strict JSON tree -------------------------------------------------------------------
+
+/// A parsed JSON value that keeps every key of an object, duplicates included, so a
+/// duplicated key is detected instead of silently resolved (serde_json keeps the last).
+enum J {
+    Null,
+    Bool(bool),
+    Num(serde_json::Number),
+    Str(String),
+    Arr(Vec<J>),
+    Obj(Vec<(String, J)>),
+}
+
+struct JVisitor;
+
+impl<'de> Visitor<'de> for JVisitor {
+    type Value = J;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<J, E> {
+        Ok(J::Bool(v))
+    }
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<J, E> {
+        Ok(J::Num(v.into()))
+    }
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<J, E> {
+        Ok(J::Num(v.into()))
+    }
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<J, E> {
+        serde_json::Number::from_f64(v)
+            .map(J::Num)
+            .ok_or_else(|| E::custom("a number that is not finite"))
+    }
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<J, E> {
+        Ok(J::Str(v.to_owned()))
+    }
+    fn visit_string<E: de::Error>(self, v: String) -> Result<J, E> {
+        Ok(J::Str(v))
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<J, E> {
+        Ok(J::Null)
+    }
+    fn visit_none<E: de::Error>(self) -> Result<J, E> {
+        Ok(J::Null)
+    }
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<J, D::Error> {
+        J::deserialize(d)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<J, A::Error> {
+        let mut out = Vec::new();
+        while let Some(element) = seq.next_element()? {
+            out.push(element);
+        }
+        Ok(J::Arr(out))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<J, A::Error> {
+        let mut out = Vec::new();
+        while let Some((key, value)) = map.next_entry::<String, J>()? {
+            out.push((key, value));
+        }
+        Ok(J::Obj(out))
+    }
+}
+
+impl<'de> Deserialize<'de> for J {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(JVisitor)
+    }
+}
+
+/// Keys whose duplication is reported by name; any other duplicated key is reported as
+/// "a key", since key names are server strings.
+const NAMED_KEYS: &[&str] = &[
+    "id",
+    "name",
+    "size",
+    "eTag",
+    "cTag",
+    "deleted",
+    "file",
+    "folder",
+    "package",
+    "root",
+    "shared",
+    "remoteItem",
+    "parentReference",
+    "driveId",
+    "hashes",
+    "quickXorHash",
+    "createdDateTime",
+    "lastModifiedDateTime",
+    "fileSystemInfo",
+];
+
+impl J {
+    /// The first key that appears twice in an object anywhere in this value.
+    fn duplicate_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Arr(items) => items.iter().find_map(Self::duplicate_key),
+            Self::Obj(pairs) => {
+                for (i, (key, _)) in pairs.iter().enumerate() {
+                    if pairs[..i].iter().any(|(k, _)| k == key) {
+                        return Some(
+                            NAMED_KEYS
+                                .iter()
+                                .find(|named| **named == key)
+                                .copied()
+                                .unwrap_or("a key"),
+                        );
+                    }
+                }
+                pairs.iter().find_map(|(_, v)| v.duplicate_key())
+            }
+            _ => None,
+        }
+    }
+
+    /// The value in `serde_json` form. Only called once duplicates are ruled out or do not
+    /// matter.
+    fn into_value(self) -> Value {
+        match self {
+            Self::Null => Value::Null,
+            Self::Bool(b) => Value::Bool(b),
+            Self::Num(n) => Value::Number(n),
+            Self::Str(s) => Value::String(s),
+            Self::Arr(items) => Value::Array(items.into_iter().map(Self::into_value).collect()),
+            Self::Obj(pairs) => Value::Object(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_value()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+fn parse_json(body: &[u8]) -> Result<J, ModelError> {
+    serde_json::from_slice(body).map_err(|_| ModelError::Shape("the body is not valid JSON"))
+}
+
+/// The one string value of `key` in an object's pairs: `None` if absent, an error if it
+/// appears with different values, is not a string, or is blank.
+fn unique_id(pairs: &[(String, J)], key: &str) -> Result<Option<String>, ()> {
+    let mut found: Option<&str> = None;
+    for (k, v) in pairs {
+        if k != key {
+            continue;
+        }
+        let J::Str(s) = v else { return Err(()) };
+        if s.trim().is_empty() || found.is_some_and(|f| f != s) {
+            return Err(());
+        }
+        found = Some(s);
+    }
+    Ok(found.map(str::to_owned))
+}
+
 // ---- field readers ----------------------------------------------------------------------
 
 type Obj = Map<String, Value>;
 
-/// A field's value, treating JSON `null` as absent.
+/// A field's value, treating JSON `null` as absent. Not for facets: see [`facet`].
 fn get<'a>(obj: &'a Obj, key: &str) -> Option<&'a Value> {
     obj.get(key).filter(|v| !v.is_null())
 }
@@ -420,9 +586,22 @@ fn opt_obj<'a>(obj: &'a Obj, key: &str, path: &'static str) -> Result<Option<&'a
     }
 }
 
-/// Whether a facet is present (any non-null value).
-fn present(obj: &Obj, key: &str) -> bool {
-    get(obj, key).is_some()
+/// A facet: absent, or an object. Present with any other value, `null` included, it is
+/// ambiguous what the item is, so the item is unusable.
+fn facet<'a>(obj: &'a Obj, key: &str, path: &'static str) -> Result<Option<&'a Obj>, String> {
+    match obj.get(key) {
+        None => Ok(None),
+        Some(Value::Object(o)) => Ok(Some(o)),
+        Some(_) => Err(format!("{path} is present but not an object")),
+    }
+}
+
+/// An identifier field: absent, or a string that is not blank.
+fn opt_id(obj: &Obj, key: &str, path: &'static str) -> Result<Option<String>, String> {
+    match opt_str(obj, key, path)? {
+        Some(s) if s.trim().is_empty() => Err(format!("{path} is empty or blank")),
+        other => Ok(other),
+    }
 }
 
 /// Collects warnings while one item is converted.
@@ -481,10 +660,10 @@ const REMOTE_PARENT: ParentPaths = ParentPaths {
 };
 
 fn parent(obj: &Obj, paths: &ParentPaths) -> Result<ParentReference, String> {
-    let drive_id = opt_str(obj, "driveId", paths.drive_id)?
+    let drive_id = opt_id(obj, "driveId", paths.drive_id)?
         .map(|d| DriveId::new(d).map_err(|_| format!("{} is empty", paths.drive_id)))
         .transpose()?;
-    let id = opt_str(obj, "id", paths.id)?
+    let id = opt_id(obj, "id", paths.id)?
         .map(|i| ItemId::new(i).map_err(|_| format!("{} is empty", paths.id)))
         .transpose()?;
     Ok(ParentReference {
@@ -507,6 +686,7 @@ struct KindPaths {
     child_count: &'static str,
     package: &'static str,
     package_type: &'static str,
+    several: &'static str,
 }
 
 const ITEM_KIND: KindPaths = KindPaths {
@@ -518,6 +698,7 @@ const ITEM_KIND: KindPaths = KindPaths {
     child_count: "folder.childCount",
     package: "package",
     package_type: "package.type",
+    several: "more than one of file, folder and package is present",
 };
 
 const REMOTE_KIND: KindPaths = KindPaths {
@@ -529,20 +710,28 @@ const REMOTE_KIND: KindPaths = KindPaths {
     child_count: "remoteItem.folder.childCount",
     package: "remoteItem.package",
     package_type: "remoteItem.package.type",
+    several: "more than one of remoteItem.file, remoteItem.folder and remoteItem.package is present",
 };
 
 fn kind(obj: &Obj, paths: &KindPaths, w: &mut Warnings) -> Result<ItemKind, String> {
-    if let Some(package) = opt_obj(obj, "package", paths.package)? {
+    let package = facet(obj, "package", paths.package)?;
+    let folder = facet(obj, "folder", paths.folder)?;
+    let file = facet(obj, "file", paths.file)?;
+    let present = [package.is_some(), folder.is_some(), file.is_some()];
+    if present.iter().filter(|p| **p).count() > 1 {
+        return Err(paths.several.to_owned());
+    }
+    if let Some(package) = package {
         return Ok(ItemKind::Package(PackageFacet {
             package_type: opt_str(package, "type", paths.package_type)?,
         }));
     }
-    if let Some(folder) = opt_obj(obj, "folder", paths.folder)? {
+    if let Some(folder) = folder {
         return Ok(ItemKind::Folder(FolderFacet {
             child_count: opt_u64(folder, "childCount", paths.child_count)?,
         }));
     }
-    let Some(file) = opt_obj(obj, "file", paths.file)? else {
+    let Some(file) = file else {
         return Ok(ItemKind::Unknown);
     };
     let quick_xor_hash = match opt_obj(file, "hashes", paths.hashes)? {
@@ -556,12 +745,9 @@ fn kind(obj: &Obj, paths: &KindPaths, w: &mut Warnings) -> Result<ItemKind, Stri
 }
 
 fn remote(obj: &Obj, w: &mut Warnings) -> Result<RemoteItem, String> {
-    let id = match get(obj, "id") {
-        Some(Value::String(s)) => {
-            ItemId::new(s.clone()).map_err(|_| "remoteItem.id is empty".to_owned())?
-        }
-        _ => return Err("remoteItem.id is missing or not a string".to_owned()),
-    };
+    let id =
+        opt_id(obj, "id", "remoteItem.id")?.ok_or_else(|| "remoteItem.id is missing".to_owned())?;
+    let id = ItemId::new(id).map_err(|_| "remoteItem.id is empty".to_owned())?;
     Ok(RemoteItem {
         kind: kind(obj, &REMOTE_KIND, w)?,
         name: opt_str(obj, "name", "remoteItem.name")?,
@@ -575,6 +761,12 @@ fn remote(obj: &Obj, w: &mut Warnings) -> Result<RemoteItem, String> {
 
 fn item_body(obj: &Obj, id: ItemId) -> Result<DriveItem, String> {
     let mut w = Warnings(Vec::new());
+    let deleted = facet(obj, "deleted", "deleted")?.is_some();
+    let root = facet(obj, "root", "root")?.is_some();
+    let shared = facet(obj, "shared", "shared")?.is_some();
+    let remote_item = facet(obj, "remoteItem", "remoteItem")?
+        .map(|r| remote(r, &mut w))
+        .transpose()?;
     let kind = kind(obj, &ITEM_KIND, &mut w)?;
     let created = w.timestamp(obj, "createdDateTime", "createdDateTime");
     let last_modified = w.timestamp(obj, "lastModifiedDateTime", "lastModifiedDateTime");
@@ -590,9 +782,6 @@ fn item_body(obj: &Obj, id: ItemId) -> Result<DriveItem, String> {
     let parent = opt_obj(obj, "parentReference", "parentReference")?
         .map(|p| parent(p, &ITEM_PARENT))
         .transpose()?;
-    let remote_item = opt_obj(obj, "remoteItem", "remoteItem")?
-        .map(|r| remote(r, &mut w))
-        .transpose()?;
     Ok(DriveItem {
         id,
         name: opt_str(obj, "name", "name")?,
@@ -604,9 +793,9 @@ fn item_body(obj: &Obj, id: ItemId) -> Result<DriveItem, String> {
         file_system_info,
         parent,
         kind,
-        deleted: present(obj, "deleted"),
-        root: present(obj, "root"),
-        shared: present(obj, "shared"),
+        deleted,
+        root,
+        shared,
         remote_item,
         warnings: w.0,
     })
@@ -614,30 +803,40 @@ fn item_body(obj: &Obj, id: ItemId) -> Result<DriveItem, String> {
 
 /// Why one item could not be parsed.
 enum ItemFailure {
-    /// No readable ID: the page cannot be trusted.
+    /// No unambiguous, usable ID: the page cannot be trusted.
     NoId,
     /// An ID, but the rest cannot be used.
     Problem(ItemProblem),
 }
 
-/// Parses one item. Its ID is read first, so every later failure can name it.
-fn parse_item(value: &Value) -> Result<DriveItem, ItemFailure> {
-    let obj = value.as_object().ok_or(ItemFailure::NoId)?;
-    let id = match get(obj, "id") {
-        Some(Value::String(s)) => ItemId::new(s.clone()).map_err(|_| ItemFailure::NoId)?,
-        _ => return Err(ItemFailure::NoId),
+/// Parses one item. Its ID is read first, so every later failure can name it. The ID
+/// must be a non-blank string, and if `id` is repeated every occurrence must agree.
+fn parse_item(j: J) -> Result<DriveItem, ItemFailure> {
+    let J::Obj(pairs) = j else {
+        return Err(ItemFailure::NoId);
     };
-    item_body(obj, id.clone()).map_err(|reason| {
+    let id = unique_id(&pairs, "id")
+        .ok()
+        .flatten()
+        .and_then(|raw| ItemId::new(raw).ok())
+        .ok_or(ItemFailure::NoId)?;
+    let deleted_key = pairs.iter().any(|(k, _)| k == "deleted");
+    let problem = |reason: String| {
         ItemFailure::Problem(ItemProblem {
-            id,
-            deleted: present(obj, "deleted"),
+            id: id.clone(),
+            deleted: deleted_key,
             reason,
         })
-    })
-}
-
-fn parse_json(body: &[u8]) -> Result<Value, ModelError> {
-    serde_json::from_slice(body).map_err(|_| ModelError::Shape("the body is not valid JSON"))
+    };
+    let whole = J::Obj(pairs);
+    if let Some(key) = whole.duplicate_key() {
+        return Err(problem(format!("{key} appears more than once")));
+    }
+    let value = whole.into_value();
+    let Value::Object(obj) = &value else {
+        return Err(ItemFailure::NoId);
+    };
+    item_body(obj, id.clone()).map_err(problem)
 }
 
 impl Drive {
@@ -645,18 +844,23 @@ impl Drive {
     ///
     /// # Errors
     ///
-    /// [`ModelError`] if the body is not a JSON object or its ID is unusable. Other
-    /// fields of the wrong type are left `None`.
+    /// [`ModelError`] if the body is not a JSON object or its ID is unusable (missing,
+    /// blank, or repeated with different values). Other fields of the wrong type are left
+    /// `None`.
     pub fn from_json(body: &[u8]) -> Result<Self, ModelError> {
-        let value = parse_json(body)?;
-        let obj = value
-            .as_object()
-            .ok_or(ModelError::Shape("the drive is not an object"))?;
-        let id = match get(obj, "id") {
-            Some(Value::String(s)) => DriveId::new(s.clone()).ok(),
-            _ => None,
-        }
-        .ok_or(ModelError::MissingId { field: "drive id" })?;
+        let J::Obj(pairs) = parse_json(body)? else {
+            return Err(ModelError::Shape("the drive is not an object"));
+        };
+        let missing = ModelError::MissingId { field: "drive id" };
+        let id = unique_id(&pairs, "id")
+            .ok()
+            .flatten()
+            .and_then(|raw| DriveId::new(raw).ok())
+            .ok_or(missing)?;
+        let value = J::Obj(pairs).into_value();
+        let Value::Object(obj) = &value else {
+            return Err(ModelError::Shape("the drive is not an object"));
+        };
         let text = |key| get(obj, key).and_then(Value::as_str);
         let quota = get(obj, "quota").and_then(Value::as_object).map(|q| {
             let num = |key| get(q, key).and_then(Value::as_i64);
@@ -682,10 +886,11 @@ impl DriveItem {
     ///
     /// # Errors
     ///
-    /// [`ModelError`] if the body is not JSON, has no readable ID, or the item cannot be
-    /// used. Unreadable hashes and timestamps are warnings, not errors.
+    /// [`ModelError`] if the body is not JSON, has no usable ID, or the item cannot be
+    /// used (including an ambiguous shape). Unreadable hashes and timestamps are
+    /// warnings, not errors.
     pub fn from_json(body: &[u8]) -> Result<Self, ModelError> {
-        parse_item(&parse_json(body)?).map_err(|failure| match failure {
+        parse_item(parse_json(body)?).map_err(|failure| match failure {
             ItemFailure::NoId => ModelError::MissingId { field: "item id" },
             ItemFailure::Problem(p) => ModelError::Item {
                 id: p.id,
@@ -695,10 +900,25 @@ impl DriveItem {
     }
 }
 
-fn link(obj: &Obj, key: &str) -> Result<Option<DeltaLink>, ModelError> {
-    match get(obj, key) {
-        None => Ok(None),
-        Some(Value::String(s)) => Ok(Some(DeltaLink(s.clone()))),
+/// A page-level field: exactly once at most.
+fn single<'a>(pairs: &'a [(String, J)], key: &str) -> Result<Option<&'a J>, ModelError> {
+    let mut found = None;
+    for (k, v) in pairs {
+        if k == key {
+            if found.is_some() {
+                return Err(ModelError::Shape("a page-level key appears more than once"));
+            }
+            found = Some(v);
+        }
+    }
+    Ok(found)
+}
+
+fn link(pairs: &[(String, J)], key: &str) -> Result<Option<DeltaLink>, ModelError> {
+    match single(pairs, key)? {
+        None | Some(J::Null) => Ok(None),
+        Some(J::Str(s)) if s.trim().is_empty() => Err(ModelError::Continuation("an empty link")),
+        Some(J::Str(s)) => Ok(Some(DeltaLink(s.clone()))),
         Some(_) => Err(ModelError::Continuation("a link that is not a string")),
     }
 }
@@ -708,17 +928,17 @@ impl DeltaPage {
     ///
     /// # Errors
     ///
-    /// [`ModelError`] if the body is not a delta page, an entry has no readable ID, or
-    /// the page does not carry exactly one of `@odata.nextLink` and `@odata.deltaLink`.
+    /// [`ModelError`] if the body is not a delta page, an entry has no usable ID (missing,
+    /// blank, or repeated with different values), a page-level key is repeated, or the
+    /// page does not carry exactly one non-empty `@odata.nextLink` or `@odata.deltaLink`.
     /// Other problems with single entries become [`DeltaEntry::Problem`].
     pub fn from_json(body: &[u8]) -> Result<Self, ModelError> {
-        let value = parse_json(body)?;
-        let obj = value
-            .as_object()
-            .ok_or(ModelError::Shape("the delta page is not an object"))?;
+        let J::Obj(mut pairs) = parse_json(body)? else {
+            return Err(ModelError::Shape("the delta page is not an object"));
+        };
         let continuation = match (
-            link(obj, "@odata.nextLink")?,
-            link(obj, "@odata.deltaLink")?,
+            link(&pairs, "@odata.nextLink")?,
+            link(&pairs, "@odata.deltaLink")?,
         ) {
             (Some(next), None) => DeltaContinuation::NextLink(next),
             (None, Some(delta)) => DeltaContinuation::DeltaLink(delta),
@@ -733,9 +953,17 @@ impl DeltaPage {
                 ));
             }
         };
-        let values = get(obj, "value")
-            .and_then(Value::as_array)
-            .ok_or(ModelError::Shape("the delta page's value is not an array"))?;
+        let not_array = ModelError::Shape("the delta page's value is not an array");
+        if !matches!(single(&pairs, "value")?, Some(J::Arr(_))) {
+            return Err(not_array);
+        }
+        let values = pairs
+            .iter_mut()
+            .find(|(k, _)| k == "value")
+            .map(|(_, v)| std::mem::replace(v, J::Null));
+        let Some(J::Arr(values)) = values else {
+            return Err(not_array);
+        };
         let mut entries = Vec::with_capacity(values.len());
         for value in values {
             entries.push(match parse_item(value) {
@@ -859,10 +1087,81 @@ mod tests {
         );
     }
 
-    /// The `package` facet (OneNote notebooks) is its own kind, even beside `folder`.
+    /// Ambiguity about what an item is never resolves silently: each of these entries
+    /// becomes a problem carrying its ID and whether a `deleted` key was present, so the
+    /// engine refetches the item.
+    #[test]
+    fn ambiguous_items_become_problems() {
+        for (entry, deleted_key) in [
+            (r#"{"id":"x","deleted":null}"#, true),
+            (r#"{"id":"x","deleted":{},"deleted":null}"#, true),
+            (r#"{"id":"x","deleted":5}"#, true),
+            (r#"{"id":"x","id":"x","file":{}}"#, false),
+            (r#"{"id":"x","file":{},"folder":{}}"#, false),
+            (r#"{"id":"x","package":{},"folder":{}}"#, false),
+            (r#"{"id":"x","file":null}"#, false),
+            (r#"{"id":"x","folder":[3]}"#, false),
+            (r#"{"id":"x","file":[null,null]}"#, false),
+            (r#"{"id":"x","package":"oneNote"}"#, false),
+            (r#"{"id":"x","root":5}"#, false),
+            (r#"{"id":"x","shared":true}"#, false),
+            (r#"{"id":"x","remoteItem":null}"#, false),
+            (
+                r#"{"id":"x","remoteItem":{"id":"r","file":{},"folder":{}}}"#,
+                false,
+            ),
+            (r#"{"id":"x","remoteItem":{"id":" "}}"#, false),
+            (r#"{"id":"x","parentReference":{"id":" "}}"#, false),
+            (r#"{"id":"x","parentReference":{"driveId":"  "}}"#, false),
+            (r#"{"id":"x","size":1,"size":2}"#, false),
+            (r#"{"id":"x","name":"a","name":"b"}"#, false),
+            (r#"{"id":"x","parentReference":{"id":"a","id":"b"}}"#, false),
+            (r#"{"id":"x","unknownKey":1,"unknownKey":2}"#, false),
+        ] {
+            let body = format!(r#"{{"value":[{entry}],"@odata.deltaLink":"d"}}"#);
+            let page = DeltaPage::from_json(body.as_bytes()).unwrap();
+            let problems: Vec<_> = page.problems().collect();
+            assert_eq!(problems.len(), 1, "{entry}");
+            assert_eq!(problems[0].id.as_str(), "x", "{entry}");
+            assert_eq!(problems[0].deleted, deleted_key, "{entry}");
+            assert!(DriveItem::from_json(entry.as_bytes()).is_err(), "{entry}");
+        }
+        let dup = DeltaPage::from_json(
+            br#"{"value":[{"id":"x","unknownKey":1,"unknownKey":2}],"@odata.deltaLink":"d"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dup.problems().next().unwrap().reason,
+            "a key appears more than once",
+            "an unknown key's name is not echoed"
+        );
+    }
+
+    /// The page fails as a whole when an entry's ID is unusable or ambiguous, or a link is
+    /// empty or repeated.
+    #[test]
+    fn unusable_ids_and_links_fail_the_page() {
+        for body in [
+            r#"{"value":[{"id":" "}],"@odata.deltaLink":"d"}"#,
+            r#"{"value":[{"id":""}],"@odata.deltaLink":"d"}"#,
+            r#"{"value":[{"id":"a","id":"b"}],"@odata.deltaLink":"d"}"#,
+            r#"{"value":[{"id":"a","id":7}],"@odata.deltaLink":"d"}"#,
+            r#"{"value":[],"@odata.deltaLink":""}"#,
+            r#"{"value":[],"@odata.nextLink":"  "}"#,
+            r#"{"value":[],"@odata.deltaLink":"d","@odata.deltaLink":"e"}"#,
+            r#"{"value":[],"value":[],"@odata.deltaLink":"d"}"#,
+        ] {
+            assert!(DeltaPage::from_json(body.as_bytes()).is_err(), "{body}");
+        }
+        assert!(DriveItem::from_json(br#"{"id":"a","id":"b"}"#).is_err());
+        assert!(Drive::from_json(br#"{"id":"a","id":"b"}"#).is_err());
+        assert!(Drive::from_json(br#"{"id":"  "}"#).is_err());
+    }
+
+    /// The `package` facet (OneNote notebooks) is its own kind.
     #[test]
     fn package_facet_is_its_own_kind() {
-        let notebook = item(r#"{"id":"A!5","package":{"type":"oneNote"},"folder":{}}"#);
+        let notebook = item(r#"{"id":"A!5","package":{"type":"oneNote"}}"#);
         assert_eq!(
             notebook.kind,
             ItemKind::Package(PackageFacet {

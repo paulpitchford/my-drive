@@ -256,8 +256,12 @@ pub enum GraphErrorKind {
         /// The `Content-Encoding` value, cut to printable ASCII.
         encoding: String,
     },
-    /// The download response uses a `Transfer-Encoding` other than `chunked`.
-    #[error("the content arrived with Transfer-Encoding {encoding:?}, not chunked")]
+    /// The download response uses a `Transfer-Encoding` other than a single line of
+    /// exactly `chunked`.
+    #[error(
+        "the content arrived with Transfer-Encoding {encoding:?}; only one line of exactly \
+         `chunked` is accepted"
+    )]
     UnsupportedTransferEncoding {
         /// The `Transfer-Encoding` value, cut to printable ASCII.
         encoding: String,

@@ -700,6 +700,111 @@ async fn range_outside_the_file_is_refused() -> TestResult {
     Ok(())
 }
 
+/// Two `Content-Encoding` lines, `identity` then `gzip`, are refused: every line counts.
+/// Likewise two `Transfer-Encoding` lines.
+#[tokio::test]
+async fn two_line_encodings_are_refused() -> TestResult {
+    let (server, client, _) = setup().await;
+    let gzip = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0];
+    server.push(response(
+        "200 OK",
+        &[
+            ("Content-Encoding", "identity"),
+            ("Content-Encoding", "gzip"),
+            ("Content-Length", "8"),
+        ],
+        &gzip,
+    ));
+    let err = client
+        .download(&drive(), &item(), 8, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.kind(), GraphErrorKind::UnsupportedEncoding { encoding } if encoding == "gzip"),
+        "{err}"
+    );
+
+    server.push(response(
+        "206 Partial Content",
+        &[
+            ("Content-Encoding", "identity"),
+            ("Content-Encoding", "gzip"),
+            ("Content-Range", "bytes 0-7/4096"),
+            ("Content-Length", "8"),
+        ],
+        &gzip,
+    ));
+    let err = client
+        .download(&drive(), &item(), SIZE, ByteRange::new(0, 8))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.kind(), GraphErrorKind::UnsupportedEncoding { .. }),
+        "{err}"
+    );
+
+    // A JSON body with the two-line form is malformed, not parsed.
+    server.push(response(
+        "200 OK",
+        &[
+            ("Content-Encoding", "identity"),
+            ("Content-Encoding", "br"),
+            ("Content-Length", "8"),
+        ],
+        &gzip,
+    ));
+    let err = client.get_drive(&drive()).await.unwrap_err();
+    assert!(matches!(err.kind(), GraphErrorKind::Malformed(_)), "{err}");
+
+    // Two Transfer-Encoding lines, whatever the second says.
+    for second in ["chunked", "gzip"] {
+        server.push(response(
+            "200 OK",
+            &[
+                ("Transfer-Encoding", "chunked"),
+                ("Transfer-Encoding", second),
+            ],
+            b"8\r\n\x1f\x8b\x08\x00\x00\x00\x00\x00\r\n0\r\n\r\n",
+        ));
+        let err = client
+            .download(&drive(), &item(), 8, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                GraphErrorKind::UnsupportedTransferEncoding { .. }
+            ),
+            "{second}: {err}"
+        );
+    }
+    Ok(())
+}
+
+/// Over the wire, a damaged delta entry is a problem, never a normal item, and a
+/// `"deleted": null` entry is reported with its `deleted` key.
+#[tokio::test]
+async fn damaged_delta_entries_are_problems() -> TestResult {
+    let (server, client, _) = setup().await;
+    server.push(response(
+        "200 OK",
+        &[("Content-Type", "application/json")],
+        br#"{"value":[{"id":"a","deleted":null},{"id":"b","deleted":{},"deleted":null},
+            {"id":"c","file":{},"folder":{}},{"id":"d","root":5}],"@odata.deltaLink":"x"}"#,
+    ));
+    let page = client.delta_from_root(&drive()).await?;
+    assert_eq!(page.items().count(), 0);
+    let problems: Vec<_> = page
+        .problems()
+        .map(|p| (p.id.as_str(), p.deleted))
+        .collect();
+    assert_eq!(
+        problems,
+        [("a", true), ("b", true), ("c", false), ("d", false)]
+    );
+    Ok(())
+}
+
 /// A `Transfer-Encoding` other than `chunked` is refused.
 #[tokio::test]
 async fn non_chunked_transfer_encoding_is_refused() -> TestResult {

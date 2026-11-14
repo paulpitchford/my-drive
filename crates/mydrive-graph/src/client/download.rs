@@ -172,35 +172,45 @@ fn printable(value: &[u8]) -> String {
         .collect()
 }
 
-/// Refuses a response whose `Content-Encoding` is anything but absent or `identity`.
+/// Refuses a response unless every coding in every `Content-Encoding` line is
+/// `identity`. A response may carry several lines, each a comma-separated list; any other
+/// coding anywhere, or an empty one, is refused.
 pub(super) fn require_identity(headers: &HeaderMap) -> Result<(), GraphErrorKind> {
-    let Some(value) = headers.get(header::CONTENT_ENCODING) else {
-        return Ok(());
-    };
-    if String::from_utf8_lossy(value.as_bytes())
-        .trim()
-        .eq_ignore_ascii_case("identity")
-    {
-        return Ok(());
+    for value in headers.get_all(header::CONTENT_ENCODING) {
+        let text = String::from_utf8_lossy(value.as_bytes());
+        if !text
+            .split(',')
+            .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+        {
+            return Err(GraphErrorKind::UnsupportedEncoding {
+                encoding: printable(value.as_bytes()),
+            });
+        }
     }
-    Err(GraphErrorKind::UnsupportedEncoding {
-        encoding: printable(value.as_bytes()),
-    })
+    Ok(())
 }
 
-/// Refuses a `Transfer-Encoding` other than `chunked`. Returns whether one is present.
+/// Refuses a `Transfer-Encoding` other than exactly one line saying exactly `chunked`
+/// (so `gzip, chunked`, and a second line of any value, are refused). Returns whether
+/// one is present.
 fn transfer_encoding(headers: &HeaderMap) -> Result<bool, GraphErrorKind> {
-    let Some(value) = headers.get(header::TRANSFER_ENCODING) else {
+    let mut values = headers.get_all(header::TRANSFER_ENCODING).iter();
+    let Some(first) = values.next() else {
         return Ok(false);
     };
-    if String::from_utf8_lossy(value.as_bytes())
+    if let Some(second) = values.next() {
+        return Err(GraphErrorKind::UnsupportedTransferEncoding {
+            encoding: printable(second.as_bytes()),
+        });
+    }
+    if String::from_utf8_lossy(first.as_bytes())
         .trim()
         .eq_ignore_ascii_case("chunked")
     {
         Ok(true)
     } else {
         Err(GraphErrorKind::UnsupportedTransferEncoding {
-            encoding: printable(value.as_bytes()),
+            encoding: printable(first.as_bytes()),
         })
     }
 }
@@ -485,6 +495,29 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// Every `Content-Encoding` and `Transfer-Encoding` line is checked, not only the
+    /// first.
+    #[test]
+    fn every_encoding_line_is_checked() {
+        let mut h = HeaderMap::new();
+        h.append(header::CONTENT_ENCODING, "identity".parse().unwrap());
+        h.append(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        assert!(require_identity(&h).is_err());
+        let mut h = HeaderMap::new();
+        h.append(header::CONTENT_ENCODING, "identity".parse().unwrap());
+        h.append(header::CONTENT_ENCODING, "identity".parse().unwrap());
+        assert!(require_identity(&h).is_ok());
+
+        let mut h = HeaderMap::new();
+        h.append(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        h.append(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        assert!(transfer_encoding(&h).is_err());
+        let mut h = HeaderMap::new();
+        h.append(header::TRANSFER_ENCODING, "gzip".parse().unwrap());
+        h.append(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        assert!(transfer_encoding(&h).is_err());
     }
 
     #[test]

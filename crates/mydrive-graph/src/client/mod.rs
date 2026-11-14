@@ -24,6 +24,20 @@
 //! making progress runs as long as it takes, so the engine must apply its own no-progress
 //! limit (F03, ADR-0005 R4).
 //!
+//! **What the engine must still do.** The download checks cannot catch everything, and
+//! two gaps are accepted at this layer by the lead's decision:
+//!
+//! - *Bytes beyond `Content-Length` on a reused connection.* A broken or hostile server,
+//!   or a TLS-intercepting proxy, that sends more bytes than its `Content-Length` on a
+//!   keep-alive connection can have them read as the response to the next request on
+//!   that connection. Disabling connection reuse would cost a TLS handshake per ranged
+//!   read, so it stays on. The defence is the engine's: verify the whole-file
+//!   quickXorHash when a file becomes fully hydrated (F03), and discard everything on a
+//!   mismatch.
+//! - *Same size, different content.* The size checks cannot see a file replaced by
+//!   different content of the same size. Only the eTag and the quickXorHash can: the
+//!   engine compares them (ADR-0011 R4) and verifies the hash once the file is whole.
+//!
 //! Nothing here logs a token, a URL or a response body.
 
 mod download;
