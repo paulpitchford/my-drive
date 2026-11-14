@@ -1,6 +1,6 @@
 # WP-012: Architecture conformance checks
 
-- **Status:** ready
+- **Status:** done (#9)
 - **Milestone:** M0
 - **Wave:** 2
 - **Depends on:** WP-010 (both change `.github/workflows/ci.yml`)

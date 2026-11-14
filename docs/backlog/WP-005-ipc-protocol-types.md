@@ -1,6 +1,6 @@
 # WP-005: IPC protocol types and framing
 
-- **Status:** ready
+- **Status:** done (#10)
 - **Milestone:** M0
 - **Wave:** 2
 - **Depends on:** WP-001, WP-002
@@ -17,6 +17,8 @@ catalogue, so the daemon, CLI and adapters can be built in parallel against one 
 ## In scope
 
 - JSON-RPC 2.0 envelope types: request, success response, error response, notification.
+- Pagination, size limits and open value sets as decided in ADR-0019 and ADR-0020 after
+  review (cursors, `limits` in `hello`, every message bounded).
 - A newline-delimited framing codec over any byte stream: one JSON document per line, a
   maximum line length of 1 MiB, typed errors for oversize lines, invalid UTF-8 and invalid
   JSON. The codec must not lose or merge messages when reads split or join lines.

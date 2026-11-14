@@ -1,6 +1,6 @@
 # WP-006: State store schema v1
 
-- **Status:** ready
+- **Status:** done (#12)
 - **Milestone:** M0
 - **Wave:** 2
 - **Depends on:** WP-001, WP-002
@@ -31,6 +31,12 @@ is wrong, nothing above it can be data-safe.
 - A transaction API so a caller can apply a batch (for example one delta page plus its new
   token) atomically.
 - `docs/architecture/store-schema.md`: tables, columns, invariants, migration rules.
+
+The scope grew during review (five rounds). As merged, the store also enforces the rules for
+unsynced local content: an explicit durable dirty mark and generation, the last remote
+identity seen while dirty, atomic `complete_upload`, `discard_local_changes`, `dehydrate`,
+explicit delete modes and `dirty_items()` for restart recovery. The authoritative description
+is `docs/architecture/store-schema.md`, including "What the engine must do".
 
 ## Out of scope
 

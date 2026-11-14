@@ -1,6 +1,6 @@
 # WP-007: Graph simulator core
 
-- **Status:** ready
+- **Status:** done (#13)
 - **Milestone:** M0
 - **Wave:** 2
 - **Depends on:** WP-001, WP-004
@@ -45,8 +45,9 @@ are only as good as the simulator's faithfulness.
 
 - AC1: A test can start the simulator, build a tree, and page through a full delta to a
   delta link; calling the delta link again returns only what changed since.
-- AC2: Delta responses for a business drive contain no cTag, and no response contains a path
-  in `parentReference`.
+- AC2 (amended after review): delta responses for a business drive contain no cTag, and no
+  DELTA response contains a path in `parentReference`; get-item and list-children include it
+  by default, as real Graph does.
 - AC3: A rename of a folder appears in delta as that folder only, not its descendants.
 - AC4: With Range honoured, a ranged request returns 206 and exactly those bytes; with Range
   ignored, the same request returns 200 and the whole body.
