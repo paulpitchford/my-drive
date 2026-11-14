@@ -2,8 +2,25 @@
 
 Side project. This file is the entry point: read it first when coming back.
 
-**Status (2026-11-14):** research complete, nothing built, no architecture committed.
-**Next action:** the four pre-commitment checks in [Before building](#before-building).
+**Status (2026-11-14):** research complete; architecture decided and documented; project
+infrastructure in place; no product code yet.
+**Next action:** owner review of the decisions, then wave 1 of the backlog
+(`docs/backlog/README.md`).
+
+## Project documents
+
+| Start here | For |
+|---|---|
+| [docs/architecture/overview.md](docs/architecture/overview.md) | Components, vocabulary, state model, decisions, gates, milestones |
+| [docs/adr/](docs/adr/) | The 18 architecture decision records |
+| [docs/flows/](docs/flows/) | Flow and state diagrams |
+| [docs/journeys/](docs/journeys/) | User journeys with acceptance criteria |
+| [docs/backlog/](docs/backlog/) | Work packages, waves and validation gates |
+| [docs/process/](docs/process/) | How work is built, reviewed and merged by agents |
+| [docs/architecture/open-questions.md](docs/architecture/open-questions.md) | What is still undecided or unverified |
+| [CLAUDE.md](CLAUDE.md) | Rules every agent follows |
+
+The rest of this file is the research summary the decisions were based on.
 
 ## Goal
 
@@ -94,7 +111,8 @@ abraunegg, onedriver and konedrive (GPL-3.0) or rclone and twodrive (MIT) can be
   - Thunar: no emblem function in the public API; menu only.
   - COSMIC Files: static user-configured actions only.
   - yazi: async "fetcher" Lua plugin can show per-file status.
-  - Flea (possible future Omarchy default): plugin API undocumented.
+  - Files / Flea on Omarchy: see the Omarchy section below (supersedes the report, which
+    predates the Files merge).
 - Nextcloud's socket protocol (line-based text over `$XDG_RUNTIME_DIR/<App>/socket`)
   already has `MAKE_AVAILABLE_LOCALLY` / `MAKE_ONLINE_ONLY`, but its status vocabulary
   cannot express online-only vs local vs pinned. Own a richer versioned protocol;
@@ -109,6 +127,34 @@ abraunegg, onedriver and konedrive (GPL-3.0) or rclone and twodrive (MIT) can be
   portals hyprland + gtk. Omarchy's own Nautilus Python extensions live in
   `~/.local/share/nautilus-python/extensions/`. Omarchy apps are Qt Quick, so Qt6/QML is
   the natural settings UI. Keep the tray menu flat.
+
+### Omarchy is replacing Nautilus with Files (checked 2026-11-14)
+
+- DHH merged "Replace Nautilus with Files" (omacom/omarchy PR #18378) into the `quattro`
+  branch on 2026-11-10. Secondary coverage says it ships as the default in Omarchy 4.6;
+  no release date. 4.5.0 (this machine) still has Nautilus.
+- **Files** (`folio`, github.com/omacom/folio, C++/Qt Quick, MIT) is Omarchy's own file
+  manager. Flea was a contender but was not chosen; it stays installable.
+- The migration **removes `nautilus`, `nautilus-python`, `sushi` and LocalSearch**. A
+  Nautilus Python adapter will have no host on stock Omarchy after that. On the plus side,
+  the indexer and Sushi previewer hydration risks go away.
+- Files still makes thumbnails "when a tile needs one" using installed thumbnailers, and
+  Space opens a full preview, so both will hydrate placeholders unless defended against.
+- Files plugin interface v1 (`docs/plugins.md`): a folder with `manifest.json` plus
+  commands in any language that print JSON; Files never loads plugin code. Hooks:
+  - `actions`: right-click entries, limited to paths `under` a folder. Enough for
+    "Always keep on this device" / "Free up space".
+  - `details`: rows in the details pane for one file. Enough to show a file's state.
+  - `poll` / `places`: status word and icon on a sidebar row (min 5 s interval).
+  - `section`, `view`: sidebar section and main-pane view of plugin items.
+  - **No per-file badge or emblem on tiles or list rows.** Open issue #77 asks for a
+    "watch command" so plugins can push changes instead of polling.
+- Flea (github.com/thisisgm/flea, Rust) now has a documented plugin system (`PLUGINS.md`:
+  menu-action, place, rail-section, previewer, send-target, shelf); no per-file badge kind
+  was seen in its headings (not read in full).
+- Consequence: the first Omarchy adapter should be a **Files plugin** (a manifest and
+  small scripts calling this project's CLI), with the Nautilus/Nemo/Caja adapter kept for
+  other distros. Per-file status icons on Omarchy need an upstream change to Files.
 
 ### Microsoft Graph
 
@@ -169,7 +215,8 @@ Four checks, each of which could change the architecture:
 2. Test against a work tenant with unmanaged-device restrictions enabled; observe the Graph
    errors, and how a shortcut stub appears in delta.
 3. Read the FUSE design record in abraunegg PR #3600 and find out why it went on hold.
-4. Ask the Flea author about a per-file status hook.
+4. Ask on omacom/folio for a per-file status hook (badge on tiles and list rows) in the
+   Files plugin interface, and ideally a way for a plugin to supply thumbnails.
 
 ## Proposed build order
 
@@ -178,9 +225,8 @@ Recommended by the research; not yet decided.
 1. Daemon, state store built around mounted drives, and CLI. Prove on the personal drive
    plus one SharePoint library as its own root, under one sign-in.
 2. Stacked FUSE layer, with read-only enforcement for locked libraries.
-3. Nautilus adapter (Python), tray, settings UI.
-4. Shortcuts, site search, adapters for Dolphin, yazi and whatever replaces Nautilus on
-   Omarchy.
+3. Files (`folio`) plugin for Omarchy, tray, settings UI.
+4. Shortcuts, site search, adapters for Nautilus/Nemo/Caja, Dolphin and yazi.
 
 ## Undecided
 
@@ -192,7 +238,7 @@ Recommended by the research; not yet decided.
 
 ## Licence
 
-GPL-3.0 (decided 2026-11-14); see `LICENSE`. This allows reusing code from the other
+GPL-3.0-or-later (decided 2026-11-14; ADR-0002); see `LICENSE`. This allows reusing code from the other
 GPL-3.0 clients surveyed (abraunegg/onedrive, onedriver, konedrive) as well as MIT ones.
 
 ## Caveats on the research

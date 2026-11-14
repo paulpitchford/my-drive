@@ -1,0 +1,5 @@
+# Project-pinned developer tools. Run `mise install` once, then use `just`.
+[tools]
+rust = "1.100.0"
+just = "1.59.0"
+"cargo:cargo-deny" = "0.20.2"
