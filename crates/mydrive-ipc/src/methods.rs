@@ -1477,6 +1477,31 @@ mod tests {
         assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
     }
 
+    /// ADR-0020 R5: the `item.status` path-count limit holds on its own. 10,001 one-byte
+    /// paths take 30,003 bytes, far under the byte limit, so only the count can refuse them.
+    #[test]
+    fn adr_0020_r5_status_path_count_limit_alone() {
+        let at_limit = vec!["/"; MAX_STATUS_PATHS as usize];
+        let over = vec!["/"; MAX_STATUS_PATHS as usize + 1];
+        let over_paths: Vec<ProtocolPath> = over.iter().map(|s| p(s)).collect();
+        assert!(
+            encoded_path_bytes(&over_paths) < MAX_STATUS_PATH_BYTES / 10,
+            "the batch must be well within the byte limit"
+        );
+        let call =
+            MethodCall::parse(method::ITEM_STATUS, Some(&json!({"paths": at_limit}))).unwrap();
+        assert!(matches!(call, MethodCall::ItemStatus(_)));
+        let err =
+            MethodCall::parse(method::ITEM_STATUS, Some(&json!({"paths": over}))).unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
+        assert!(
+            err.message
+                .contains("10001 paths given, the limit is 10000"),
+            "refused by the count, not the bytes: {}",
+            err.message
+        );
+    }
+
     /// A `null` optional field means the same as an absent one, everywhere.
     #[test]
     fn null_optional_fields_mean_absent() {
