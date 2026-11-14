@@ -1,6 +1,6 @@
 # ADR-0019: Protocol version 1 paginates large results and declares which value sets are open
 
-- **Status:** Accepted
+- **Status:** Accepted; R1 replaced, R2 widened and the axes opened by ADR-0020
 - **Date:** 2026-11-14
 - **Depends on gates:** none
 
