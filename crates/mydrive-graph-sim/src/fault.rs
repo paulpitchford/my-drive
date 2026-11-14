@@ -25,6 +25,12 @@ pub enum FaultAction {
         status: StatusCode,
         /// The value of a `Retry-After` header in seconds, if one is sent.
         retry_after: Option<u64>,
+        /// The Graph error `code` in the body. `None` uses the code the simulator uses
+        /// for that status elsewhere (see the README).
+        code: Option<String>,
+        /// The value of a `Location` header, if one is sent. The documented `410 Gone`
+        /// resync responses carry the link to restart from here.
+        location: Option<String>,
     },
     /// Wait this long, then handle the request normally.
     Delay(Duration),
@@ -43,6 +49,8 @@ impl Fault {
         Self::new(FaultAction::Status {
             status,
             retry_after: None,
+            code: None,
+            location: None,
         })
     }
 
@@ -71,6 +79,25 @@ impl Fault {
     pub fn retry_after(mut self, secs: u64) -> Self {
         if let FaultAction::Status { retry_after, .. } = &mut self.action {
             *retry_after = Some(secs);
+        }
+        self
+    }
+
+    /// Sets the Graph error `code` the body carries, for example
+    /// `resyncChangesApplyDifferences`. Has no effect on a fault that is not a status.
+    #[must_use]
+    pub fn code(mut self, value: impl Into<String>) -> Self {
+        if let FaultAction::Status { code, .. } = &mut self.action {
+            *code = Some(value.into());
+        }
+        self
+    }
+
+    /// Adds a `Location: <value>` header. Has no effect on a fault that is not a status.
+    #[must_use]
+    pub fn location(mut self, value: impl Into<String>) -> Self {
+        if let FaultAction::Status { location, .. } = &mut self.action {
+            *location = Some(value.into());
         }
         self
     }
@@ -127,10 +154,33 @@ mod tests {
             status.action(),
             &FaultAction::Status {
                 status: StatusCode::TOO_MANY_REQUESTS,
-                retry_after: Some(7)
+                retry_after: Some(7),
+                code: None,
+                location: None,
             }
         );
         let delay = Fault::delay(Duration::from_secs(1)).retry_after(7);
         assert_eq!(delay.action(), &FaultAction::Delay(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn code_and_location_only_apply_to_status_faults() {
+        let gone = Fault::status(StatusCode::GONE)
+            .code("resyncChangesApplyDifferences")
+            .location("http://127.0.0.1:1/v1.0/drives/d/root/delta?token=x");
+        assert_eq!(
+            gone.action(),
+            &FaultAction::Status {
+                status: StatusCode::GONE,
+                retry_after: None,
+                code: Some("resyncChangesApplyDifferences".to_owned()),
+                location: Some("http://127.0.0.1:1/v1.0/drives/d/root/delta?token=x".to_owned()),
+            }
+        );
+        let truncate = Fault::truncate_body(3).code("x").location("y");
+        assert_eq!(
+            truncate.action(),
+            &FaultAction::TruncateBody { keep_bytes: 3 }
+        );
     }
 }

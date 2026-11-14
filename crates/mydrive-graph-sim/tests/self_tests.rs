@@ -866,6 +866,46 @@ mod self_tests {
         assert!(page["@odata.deltaLink"].is_string());
     }
 
+    /// A status fault can carry a chosen Graph error code and a `Location` header, as the
+    /// documented `410 Gone` resync responses do (WP-008); without them it keeps the
+    /// default code and sends no `Location`.
+    #[tokio::test]
+    async fn status_fault_carries_chosen_code_and_location() {
+        let sim = GraphSim::start().await.unwrap();
+        let drive = sim.add_drive(DriveType::Business).unwrap();
+        let restart = format!("{}?token=sim0", delta_url(&sim, &drive));
+        sim.push_fault(
+            Fault::status(StatusCode::GONE)
+                .code("resyncChangesUploadDifferences")
+                .location(restart.clone())
+                .on_path("/root/delta"),
+        );
+        sim.push_fault(Fault::status(StatusCode::GONE).on_path("/root/delta"));
+
+        let gone = client()
+            .get(delta_url(&sim, &drive))
+            .bearer_auth(sim.token())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::GONE);
+        assert_eq!(gone.headers()["location"], restart.as_str());
+        let body: Value = serde_json::from_slice(&gone.bytes().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "resyncChangesUploadDifferences");
+
+        let plain = client()
+            .get(delta_url(&sim, &drive))
+            .bearer_auth(sim.token())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plain.status(), StatusCode::GONE);
+        assert!(plain.headers().get("location").is_none());
+        let body: Value = serde_json::from_slice(&plain.bytes().await.unwrap()).unwrap();
+        assert_eq!(body["error"]["code"], "generalException");
+        assert_eq!(sim.pending_faults(), 0);
+    }
+
     /// A truncated body announces the full length and stops early; the client sees an error
     /// reading the body, and the next request is whole.
     #[tokio::test]

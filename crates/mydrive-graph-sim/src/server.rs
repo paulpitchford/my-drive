@@ -125,12 +125,29 @@ async fn apply_fault(AxState((shared, _)): AxState<Ctx>, req: Request, next: Nex
         FaultAction::Status {
             status,
             retry_after,
+            code,
+            location,
         } => {
-            let mut response = graph_error(status, default_code(status), "Scripted fault.");
+            let code = code.as_deref().unwrap_or_else(|| default_code(status));
+            let mut response = graph_error(status, code, "Scripted fault.");
             if let Some(secs) = retry_after {
                 response
                     .headers_mut()
                     .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+            }
+            if let Some(location) = location {
+                match HeaderValue::from_str(&location) {
+                    Ok(value) => {
+                        response.headers_mut().insert(header::LOCATION, value);
+                    }
+                    Err(_) => {
+                        return graph_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "generalException",
+                            "The scripted fault's Location is not a valid header value.",
+                        );
+                    }
+                }
             }
             response
         }

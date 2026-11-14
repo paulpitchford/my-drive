@@ -25,6 +25,7 @@ zbus = { workspace = true, features = ["tokio"] }
 
 [dev-dependencies]
 axum.workspace = true
+mydrive-graph-sim.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 zbus = { workspace = true, features = ["tokio", "p2p"] }
 
