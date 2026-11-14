@@ -6,8 +6,12 @@
 - **Depends on:** WP-001, WP-007, WP-009
 - **Gates:** —
 - **Owned paths:** `crates/mydrive-graph/src/client/**`, `crates/mydrive-graph/src/model/**`,
-  `crates/mydrive-graph/src/lib.rs`, `crates/mydrive-graph/Cargo.toml`,
-  `crates/mydrive-graph/tests/client_*.rs`
+  `crates/mydrive-graph/src/lib.rs` (module declarations and re-exports only),
+  `crates/mydrive-graph/Cargo.toml`, `crates/mydrive-graph/tests/client_*.rs`; and in the
+  simulator, only what the fault extension below needs: `crates/mydrive-graph-sim/src/fault.rs`,
+  the lines of `server.rs`/`json.rs` that build a fault's response, its self-test and README
+  row. `Cargo.lock` as a result of this crate's dependencies. Not `src/auth/**` (WP-013
+  works there in parallel).
 - **ADRs:** ADR-0011, ADR-0010
 - **Flows / journeys:** F02, F03, F05, F10
 
@@ -18,7 +22,12 @@ the engine never handles raw HTTP and cannot forget a rule.
 
 ## In scope
 
-- A client with an injectable base URL and an injectable token provider (trait from WP-009).
+- A client with an injectable base URL and an injectable token provider: the existing
+  `auth::TokenProvider` trait (`access_token()` and `force_refresh(rejected)`).
+- A small additive extension to the simulator's scripted faults, needed to test error
+  mapping: a status fault may carry a chosen Graph error `code` string and an optional
+  `Location` header (the documented `410 Gone` resync responses carry both). Default
+  behaviour of existing faults is unchanged.
 - Response types for drive, drive item and delta page that tolerate what real responses omit:
   no cTag on business drives, missing hashes, the `deleted` facet, `remoteItem`, the root
   item. Drive IDs are normalised through `DriveId` at this boundary.
@@ -48,11 +57,20 @@ the engine never handles raw HTTP and cannot forget a rule.
   (asserted from the simulator's request log); in direct mode it is sent.
 - AC4: A 429 or 503 with `Retry-After` maps to the throttled error carrying that duration;
   the client itself does not retry.
-- AC5: A 401 causes exactly one token refresh through the provider and one retry; a second
-  401 is returned as unauthorised.
+- AC5: A 401 causes exactly one `force_refresh` of the rejected token through the provider
+  and one retry; a second 401 is returned as unauthorised. A provider error (needs sign-in,
+  transient, closed) is returned as its own typed error, never retried in a loop.
 - AC6: A truncated body is reported as an error, never as a short successful read.
 - AC7: Tokens and pre-authenticated URLs never appear in `Debug` output or log events.
-- AC8: Both `410` resync variants map to distinct error values.
+- AC8: Both documented `410` resync variants (`resyncChangesApplyDifferences` and
+  `resyncChangesUploadDifferences`) map to distinct error values carrying the restart link
+  from the `Location` header when present; an unknown 410 code maps to a third, conservative
+  value.
+- AC9: Item IDs are kept exactly as received (no case folding); drive IDs go through
+  `DriveId`. A response whose JSON has unknown fields or lacks optional ones still parses.
+- AC10: Every simulator switch that changes a response shape the client reads is exercised:
+  both download modes, `Range` honoured and ignored, both folder-delete modes, both repeat
+  modes, hashes present and absent, `parentReference.path` present and absent.
 
 ## Required tests
 
@@ -61,7 +79,9 @@ the engine never handles raw HTTP and cannot forget a rule.
 
 ## Notes
 
-WP-009 creates this crate's `lib.rs` and manifest in wave 2; this WP owns them in wave 3.
+The crate already contains sign-in (`src/auth/`, WP-009). Add the client beside it; do not
+change `src/auth/`. The simulator's README lists every switch and what is not simulated yet
+(upload, throttling model, sharing links are M1): do not build client features for those.
 
 ## Open questions
 
