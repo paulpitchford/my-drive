@@ -8,6 +8,9 @@
 //! `docs/architecture/overview.md` ("Wire forms"). [`Display`](fmt::Display),
 //! [`FromStr`] and `serde` all use that one form, generated from a single table per enum, so
 //! they cannot drift apart.
+//!
+//! [`Sync`] shadows the standard `Sync` trait: a module that glob-imports `state::*` gets an
+//! ambiguous-name error and must import `Sync` explicitly (or use the path `state::Sync`).
 
 use std::fmt;
 use std::str::FromStr;
@@ -225,13 +228,31 @@ where
         .unwrap_or(EffectivePin::Unpinned)
 }
 
+/// The pin that governs an item, given its own pin and a caller-supplied effective pin.
+///
+/// An explicit own pin (`Pinned` or `Unpinned`) always wins, as in ADR-0008 R4, so a stale or
+/// wrong `supplied` value can never make a pinned item look unpinned. `supplied` is used only
+/// when the item's own pin is `Inherit`.
+const fn governing_pin(own: Pin, supplied: EffectivePin) -> EffectivePin {
+    match own {
+        Pin::Pinned => EffectivePin::Pinned,
+        Pin::Unpinned => EffectivePin::Unpinned,
+        Pin::Inherit => supplied,
+    }
+}
+
 /// Derives the display status from an item's axes and its resolved pin (ADR-0008 R2).
 ///
 /// This is the only function that derives a display status. The priority order is the
 /// overview's table, first match wins: `blocked`, `error`, `syncing`, `pinned`, `local`,
-/// `online-only`. The item's own `state.pin` is ignored; `effective` is what counts.
+/// `online-only`.
+///
+/// `effective` is the pin resolved by [`effective_pin`]. It is used only when `state.pin` is
+/// `Inherit`; an explicit own pin (`Pinned` or `Unpinned`) overrides it, because the item's
+/// own pin always wins (ADR-0008 R4) and a contradictory caller value must not hide a pin.
 #[must_use]
 pub const fn display_status(state: &ItemState, effective: EffectivePin) -> DisplayStatus {
+    let effective = governing_pin(state.pin, effective);
     match (state.sync, effective, state.hydration) {
         (Sync::Blocked, _, _) => DisplayStatus::Blocked,
         (Sync::Error | Sync::Conflict, _, _) => DisplayStatus::Error,
@@ -264,6 +285,10 @@ pub enum DehydrateRefusal {
 /// F06 refuses a non-`InSync` "Free up space" before it changes the pin. This function only
 /// decides; it changes no state.
 ///
+/// `effective` is the pin resolved by [`effective_pin`]. It is used only when `state.pin` is
+/// `Inherit`; an explicit own pin overrides it (ADR-0008 R4), so an item whose own pin is
+/// `Pinned` is refused even if a stale or buggy caller passes `EffectivePin::Unpinned`.
+///
 /// # Errors
 ///
 /// Returns the [`DehydrateRefusal`] naming why the item must not be dehydrated.
@@ -271,7 +296,7 @@ pub const fn check_dehydrate(
     state: &ItemState,
     effective: EffectivePin,
 ) -> Result<(), DehydrateRefusal> {
-    match (state.sync, effective) {
+    match (state.sync, governing_pin(state.pin, effective)) {
         (Sync::InSync, EffectivePin::Unpinned) => Ok(()),
         (Sync::InSync, EffectivePin::Pinned) => Err(DehydrateRefusal::Pinned),
         (other, _) => Err(DehydrateRefusal::NotInSync(other)),
@@ -366,15 +391,43 @@ mod tests {
         );
 
         for (h, e, s, expected) in table {
-            // The item's own pin must not affect the result; only the effective pin does.
-            for &own in Pin::ALL {
-                assert_eq!(
-                    display_status(&state(h, own, s), e),
-                    expected,
-                    "hydration={h} effective={e} sync={s} own-pin={own}"
-                );
-            }
+            // Own pin `Inherit`: the supplied effective pin decides.
+            assert_eq!(
+                display_status(&state(h, Pin::Inherit, s), e),
+                expected,
+                "hydration={h} effective={e} sync={s} own-pin=inherit"
+            );
+            // Own pin explicit and consistent with the effective pin: same result.
+            let own = match e {
+                E::Pinned => Pin::Pinned,
+                E::Unpinned => Pin::Unpinned,
+            };
+            assert_eq!(
+                display_status(&state(h, own, s), e),
+                expected,
+                "hydration={h} effective={e} sync={s} own-pin={own}"
+            );
         }
+    }
+
+    /// ADR-0008 R4: an explicit own pin wins over a contradictory supplied effective pin, so a
+    /// stale caller cannot make a pinned item display as `local` (or an unpinned one as
+    /// `pinned`).
+    #[test]
+    fn display_status_own_pin_overrides_contradictory_effective_pin() {
+        assert_eq!(
+            display_status(&state(H::Full, Pin::Pinned, S::InSync), E::Unpinned),
+            D::Pinned
+        );
+        assert_eq!(
+            display_status(&state(H::Full, Pin::Unpinned, S::InSync), E::Pinned),
+            D::Local
+        );
+        // Sync still takes priority over the pin.
+        assert_eq!(
+            display_status(&state(H::Full, Pin::Pinned, S::Uploading), E::Unpinned),
+            D::Syncing
+        );
     }
 
     /// The worked examples in F13, as a second, independently written check.
@@ -474,7 +527,13 @@ mod tests {
                 for &s in Sync::ALL {
                     for &e in EffectivePin::ALL {
                         let got = check_dehydrate(&state(h, own, s), e);
-                        let expected = match (s, e) {
+                        // Own explicit pin wins; the supplied value counts only for Inherit.
+                        let governing = match own {
+                            Pin::Pinned => E::Pinned,
+                            Pin::Unpinned => E::Unpinned,
+                            Pin::Inherit => e,
+                        };
+                        let expected = match (s, governing) {
                             (S::InSync, E::Unpinned) => Ok(()),
                             (S::InSync, E::Pinned) => Err(DehydrateRefusal::Pinned),
                             (other, _) => Err(DehydrateRefusal::NotInSync(other)),
@@ -493,6 +552,30 @@ mod tests {
             check_dehydrate(&state(H::Full, Pin::Inherit, S::Error), E::Unpinned)
                 .map_err(|r| r.to_string()),
             Err("dehydrate refused: sync state is error, not in-sync".to_owned())
+        );
+    }
+
+    /// ADR-0008 R4, R5: an item whose own pin is `Pinned` is refused dehydration even when a
+    /// stale or buggy caller passes `EffectivePin::Unpinned`; an own `Unpinned` is allowed
+    /// even if `Pinned` is passed, because the own pin wins.
+    #[test]
+    fn dehydrate_own_pin_overrides_contradictory_effective_pin() {
+        for &h in Hydration::ALL {
+            assert_eq!(
+                check_dehydrate(&state(h, Pin::Pinned, S::InSync), E::Unpinned),
+                Err(DehydrateRefusal::Pinned),
+                "hydration={h}"
+            );
+            assert_eq!(
+                check_dehydrate(&state(h, Pin::Unpinned, S::InSync), E::Pinned),
+                Ok(()),
+                "hydration={h}"
+            );
+        }
+        // Not in sync still takes precedence.
+        assert_eq!(
+            check_dehydrate(&state(H::Full, Pin::Pinned, S::PendingUpload), E::Unpinned),
+            Err(DehydrateRefusal::NotInSync(S::PendingUpload))
         );
     }
 
