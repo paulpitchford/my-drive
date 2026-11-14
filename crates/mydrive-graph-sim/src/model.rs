@@ -62,38 +62,65 @@ pub enum RangeMode {
     Ignored,
 }
 
-/// How often an item changed several times since a token appears in the delta feed.
+/// How an item changed several times since a delta token appears in the feed.
+///
+/// Graph documents both that "the delta feed shows the latest state for each item, not
+/// each change" and that "the same item may appear more than once in a delta feed ... use
+/// the last occurrence". When and how often repeats happen is not documented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeltaRepeats {
-    /// Once per change, each time showing its state when the page is served. This is the
-    /// "same item may appear more than once" case that clients must handle.
+    /// Once per change since the token, each occurrence showing the item's state when its
+    /// page is served. Deliberately harsher than Graph usually is, to exercise a client's
+    /// last-occurrence rule (ADR-0011 R2).
     EveryChange,
-    /// Once, at the position of its latest change.
-    LastChangeOnly,
+    /// Once, at the position of its latest change: the "latest state for each item" model.
+    LatestStateOnce,
+}
+
+/// What delta reports when a folder with contents is deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FolderDeletes {
+    /// Only the folder appears with the `deleted` facet; the client must work out that
+    /// everything below it is gone.
+    FolderOnly,
+    /// The folder and then every descendant appear with the `deleted` facet.
+    EveryDescendant,
 }
 
 /// Per-drive behaviour switches. Set them with `GraphSim::add_drive_with` or
 /// `GraphSim::set_options`.
+///
+/// Each default is what Microsoft documents. Where the documentation is silent or the
+/// behaviour is unverified, the default is the case that is harder for a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveOptions {
-    /// How content is downloaded. Default: [`DownloadMode::Redirect`].
+    /// How content is downloaded. Default [`DownloadMode::Redirect`], as documented today.
     pub download: DownloadMode,
-    /// What happens to `Range`. Default: [`RangeMode::Honoured`].
+    /// What happens to `Range`. Default [`RangeMode::Honoured`], the documented normal case.
     pub range: RangeMode,
-    /// Items per delta page; 0 is treated as 1. Default: 200.
+    /// Items per delta page; 0 is treated as 1. Default 200 (not documented for delta;
+    /// the documented children page size).
     pub delta_page_size: usize,
     /// Items per children page when the request has no `$top`; 0 is treated as 1.
-    /// Default: 200, the documented default page size.
+    /// Default 200, the documented default page size.
     pub children_page_size: usize,
-    /// Whether repeated changes repeat in delta. Default: [`DeltaRepeats::EveryChange`].
+    /// Repeats in token-based delta. Default [`DeltaRepeats::EveryChange`], the harder
+    /// case. A token-less enumeration always shows each item's current state once.
     pub delta_repeats: DeltaRepeats,
-    /// Whether `parentReference.path` is included in get-item and list-children
-    /// responses, as real Graph does. Delta never includes it. Default: `false`.
+    /// What a folder delete reports. Unverified; default [`FolderDeletes::FolderOnly`],
+    /// the harder case.
+    pub folder_deletes: FolderDeletes,
+    /// Whether get-item and list-children include `parentReference.path`. Default `true`,
+    /// as Graph does; delta never includes it.
     pub parent_path_outside_delta: bool,
+    /// Whether personal-drive folders carry a cTag. Default `false`: the driveItem
+    /// resource says cTag "isn't returned if the item is a folder".
+    pub personal_folder_ctag: bool,
     /// Whether content responses carry the item's eTag in an `ETag` header. Unverified
-    /// (gate G1); default `false`.
+    /// (gate G1); default `false`, the harder case.
     pub content_etag_header: bool,
-    /// Whether zero-byte files report a quickXorHash. Unverified; default `true`.
+    /// Whether zero-byte files report a quickXorHash. Unverified; default `false`, the
+    /// harder case.
     pub hash_empty_files: bool,
 }
 
@@ -105,9 +132,11 @@ impl Default for DriveOptions {
             delta_page_size: 200,
             children_page_size: 200,
             delta_repeats: DeltaRepeats::EveryChange,
-            parent_path_outside_delta: false,
+            folder_deletes: FolderDeletes::FolderOnly,
+            parent_path_outside_delta: true,
+            personal_folder_ctag: false,
             content_etag_header: false,
-            hash_empty_files: true,
+            hash_empty_files: false,
         }
     }
 }
@@ -128,6 +157,8 @@ pub(crate) struct Item {
     pub(crate) kind: ItemKind,
     pub(crate) created: i64,
     pub(crate) modified: i64,
+    /// A file's length, or the total of a folder's live contents.
+    pub(crate) size: u64,
     /// Bumped on every change; the number in the eTag.
     pub(crate) etag_version: u64,
     /// Bumped on content changes; the number in the cTag.
@@ -153,12 +184,23 @@ impl Item {
     }
 }
 
+/// Where a delta enumeration has got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeltaCursor {
+    /// Changes up to and including this sequence number have been served.
+    pub(crate) after: u64,
+    /// For a token-less enumeration, the end of the change log when it started. Changes
+    /// up to here are served as the current state of each live item, once; later ones as
+    /// ordinary changes.
+    pub(crate) snapshot: Option<u64>,
+}
+
 /// A page of delta results, as item IDs in feed order.
 #[derive(Debug)]
 pub(crate) struct DeltaPage {
     pub(crate) items: Vec<ItemId>,
-    /// The change sequence the next request continues after.
-    pub(crate) resume_after: u64,
+    /// Where the next page continues.
+    pub(crate) next: DeltaCursor,
     /// Whether this is the last page (it then carries a deltaLink).
     pub(crate) last: bool,
 }
@@ -172,6 +214,8 @@ pub(crate) struct Drive {
     pub(crate) options: DriveOptions,
     pub(crate) root: ItemId,
     pub(crate) items: HashMap<ItemId, Item>,
+    /// Live children of each live folder.
+    children: HashMap<ItemId, HashSet<ItemId>>,
     /// Every change, in order: (sequence number, item).
     changes: Vec<(u64, ItemId)>,
     seq: u64,
@@ -203,6 +247,7 @@ impl Drive {
             drive_type,
             options,
             items: HashMap::new(),
+            children: HashMap::new(),
             changes: Vec::new(),
             seq: 0,
             next_item: 0,
@@ -235,22 +280,55 @@ impl Drive {
         now: i64,
     ) -> Result<ItemId, SimError> {
         let (id, guid) = self.new_item_id()?;
+        let size = match &kind {
+            ItemKind::File { content, .. } => content.len() as u64,
+            ItemKind::Folder => 0,
+        };
         let item = Item {
             id: id.clone(),
             name,
-            parent,
+            parent: parent.clone(),
             kind,
             created: now,
             modified: now,
+            size,
             etag_version: 1,
             ctag_version: 1,
             guid,
             deleted: false,
             last_seq: 0,
         };
+        if item.is_folder() {
+            self.children.insert(id.clone(), HashSet::new());
+        }
         self.items.insert(id.clone(), item);
+        if let Some(parent) = &parent {
+            self.children
+                .entry(parent.clone())
+                .or_default()
+                .insert(id.clone());
+            self.adjust_sizes(parent, size, true);
+        }
         self.record(&id);
         Ok(id)
+    }
+
+    /// Adds `amount` to (or takes it from) the size of `folder` and each of its ancestors.
+    fn adjust_sizes(&mut self, folder: &ItemId, amount: u64, add: bool) {
+        let mut cursor = Some(folder.clone());
+        while let Some(id) = cursor {
+            cursor = match self.items.get_mut(&id) {
+                Some(item) => {
+                    item.size = if add {
+                        item.size.saturating_add(amount)
+                    } else {
+                        item.size.saturating_sub(amount)
+                    };
+                    item.parent.clone()
+                }
+                None => None,
+            };
+        }
     }
 
     fn record(&mut self, id: &ItemId) {
@@ -285,32 +363,22 @@ impl Drive {
         }
     }
 
+    /// How many live children `folder` has.
+    pub(crate) fn child_count(&self, folder: &ItemId) -> usize {
+        self.children.get(folder).map_or(0, HashSet::len)
+    }
+
     /// Live children of `folder`, sorted by name without regard to case, then by ID.
     pub(crate) fn children(&self, folder: &ItemId) -> Vec<&Item> {
         let mut children: Vec<&Item> = self
-            .items
-            .values()
-            .filter(|item| !item.deleted && item.parent.as_ref() == Some(folder))
+            .children
+            .get(folder)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.items.get(id))
             .collect();
-        children.sort_by(|a, b| {
-            a.name
-                .to_lowercase()
-                .cmp(&b.name.to_lowercase())
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        children.sort_by_cached_key(|item| (item.name.to_lowercase(), item.id.clone()));
         children
-    }
-
-    /// Total size of a live item: a file's length, or the sum over a folder's descendants.
-    pub(crate) fn size(&self, item: &Item) -> u64 {
-        match &item.kind {
-            ItemKind::File { content, .. } => content.len() as u64,
-            ItemKind::Folder => self
-                .children(&item.id)
-                .into_iter()
-                .map(|child| self.size(child))
-                .sum(),
-        }
     }
 
     /// Names of the ancestors of `item` below the root, outermost first.
@@ -344,9 +412,13 @@ impl Drive {
         // OneDrive's namespace is case-insensitive (rclone docs, research section 4).
         let lower = name.to_lowercase();
         let clash = self
-            .children(parent)
+            .children
+            .get(parent)
             .into_iter()
-            .any(|child| Some(&child.id) != except && child.name.to_lowercase() == lower);
+            .flatten()
+            .filter(|id| Some(*id) != except)
+            .filter_map(|id| self.items.get(id))
+            .any(|child| child.name.to_lowercase() == lower);
         if clash {
             return Err(SimError::NameConflict {
                 drive: self.id.clone(),
@@ -389,18 +461,26 @@ impl Drive {
     }
 
     fn modify_file(&mut self, id: &ItemId, content: Bytes, now: i64) -> Result<(), SimError> {
-        if self.live(id)?.is_folder() {
+        let item = self.live(id)?;
+        if item.is_folder() {
             return Err(SimError::NotAFile {
                 drive: self.id.clone(),
                 item: id.clone(),
             });
         }
+        let (old_size, parent) = (item.size, item.parent.clone());
+        let new_size = content.len() as u64;
         let kind = Self::file_kind(content);
         if let Some(item) = self.items.get_mut(id) {
             item.kind = kind;
+            item.size = new_size;
             item.modified = now;
             item.etag_version += 1;
             item.ctag_version += 1;
+        }
+        if let Some(parent) = &parent {
+            self.adjust_sizes(parent, old_size, false);
+            self.adjust_sizes(parent, new_size, true);
         }
         self.record(id);
         Ok(())
@@ -422,7 +502,8 @@ impl Drive {
 
     fn move_to(&mut self, id: &ItemId, new_parent: &ItemId) -> Result<(), SimError> {
         self.not_root(id)?;
-        let name = self.live(id)?.name.clone();
+        let item = self.live(id)?;
+        let (name, size, old_parent) = (item.name.clone(), item.size, item.parent.clone());
         self.live_folder(new_parent)?;
         // A folder cannot move into itself or below itself.
         let mut cursor = Some(new_parent.clone());
@@ -439,6 +520,17 @@ impl Drive {
                 .and_then(|item| item.parent.clone());
         }
         self.check_name(new_parent, &name, Some(id))?;
+        if let Some(old) = &old_parent {
+            if let Some(siblings) = self.children.get_mut(old) {
+                siblings.remove(id);
+            }
+            self.adjust_sizes(old, size, false);
+        }
+        self.children
+            .entry(new_parent.clone())
+            .or_default()
+            .insert(id.clone());
+        self.adjust_sizes(new_parent, size, true);
         if let Some(item) = self.items.get_mut(id) {
             item.parent = Some(new_parent.clone());
             item.etag_version += 1;
@@ -447,16 +539,20 @@ impl Drive {
         Ok(())
     }
 
-    /// Deletes an item and everything below it. The item's change comes first in the feed
-    /// and its descendants' after it, so a client that removes a folder only once it is
-    /// empty after the whole feed is applied is exercised.
+    /// Deletes an item and everything below it. Delta reports the item, and its
+    /// descendants after it only under [`FolderDeletes::EveryDescendant`].
     fn delete(&mut self, id: &ItemId) -> Result<(), SimError> {
         self.not_root(id)?;
-        self.live(id)?;
+        let item = self.live(id)?;
+        let (size, parent) = (item.size, item.parent.clone());
         let mut order = Vec::new();
         let mut queue = VecDeque::from([id.clone()]);
         while let Some(current) = queue.pop_front() {
-            queue.extend(self.children(&current).into_iter().map(|c| c.id.clone()));
+            if let Some(children) = self.children.remove(&current) {
+                let mut children: Vec<ItemId> = children.into_iter().collect();
+                children.sort();
+                queue.extend(children);
+            }
             order.push(current);
         }
         for current in &order {
@@ -465,45 +561,88 @@ impl Drive {
                 item.etag_version += 1;
             }
         }
-        for current in &order {
-            self.record(current);
+        if let Some(parent) = &parent {
+            if let Some(siblings) = self.children.get_mut(parent) {
+                siblings.remove(id);
+            }
+            self.adjust_sizes(parent, size, false);
+        }
+        match self.options.folder_deletes {
+            FolderDeletes::FolderOnly => self.record(id),
+            FolderDeletes::EveryDescendant => {
+                for current in &order {
+                    self.record(current);
+                }
+            }
         }
         Ok(())
     }
 
-    /// The next page of changes after sequence number `after`.
-    pub(crate) fn delta_page(&self, after: u64) -> DeltaPage {
+    /// A token-less enumeration starting now.
+    pub(crate) fn initial_cursor(&self) -> DeltaCursor {
+        DeltaCursor {
+            after: 0,
+            snapshot: Some(self.seq),
+        }
+    }
+
+    /// Whether a cursor decoded from a client's link can belong to this drive.
+    pub(crate) fn cursor_is_valid(&self, cursor: DeltaCursor) -> bool {
+        cursor.after <= self.seq && cursor.snapshot.is_none_or(|s| s <= self.seq)
+    }
+
+    /// The next page of the feed from `cursor`.
+    pub(crate) fn delta_page(&self, cursor: DeltaCursor) -> DeltaPage {
         let page_size = self.options.delta_page_size.max(1);
-        let start = self.changes.partition_point(|(seq, _)| *seq <= after);
+        let start = self
+            .changes
+            .partition_point(|(seq, _)| *seq <= cursor.after);
         let mut items = Vec::new();
-        let mut resume_after = after;
+        let mut after = cursor.after;
         for (seq, id) in &self.changes[start..] {
             if items.len() == page_size {
                 return DeltaPage {
                     items,
-                    resume_after,
+                    next: DeltaCursor {
+                        after,
+                        snapshot: cursor.snapshot,
+                    },
                     last: false,
                 };
             }
-            resume_after = *seq;
-            let latest = self.items.get(id).map(|item| item.last_seq);
-            if self.options.delta_repeats == DeltaRepeats::LastChangeOnly && latest != Some(*seq) {
+            after = *seq;
+            let Some(item) = self.items.get(id) else {
                 continue;
+            };
+            let latest = item.last_seq == *seq;
+            let include = match cursor.snapshot {
+                // The current state: each live item once, at its latest change.
+                Some(snapshot) if *seq <= snapshot => latest && !item.deleted,
+                _ => latest || self.options.delta_repeats == DeltaRepeats::EveryChange,
+            };
+            if include {
+                items.push(id.clone());
             }
-            items.push(id.clone());
         }
         DeltaPage {
             items,
-            resume_after: self.seq,
+            next: DeltaCursor {
+                after: self.seq,
+                snapshot: None,
+            },
             last: true,
         }
     }
 
     /// The current end of the change log.
+    #[cfg(test)]
     pub(crate) fn latest_seq(&self) -> u64 {
         self.seq
     }
 }
+
+/// How many pre-authenticated download keys stay valid at once.
+pub(crate) const MAX_DOWNLOAD_KEYS: usize = 1024;
 
 /// Everything one simulator holds.
 #[derive(Debug)]
@@ -515,6 +654,8 @@ pub(crate) struct State {
     pub(crate) faults: VecDeque<Fault>,
     pub(crate) log: Vec<LoggedRequest>,
     download_keys: HashMap<String, (DriveId, ItemId)>,
+    /// Issue order of `download_keys`, oldest first, so the oldest can expire.
+    key_order: VecDeque<String>,
     next_key: u64,
     /// Distinguishes this simulator's pre-authenticated keys from another's.
     key_prefix: String,
@@ -530,6 +671,7 @@ impl State {
             faults: VecDeque::new(),
             log: Vec::new(),
             download_keys: HashMap::new(),
+            key_order: VecDeque::new(),
             next_key: 0,
             key_prefix,
         }
@@ -614,12 +756,19 @@ impl State {
         self.drive_mut(drive)?.delete(item)
     }
 
-    /// Issues a fresh pre-authenticated download key for an item.
+    /// Issues a fresh pre-authenticated download key for an item. Only the newest
+    /// [`MAX_DOWNLOAD_KEYS`] keys stay valid; an older one has expired and gets 401.
     pub(crate) fn issue_download_key(&mut self, drive: &DriveId, item: &ItemId) -> String {
         self.next_key += 1;
         let key = format!("{}{:08x}", self.key_prefix, self.next_key);
         self.download_keys
             .insert(key.clone(), (drive.clone(), item.clone()));
+        self.key_order.push_back(key.clone());
+        while self.key_order.len() > MAX_DOWNLOAD_KEYS {
+            if let Some(oldest) = self.key_order.pop_front() {
+                self.download_keys.remove(&oldest);
+            }
+        }
         key
     }
 
@@ -694,18 +843,59 @@ mod tests {
     }
 
     #[test]
-    fn last_change_only_skips_earlier_occurrences() {
+    fn sizes_and_child_counts_follow_changes() {
+        let mut d = drive(DriveOptions::default());
+        let root = d.root.clone();
+        let a = d.create(&root, "a", ItemKind::Folder, START_SECS).unwrap();
+        let b = d.create(&root, "b", ItemKind::Folder, START_SECS).unwrap();
+        let five = Drive::file_kind(Bytes::from_static(b"12345"));
+        let f = d.create(&a, "f", five, START_SECS).unwrap();
+        let size = |d: &Drive, id: &ItemId| d.live(id).unwrap().size;
+        assert_eq!((size(&d, &root), size(&d, &a), size(&d, &b)), (5, 5, 0));
+        d.modify_file(&f, Bytes::from_static(b"12"), START_SECS)
+            .unwrap();
+        assert_eq!((size(&d, &root), size(&d, &a)), (2, 2));
+        d.move_to(&f, &b).unwrap();
+        assert_eq!((size(&d, &root), size(&d, &a), size(&d, &b)), (2, 0, 2));
+        assert_eq!((d.child_count(&a), d.child_count(&b)), (0, 1));
+        d.delete(&b).unwrap();
+        assert_eq!((size(&d, &root), d.child_count(&root)), (0, 1));
+        assert!(d.live(&f).is_err());
+    }
+
+    #[test]
+    fn download_keys_are_bounded() {
+        let mut state = State::new("k".to_owned());
+        let drive = state
+            .add_drive(DriveType::Personal, DriveOptions::default())
+            .unwrap();
+        let root = state.drive(&drive).unwrap().root.clone();
+        let first = state.issue_download_key(&drive, &root);
+        for _ in 0..MAX_DOWNLOAD_KEYS {
+            state.issue_download_key(&drive, &root);
+        }
+        assert!(state.resolve_download_key(&first).is_none());
+        assert_eq!(state.download_keys.len(), MAX_DOWNLOAD_KEYS);
+    }
+
+    #[test]
+    fn latest_state_once_skips_earlier_occurrences() {
         let mut d = drive(DriveOptions {
-            delta_repeats: DeltaRepeats::LastChangeOnly,
+            delta_repeats: DeltaRepeats::LatestStateOnce,
             ..DriveOptions::default()
         });
         let root = d.root.clone();
         let file = d
             .create(&root, "a", Drive::file_kind(Bytes::new()), START_SECS)
             .unwrap();
+        let after = d.latest_seq();
         d.rename(&file, "b").unwrap();
-        let page = d.delta_page(0);
+        d.rename(&file, "c").unwrap();
+        let page = d.delta_page(DeltaCursor {
+            after,
+            snapshot: None,
+        });
         assert!(page.last);
-        assert_eq!(page.items, vec![root, file]);
+        assert_eq!(page.items, vec![file]);
     }
 }

@@ -51,7 +51,7 @@ pub use axum::http::{Method, StatusCode};
 pub use error::SimError;
 pub use fault::{Fault, FaultAction};
 pub use log::{LOGGED_HEADERS, LoggedRequest, Origin};
-pub use model::{DeltaRepeats, DownloadMode, DriveOptions, DriveType, RangeMode};
+pub use model::{DeltaRepeats, DownloadMode, DriveOptions, DriveType, FolderDeletes, RangeMode};
 
 use conn::{ConnTap, TapListener};
 use model::State;
@@ -290,8 +290,9 @@ impl GraphSim {
         self.shared.lock().move_to(drive, item, new_parent)
     }
 
-    /// Deletes an item and everything below it. Each appears in delta with the `deleted`
-    /// facet, the item first.
+    /// Deletes an item and everything below it. The item appears in delta with the
+    /// `deleted` facet; its descendants follow it only under
+    /// [`FolderDeletes::EveryDescendant`].
     ///
     /// # Errors
     ///

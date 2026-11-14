@@ -17,7 +17,7 @@ use crate::conn::ConnTap;
 use crate::fault::FaultAction;
 use crate::json::{View, drive_json, error_json, item_json, percent_encode};
 use crate::log::{LOGGED_HEADERS, LoggedRequest, Origin};
-use crate::model::{DownloadMode, Drive, DriveOptions, ItemKind, RangeMode, State};
+use crate::model::{DeltaCursor, DownloadMode, Drive, DriveOptions, ItemKind, RangeMode, State};
 
 /// State shared by the handlers and the control API.
 #[derive(Debug)]
@@ -383,13 +383,25 @@ fn children_page(
     ok_json(body)
 }
 
-/// Delta tokens: `sim` and the change sequence number in hex. Opaque to clients.
-fn encode_token(seq: u64) -> String {
-    format!("sim{seq:x}")
+/// Delta tokens: `sim`, the change sequence number in hex, and for a token-less
+/// enumeration still in progress `-` and its snapshot point. Opaque to clients.
+fn encode_token(cursor: DeltaCursor) -> String {
+    match cursor.snapshot {
+        Some(snapshot) => format!("sim{:x}-{snapshot:x}", cursor.after),
+        None => format!("sim{:x}", cursor.after),
+    }
 }
 
-fn decode_token(token: &str) -> Option<u64> {
-    u64::from_str_radix(token.strip_prefix("sim")?, 16).ok()
+fn decode_token(token: &str) -> Option<DeltaCursor> {
+    let rest = token.strip_prefix("sim")?;
+    let (after, snapshot) = match rest.split_once('-') {
+        Some((after, snapshot)) => (after, Some(u64::from_str_radix(snapshot, 16).ok()?)),
+        None => (rest, None),
+    };
+    Some(DeltaCursor {
+        after: u64::from_str_radix(after, 16).ok()?,
+        snapshot,
+    })
 }
 
 async fn delta(
@@ -401,14 +413,15 @@ async fn delta(
     let Some(d) = find_drive(&state, &drive) else {
         return not_found();
     };
-    let after = match query.get("token") {
-        None => 0,
+    // No token: "enumerates the hierarchy's current state" (delta, parameters).
+    let cursor = match query.get("token") {
+        None => d.initial_cursor(),
         Some(token) => match decode_token(token) {
-            Some(seq) if seq <= d.latest_seq() => seq,
+            Some(cursor) if d.cursor_is_valid(cursor) => cursor,
             _ => return bad_request("Invalid delta token."),
         },
     };
-    let page = d.delta_page(after);
+    let page = d.delta_page(cursor);
     let value: Vec<Value> = page
         .items
         .iter()
@@ -419,7 +432,7 @@ async fn delta(
         "{}/drives/{}/root/delta?token={}",
         shared.graph_base,
         percent_encode(d.id.as_str()),
-        encode_token(page.resume_after)
+        encode_token(page.next)
     );
     let key = if page.last {
         "@odata.deltaLink"
@@ -659,8 +672,23 @@ mod tests {
 
     #[test]
     fn delta_tokens_round_trip() {
-        assert_eq!(decode_token(&encode_token(0)), Some(0));
-        assert_eq!(decode_token(&encode_token(12_345)), Some(12_345));
+        for cursor in [
+            DeltaCursor {
+                after: 0,
+                snapshot: None,
+            },
+            DeltaCursor {
+                after: 12_345,
+                snapshot: None,
+            },
+            DeltaCursor {
+                after: 3,
+                snapshot: Some(9),
+            },
+        ] {
+            assert_eq!(decode_token(&encode_token(cursor)), Some(cursor));
+        }
         assert_eq!(decode_token("garbage"), None);
+        assert_eq!(decode_token("sim1-x"), None);
     }
 }

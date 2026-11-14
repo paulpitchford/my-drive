@@ -19,10 +19,7 @@ pub(crate) enum View {
 
 /// A drive resource, as `GET /drives/{id}` returns it.
 pub(crate) fn drive_json(drive: &Drive) -> Value {
-    let used: u64 = drive
-        .items
-        .get(&drive.root)
-        .map_or(0, |root| drive.size(root));
+    let used: u64 = drive.items.get(&drive.root).map_or(0, |root| root.size);
     let total: u64 = 1 << 40;
     json!({
         "id": drive.id.as_str(),
@@ -59,13 +56,18 @@ pub(crate) fn item_json(
     out.insert("id".into(), json!(item.id.as_str()));
     out.insert("name".into(), json!(item.name));
     out.insert("eTag".into(), json!(item.etag()));
-    // Delta on OneDrive for Business omits cTag on create and modify (delta, "properties
-    // omitted"); business folders never carry one (driveItem resource).
-    let ctag = personal || (view == View::Item && !item.is_folder());
+    // The driveItem resource: cTag "isn't returned if the item is a folder" (personal
+    // folders have a switch). Delta on OneDrive for Business omits cTag on create and
+    // modify (delta, "properties omitted").
+    let ctag = if item.is_folder() {
+        personal && drive.options.personal_folder_ctag
+    } else {
+        personal || view == View::Item
+    };
     if ctag {
         out.insert("cTag".into(), json!(item.ctag()));
     }
-    out.insert("size".into(), json!(drive.size(item)));
+    out.insert("size".into(), json!(item.size));
     let created = format_timestamp(item.created);
     let modified = format_timestamp(item.modified);
     out.insert("createdDateTime".into(), json!(created));
@@ -84,7 +86,7 @@ pub(crate) fn item_json(
     );
     match &item.kind {
         ItemKind::Folder => {
-            let child_count = drive.children(&item.id).len();
+            let child_count = drive.child_count(&item.id);
             out.insert("folder".into(), json!({ "childCount": child_count }));
         }
         ItemKind::File { content, quick_xor } => {
@@ -113,11 +115,7 @@ fn deleted_item_json(drive: &Drive, item: &Item) -> Value {
     if drive.drive_type.is_personal() {
         out.insert("name".into(), json!(item.name));
     } else {
-        let size = match &item.kind {
-            ItemKind::File { content, .. } => content.len() as u64,
-            ItemKind::Folder => 0,
-        };
-        out.insert("size".into(), json!(size));
+        out.insert("size".into(), json!(item.size));
     }
     out.insert(
         "parentReference".into(),

@@ -10,8 +10,8 @@ mod self_tests {
     use std::time::Duration;
 
     use mydrive_graph_sim::{
-        DeltaRepeats, DownloadMode, DriveOptions, DriveType, Fault, GraphSim, Method, Origin,
-        RangeMode, StatusCode,
+        DeltaRepeats, DownloadMode, DriveOptions, DriveType, Fault, FolderDeletes, GraphSim,
+        Method, Origin, RangeMode, StatusCode,
     };
     use reqwest::redirect::Policy;
     use serde_json::Value;
@@ -39,11 +39,15 @@ mod self_tests {
         format!("{}/drives/{drive}/root/delta", sim.base_url())
     }
 
+    /// The most pages any paging loop in these tests follows. A simulator that never ends
+    /// a feed fails the test instead of hanging it.
+    const MAX_PAGES: usize = 1000;
+
     /// Follows nextLinks from `url` to the deltaLink. Returns every page and the deltaLink.
     async fn full_delta(sim: &GraphSim, url: &str) -> (Vec<Value>, String) {
         let mut pages = Vec::new();
         let mut next = url.to_owned();
-        loop {
+        while pages.len() < MAX_PAGES {
             let page = get_json(sim, &next).await;
             let next_link = page["@odata.nextLink"].as_str().map(str::to_owned);
             let delta_link = page["@odata.deltaLink"].as_str().map(str::to_owned);
@@ -56,6 +60,7 @@ mod self_tests {
                 }
             }
         }
+        panic!("delta from {url} did not reach a deltaLink within {MAX_PAGES} pages");
     }
 
     fn items(pages: &[Value]) -> Vec<Value> {
@@ -145,9 +150,68 @@ mod self_tests {
         );
     }
 
-    /// An item changed twice since the token appears twice in one feed (the delta docs' "same
-    /// item may appear more than once"); with `LastChangeOnly` it appears once. Supports
-    /// clients implementing ADR-0011 R2.
+    /// Without a token, delta "enumerates the hierarchy's current state": no deleted items
+    /// and each item once, however often it changed. A change made while the client is still
+    /// paging appears later in the same feed.
+    #[tokio::test]
+    async fn tokenless_delta_enumerates_current_state() {
+        let sim = GraphSim::start().await.unwrap();
+        let drive = sim
+            .add_drive_with(
+                DriveType::Personal,
+                DriveOptions {
+                    delta_page_size: 2,
+                    ..DriveOptions::default()
+                },
+            )
+            .unwrap();
+        let root = sim.root_id(&drive).unwrap();
+        let kept = sim
+            .create_file(&drive, &root, "kept", b"1".to_vec())
+            .unwrap();
+        let gone = sim
+            .create_file(&drive, &root, "gone", b"2".to_vec())
+            .unwrap();
+        sim.modify_file(&drive, &kept, b"11".to_vec()).unwrap();
+        sim.rename(&drive, &kept, "kept2").unwrap();
+        sim.delete(&drive, &gone).unwrap();
+        let other = sim
+            .create_file(&drive, &root, "other", b"3".to_vec())
+            .unwrap();
+
+        let (pages, _) = full_delta(&sim, &delta_url(&sim, &drive)).await;
+        let all = items(&pages);
+        assert!(all.iter().all(|item| item.get("deleted").is_none()));
+        let mut seen = ids(&all);
+        seen.sort();
+        let mut expected = vec![root.to_string(), kept.to_string(), other.to_string()];
+        expected.sort();
+        assert_eq!(seen, expected, "each live item exactly once");
+
+        // A change during paging: the first page is served, then a file changes.
+        let first = get_json(&sim, &delta_url(&sim, &drive)).await;
+        let next = first["@odata.nextLink"].as_str().unwrap().to_owned();
+        let first_ids = ids(first["value"].as_array().unwrap());
+        let changed = if first_ids.contains(&kept.to_string()) {
+            kept.clone()
+        } else {
+            other.clone()
+        };
+        sim.modify_file(&drive, &changed, b"changed while paging".to_vec())
+            .unwrap();
+        let (rest, _) = full_delta(&sim, &next).await;
+        let later = items(&rest);
+        let last = later
+            .iter()
+            .rev()
+            .find(|item| item["id"] == changed.as_str())
+            .unwrap();
+        assert_eq!(last["size"], 20);
+    }
+
+    /// An item changed twice since the token appears twice in one feed under the default
+    /// `EveryChange`, and once under `LatestStateOnce`. Supports clients implementing
+    /// ADR-0011 R2.
     #[tokio::test]
     async fn item_changed_twice_appears_twice_in_one_feed() {
         let sim = GraphSim::start().await.unwrap();
@@ -166,19 +230,60 @@ mod self_tests {
         assert_eq!(changed[1]["name"], "g.txt");
 
         let mut options = sim.options(&drive).unwrap();
-        options.delta_repeats = DeltaRepeats::LastChangeOnly;
+        options.delta_repeats = DeltaRepeats::LatestStateOnce;
         sim.set_options(&drive, options).unwrap();
         let (pages, _) = full_delta(&sim, &link).await;
         assert_eq!(ids(&items(&pages)), vec![file.to_string()]);
     }
 
-    /// AC2: delta for a business drive contains no cTag, and no response has a path in
-    /// `parentReference`.
+    /// A change that lands between two pages makes the first and last occurrence of an item
+    /// differ, so a client that keeps the first occurrence ends up with stale state.
+    /// Supports clients implementing ADR-0011 R2 (last occurrence wins).
     #[tokio::test]
-    async fn ac2_business_delta_has_no_ctag_and_no_response_has_parent_path() {
+    async fn change_between_pages_makes_first_and_last_occurrence_differ() {
+        let sim = GraphSim::start().await.unwrap();
+        let drive = sim
+            .add_drive_with(
+                DriveType::Personal,
+                DriveOptions {
+                    delta_page_size: 1,
+                    ..DriveOptions::default()
+                },
+            )
+            .unwrap();
+        let root = sim.root_id(&drive).unwrap();
+        let x = sim.create_file(&drive, &root, "x", b"v1".to_vec()).unwrap();
+        let y = sim.create_file(&drive, &root, "y", b"y1".to_vec()).unwrap();
+        let (_, link) = full_delta(&sim, &delta_url(&sim, &drive)).await;
+
+        sim.modify_file(&drive, &x, b"v2-".to_vec()).unwrap();
+        sim.modify_file(&drive, &y, b"y2".to_vec()).unwrap();
+        let first = get_json(&sim, &link).await;
+        assert_eq!(first["value"][0]["id"], x.as_str());
+        assert_eq!(first["value"][0]["size"], 3);
+        let next = first["@odata.nextLink"].as_str().unwrap().to_owned();
+
+        sim.modify_file(&drive, &x, b"v3---".to_vec()).unwrap();
+        let (rest, _) = full_delta(&sim, &next).await;
+        let mut feed = first["value"].as_array().unwrap().clone();
+        feed.extend(items(&rest));
+        let of_x: Vec<&Value> = feed.iter().filter(|i| i["id"] == x.as_str()).collect();
+        assert!(of_x.len() >= 2);
+        let first_x = of_x.first().unwrap();
+        let last_x = of_x.last().unwrap();
+        assert_ne!(first_x["size"], last_x["size"]);
+        assert_eq!(last_x["size"], 5);
+        assert_ne!(first_x["file"]["hashes"], last_x["file"]["hashes"]);
+    }
+
+    /// AC2: delta for a business drive contains no cTag, and no delta response has a path
+    /// in `parentReference`. Outside delta the path is present by default, as in Graph.
+    #[tokio::test]
+    async fn ac2_business_delta_has_no_ctag_and_delta_never_has_parent_path() {
         let sim = GraphSim::start().await.unwrap();
         let business = sim.add_drive(DriveType::Business).unwrap();
         let personal = sim.add_drive(DriveType::Personal).unwrap();
+        let mut links = Vec::new();
         for drive in [&business, &personal] {
             let root = sim.root_id(drive).unwrap();
             let folder = sim.create_folder(drive, &root, "Folder").unwrap();
@@ -187,96 +292,98 @@ mod self_tests {
             let gone = sim
                 .create_file(drive, &folder, "gone.bin", vec![2u8; 3])
                 .unwrap();
+            let (pages, link) = full_delta(&sim, &delta_url(&sim, drive)).await;
+            for page in &pages {
+                assert_no_parent_path(page);
+            }
             sim.delete(drive, &gone).unwrap();
+            links.push((pages, link));
         }
 
-        let (pages, _) = full_delta(&sim, &delta_url(&sim, &business)).await;
-        for page in &pages {
+        // Business: no cTag in the enumeration or in the delete; the deleted item omits
+        // cTag and name (delta, "properties omitted").
+        let (pages, link) = &links[0];
+        let enumeration = items(pages);
+        assert!(!enumeration.is_empty());
+        let (changes, _) = full_delta(&sim, link).await;
+        for page in &changes {
             assert_no_parent_path(page);
         }
-        let business_items = items(&pages);
-        assert!(!business_items.is_empty());
-        for item in &business_items {
+        let deleted = items(&changes);
+        for item in enumeration.iter().chain(&deleted) {
             assert!(
                 item.get("cTag").is_none(),
                 "business delta item has cTag: {item}"
             );
         }
-        // A business deleted item omits cTag and name (delta, "properties omitted"). It
-        // appears once for its creation and once for its deletion, both in its latest state.
-        let deleted: Vec<&Value> = business_items
-            .iter()
-            .filter(|i| i.get("deleted").is_some())
-            .collect();
-        assert_eq!(deleted.len(), 2);
-        assert_eq!(deleted[0], deleted[1]);
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0]["deleted"].is_object());
         assert!(deleted[0].get("name").is_none());
         assert_eq!(deleted[0]["size"], 3);
 
-        // Personal delta keeps cTag on live items; its deleted item omits cTag and size.
-        let (pages, _) = full_delta(&sim, &delta_url(&sim, &personal)).await;
-        let personal_items = items(&pages);
-        for page in &pages {
-            assert_no_parent_path(page);
-        }
-        for item in &personal_items {
-            if item.get("deleted").is_some() {
-                assert!(item.get("cTag").is_none() && item.get("size").is_none());
-                assert_eq!(item["name"], "gone.bin");
-            } else {
+        // Personal: files keep cTag in delta; the deleted item omits cTag and size.
+        let (pages, link) = &links[1];
+        for item in items(pages) {
+            if item.get("file").is_some() {
                 assert!(
                     item.get("cTag").is_some(),
-                    "personal delta item lacks cTag: {item}"
+                    "personal file lacks cTag: {item}"
                 );
             }
         }
+        let (changes, _) = full_delta(&sim, link).await;
+        for page in &changes {
+            assert_no_parent_path(page);
+        }
+        let deleted = items(&changes);
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].get("cTag").is_none() && deleted[0].get("size").is_none());
+        assert_eq!(deleted[0]["name"], "gone.bin");
 
-        // Get item and list children carry no path either, by default.
-        for drive in [&business, &personal] {
-            let root = sim.root_id(drive).unwrap();
+        // Outside delta the path is present by default.
+        for (drive, prefix) in [
+            (&business, format!("/drives/{business}/root:")),
+            (&personal, "/drive/root:".to_owned()),
+        ] {
             let base = format!("{}/drives/{drive}", sim.base_url());
-            assert_no_parent_path(&get_json(&sim, &format!("{base}/root")).await);
+            let root_json = get_json(&sim, &format!("{base}/root")).await;
+            assert!(root_json["parentReference"].get("path").is_none());
             let children = get_json(&sim, &format!("{base}/root/children")).await;
-            assert_no_parent_path(&children);
-            let folder = children["value"][0]["id"].as_str().unwrap().to_owned();
-            assert_no_parent_path(&get_json(&sim, &format!("{base}/items/{folder}")).await);
-            assert_no_parent_path(
-                &get_json(&sim, &format!("{base}/items/{folder}/children")).await,
+            let folder = &children["value"][0];
+            assert_eq!(folder["parentReference"]["path"], prefix.as_str());
+            let folder_id = folder["id"].as_str().unwrap();
+            let inner = get_json(&sim, &format!("{base}/items/{folder_id}/children")).await;
+            let file_id = inner["value"][0]["id"].as_str().unwrap();
+            let file = get_json(&sim, &format!("{base}/items/{file_id}")).await;
+            assert_eq!(
+                file["parentReference"]["path"],
+                format!("{prefix}/Folder").as_str()
             );
-            assert_no_parent_path(&get_json(&sim, &format!("{base}/items/{root}")).await);
         }
     }
 
-    /// With `parent_path_outside_delta`, get-item reports the path as real Graph does, and
-    /// delta still never does.
+    /// With `parent_path_outside_delta` off, no response has a path; the path is
+    /// percent-encoded when on.
     #[tokio::test]
-    async fn parent_path_switch_affects_get_item_but_never_delta() {
+    async fn parent_path_switch_off_removes_path_everywhere() {
         let sim = GraphSim::start().await.unwrap();
-        let drive = sim
-            .add_drive_with(
-                DriveType::Personal,
-                DriveOptions {
-                    parent_path_outside_delta: true,
-                    ..DriveOptions::default()
-                },
-            )
-            .unwrap();
+        let drive = sim.add_drive(DriveType::Personal).unwrap();
         let root = sim.root_id(&drive).unwrap();
         let folder = sim.create_folder(&drive, &root, "My Docs").unwrap();
         let file = sim
             .create_file(&drive, &folder, "f", b"x".to_vec())
             .unwrap();
-        let item = get_json(
-            &sim,
-            &format!("{}/drives/{drive}/items/{file}", sim.base_url()),
-        )
-        .await;
+        let url = format!("{}/drives/{drive}/items/{file}", sim.base_url());
+        let item = get_json(&sim, &url).await;
         assert_eq!(item["parentReference"]["path"], "/drive/root:/My%20Docs");
         assert_eq!(item["parentReference"]["id"], folder.as_str());
-        let (pages, _) = full_delta(&sim, &delta_url(&sim, &drive)).await;
-        for page in &pages {
-            assert_no_parent_path(page);
-        }
+
+        let mut options = sim.options(&drive).unwrap();
+        options.parent_path_outside_delta = false;
+        sim.set_options(&drive, options).unwrap();
+        assert_no_parent_path(&get_json(&sim, &url).await);
+        let children = format!("{}/drives/{drive}/items/{folder}/children", sim.base_url());
+        assert_no_parent_path(&get_json(&sim, &children).await);
     }
 
     /// AC3: renaming a folder appears in delta as that folder only, not its descendants.
@@ -300,34 +407,93 @@ mod self_tests {
         assert_eq!(changed[0]["name"], "Renamed");
     }
 
-    /// A deleted folder and everything below it appear with the `deleted` facet, the folder
-    /// first, so a client must apply the whole feed before deciding the folder is empty.
+    /// Deleting a folder reports only the folder by default (`FolderOnly`, the harder
+    /// case); with `EveryDescendant` the folder comes first and then each descendant, so a
+    /// client must apply the whole feed before deciding the folder is empty.
     #[tokio::test]
-    async fn deleted_items_carry_the_deleted_facet() {
+    async fn folder_delete_reporting_follows_the_switch() {
+        for (mode, expect_file) in [
+            (FolderDeletes::FolderOnly, false),
+            (FolderDeletes::EveryDescendant, true),
+        ] {
+            let sim = GraphSim::start().await.unwrap();
+            let drive = sim
+                .add_drive_with(
+                    DriveType::Personal,
+                    DriveOptions {
+                        folder_deletes: mode,
+                        ..DriveOptions::default()
+                    },
+                )
+                .unwrap();
+            let root = sim.root_id(&drive).unwrap();
+            let folder = sim.create_folder(&drive, &root, "F").unwrap();
+            let file = sim
+                .create_file(&drive, &folder, "f", b"x".to_vec())
+                .unwrap();
+            let (_, link) = full_delta(&sim, &delta_url(&sim, &drive)).await;
+
+            sim.delete(&drive, &folder).unwrap();
+            let (pages, _) = full_delta(&sim, &link).await;
+            let changed = items(&pages);
+            let mut expected = vec![folder.to_string()];
+            if expect_file {
+                expected.push(file.to_string());
+            }
+            assert_eq!(ids(&changed), expected, "{mode:?}");
+            assert!(changed.iter().all(|item| item["deleted"].is_object()));
+
+            let response = client()
+                .get(format!("{}/drives/{drive}/items/{file}", sim.base_url()))
+                .bearer_auth(sim.token())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            assert_eq!(body["error"]["code"], "itemNotFound");
+        }
+    }
+
+    /// Zero-byte files have no quickXorHash by default (unverified, so the harder case);
+    /// `hash_empty_files` adds it.
+    #[tokio::test]
+    async fn empty_file_hash_follows_the_switch() {
+        let sim = GraphSim::start().await.unwrap();
+        let drive = sim.add_drive(DriveType::Personal).unwrap();
+        let root = sim.root_id(&drive).unwrap();
+        let empty = sim.create_file(&drive, &root, "empty", Vec::new()).unwrap();
+        let url = format!("{}/drives/{drive}/items/{empty}", sim.base_url());
+        let item = get_json(&sim, &url).await;
+        assert!(item["file"].is_object());
+        assert!(item["file"].get("hashes").is_none());
+
+        let mut options = sim.options(&drive).unwrap();
+        options.hash_empty_files = true;
+        sim.set_options(&drive, options).unwrap();
+        let item = get_json(&sim, &url).await;
+        assert!(item["file"]["hashes"]["quickXorHash"].is_string());
+    }
+
+    /// Personal folders carry no cTag by default, following the driveItem resource;
+    /// `personal_folder_ctag` adds one. Files keep theirs.
+    #[tokio::test]
+    async fn personal_folder_ctag_follows_the_switch() {
         let sim = GraphSim::start().await.unwrap();
         let drive = sim.add_drive(DriveType::Personal).unwrap();
         let root = sim.root_id(&drive).unwrap();
         let folder = sim.create_folder(&drive, &root, "F").unwrap();
-        let file = sim
-            .create_file(&drive, &folder, "f", b"x".to_vec())
-            .unwrap();
-        let (_, link) = full_delta(&sim, &delta_url(&sim, &drive)).await;
+        let url = format!("{}/drives/{drive}/items/{folder}", sim.base_url());
+        assert!(get_json(&sim, &url).await.get("cTag").is_none());
+        let (pages, _) = full_delta(&sim, &delta_url(&sim, &drive)).await;
+        for item in items(&pages) {
+            assert!(item.get("cTag").is_none(), "folder has cTag: {item}");
+        }
 
-        sim.delete(&drive, &folder).unwrap();
-        let (pages, _) = full_delta(&sim, &link).await;
-        let changed = items(&pages);
-        assert_eq!(ids(&changed), vec![folder.to_string(), file.to_string()]);
-        assert!(changed.iter().all(|item| item["deleted"].is_object()));
-
-        let response = client()
-            .get(format!("{}/drives/{drive}/items/{file}", sim.base_url()))
-            .bearer_auth(sim.token())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
-        assert_eq!(body["error"]["code"], "itemNotFound");
+        let mut options = sim.options(&drive).unwrap();
+        options.personal_folder_ctag = true;
+        sim.set_options(&drive, options).unwrap();
+        assert!(get_json(&sim, &url).await["cTag"].is_string());
     }
 
     /// Item JSON carries the quickXorHash from `mydrive-core`, whole-second timestamps,
@@ -393,6 +559,7 @@ mod self_tests {
         let mut names = Vec::new();
         let mut pages = 0;
         loop {
+            assert!(pages < MAX_PAGES, "children paging did not end");
             let page = get_json(&sim, &url).await;
             pages += 1;
             for item in page["value"].as_array().unwrap() {
