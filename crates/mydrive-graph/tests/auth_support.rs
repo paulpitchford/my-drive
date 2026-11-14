@@ -280,6 +280,17 @@ pub(crate) enum SaveMode {
     Succeed,
     Fail,
     Dismiss,
+    /// Panic in the next write, then succeed.
+    PanicOnce,
+}
+
+/// What [`FlakyStore::load`] does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LoadMode {
+    Normal,
+    Dismiss,
+    /// Panic in the next read, then read normally.
+    PanicOnce,
 }
 
 /// A store whose writes can fail, be dismissed, or wait on a gate. Reads come from the
@@ -287,8 +298,10 @@ pub(crate) enum SaveMode {
 pub(crate) struct FlakyStore {
     pub(crate) inner: MemoryTokenStore,
     mode: Mutex<SaveMode>,
+    load_mode: Mutex<LoadMode>,
     gate: Mutex<Option<Arc<Semaphore>>>,
     saves: AtomicUsize,
+    loads: AtomicUsize,
 }
 
 impl FlakyStore {
@@ -296,8 +309,10 @@ impl FlakyStore {
         let store = Arc::new(Self {
             inner: MemoryTokenStore::new(),
             mode: Mutex::new(SaveMode::Succeed),
+            load_mode: Mutex::new(LoadMode::Normal),
             gate: Mutex::new(None),
             saves: AtomicUsize::new(0),
+            loads: AtomicUsize::new(0),
         });
         store
             .inner
@@ -309,6 +324,15 @@ impl FlakyStore {
 
     pub(crate) fn set_mode(&self, mode: SaveMode) {
         *lock(&self.mode) = mode;
+    }
+
+    pub(crate) fn set_load_mode(&self, mode: LoadMode) {
+        *lock(&self.load_mode) = mode;
+    }
+
+    /// How many reads were attempted.
+    pub(crate) fn loads(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
     }
 
     /// Makes every write wait for a permit from the returned semaphore.
@@ -336,7 +360,20 @@ impl TokenStore for FlakyStore {
         &'a self,
         account: &'a AccountId,
     ) -> BoxFuture<'a, Result<Option<RefreshToken>, StoreError>> {
-        self.inner.load(account)
+        Box::pin(async move {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            let mode = std::mem::replace(&mut *lock(&self.load_mode), LoadMode::Normal);
+            match mode {
+                LoadMode::Normal => self.inner.load(account).await,
+                LoadMode::Dismiss => {
+                    *lock(&self.load_mode) = LoadMode::Dismiss;
+                    Err(StoreError::Dismissed {
+                        operation: "reading a refresh token",
+                    })
+                }
+                LoadMode::PanicOnce => panic!("test store panics while reading"),
+            }
+        })
     }
 
     fn save<'a>(
@@ -355,6 +392,10 @@ impl TokenStore for FlakyStore {
             let mode = *lock(&self.mode);
             match mode {
                 SaveMode::Succeed => self.inner.save(account, token).await,
+                SaveMode::PanicOnce => {
+                    *lock(&self.mode) = SaveMode::Succeed;
+                    panic!("test store panics while writing")
+                }
                 SaveMode::Fail => Err(StoreError::Failed {
                     operation: "storing a refresh token",
                     reason: "test failure".into(),

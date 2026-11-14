@@ -15,8 +15,8 @@ use mydrive_graph::auth::{
     Scopes, StoreError, TokenClient, TokenError, TokenProvider, TokenSet, TokenStore,
 };
 use support::{
-    FakeAuthority, FlakyStore, SaveMode, TestResult, account, dead_authority, resume, seeded_store,
-    settle,
+    FakeAuthority, FlakyStore, LoadMode, SaveMode, TestResult, account, dead_authority, resume,
+    seeded_store, settle,
 };
 use tokio::time::Instant;
 
@@ -309,7 +309,7 @@ async fn failed_store_write_keeps_session_and_newest_token() -> TestResult {
     assert_eq!(t1.expose_secret(), "fake-access-1");
     assert!(!provider.needs_sign_in());
     assert!(matches!(
-        provider.store_warning(),
+        provider.store_warning().map(|w| w.error),
         Some(StoreError::Failed { .. })
     ));
     assert_eq!(store.stored("a").as_deref(), Some("old"));
@@ -399,7 +399,7 @@ async fn dismissed_prompt_is_not_retried_soon() -> TestResult {
     let provider = resume(fake.client(), store.clone(), "a");
     let t = provider.access_token().await?;
     assert!(matches!(
-        provider.store_warning(),
+        provider.store_warning().map(|w| w.error),
         Some(StoreError::Dismissed { .. })
     ));
     assert_eq!(store.saves(), 1);
@@ -413,7 +413,7 @@ async fn dismissed_prompt_is_not_retried_soon() -> TestResult {
     }
     assert_eq!(store.saves(), 1, "no prompt again so soon");
     assert!(matches!(
-        provider.store_warning(),
+        provider.store_warning().map(|w| w.error),
         Some(StoreError::Dismissed { .. })
     ));
 
@@ -522,5 +522,221 @@ async fn needs_sign_in_is_per_account() -> TestResult {
     assert!(a.needs_sign_in());
     assert!(b.access_token().await.is_ok());
     assert!(!b.needs_sign_in());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// Liveness (second review)
+// ---------------------------------------------------------------------------------------
+
+/// Second review item 1: a panic in the store while a refresh reads the token does not
+/// wedge the provider; once the failure backoff passes, the next call refreshes.
+#[tokio::test]
+async fn panic_in_refresh_task_is_recovered() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let store = FlakyStore::seeded("a", "old").await;
+    store.set_load_mode(LoadMode::PanicOnce);
+    let provider = resume(fake.client(), store.clone(), "a");
+    let r = provider.access_token().await;
+    assert!(matches!(r, Err(TokenError::RefreshAborted { .. })), "{r:?}");
+    jump(mydrive_graph::auth::REFRESH_RETRY_INITIAL + Duration::from_secs(1)).await;
+    assert_eq!(
+        provider.access_token().await?.expose_secret(),
+        "fake-access-1"
+    );
+    Ok(())
+}
+
+/// Second review item 1: a panic in the store while writing does not leave the writer
+/// marked as running: a warning appears, with a retry time, and a retry succeeds.
+#[tokio::test]
+async fn panic_in_writer_is_recovered() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let store = FlakyStore::seeded("a", "old").await;
+    store.set_mode(SaveMode::PanicOnce);
+    let provider = resume(fake.client(), store.clone(), "a");
+    provider.access_token().await?;
+    let w = provider.store_warning().ok_or("expected a warning")?;
+    assert!(w.retry_in.is_some(), "{w:?}");
+    assert_eq!(store.stored("a").as_deref(), Some("old"));
+    provider.retry_store_now();
+    assert!(settle(|| store.stored("a").as_deref() == Some("fake-refresh-1")).await);
+    assert!(provider.store_warning().is_none());
+    Ok(())
+}
+
+/// Second review item 3: an early refresh (inside the margin) that fails transiently hands
+/// out the still-valid cached token; once it has expired, the failure is returned.
+#[tokio::test]
+async fn early_refresh_failure_keeps_valid_cached_token() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let far = SystemTime::now() + Duration::from_secs(24 * 3600);
+    let p = signed_in(
+        &fake,
+        token_set("initial", "r0", Duration::from_secs(3600), far),
+    )
+    .await?;
+    jump(Duration::from_secs(3600 - 200)).await;
+    fake.error(503, "temporarily_unavailable");
+    assert_eq!(p.access_token().await?.expose_secret(), "initial");
+    assert_eq!(p.access_token().await?.expose_secret(), "initial");
+    assert_eq!(fake.count(), 1, "the failure is reused, not repeated");
+    jump(Duration::from_secs(300)).await;
+    fake.error(503, "temporarily_unavailable");
+    let r = p.access_token().await;
+    assert!(matches!(r, Err(TokenError::Transient { .. })), "{r:?}");
+    Ok(())
+}
+
+/// Second review item 4: `reset_backoff` ends the failure backoff, and `force_refresh`
+/// bypasses it.
+#[tokio::test]
+async fn reset_backoff_and_force_refresh_bypass_the_failure_cache() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    fake.error(503, "temporarily_unavailable");
+    let provider = resume(fake.client(), seeded_store("a", "seed").await, "a");
+    assert!(provider.access_token().await.is_err());
+    assert!(provider.access_token().await.is_err());
+    assert_eq!(fake.count(), 1);
+    provider.reset_backoff();
+    assert_eq!(
+        provider.access_token().await?.expose_secret(),
+        "fake-access-1"
+    );
+    assert_eq!(fake.count(), 2);
+
+    let fake = FakeAuthority::start().await?;
+    fake.error(503, "temporarily_unavailable");
+    let provider = resume(fake.client(), seeded_store("a", "seed").await, "a");
+    assert!(provider.access_token().await.is_err());
+    let t = provider
+        .force_refresh(&AccessToken::new("rejected"))
+        .await?;
+    assert_eq!(t.expose_secret(), "fake-access-1");
+    assert_eq!(fake.count(), 2);
+    Ok(())
+}
+
+/// Second review item 5: after `close`, a write the old provider had started never lands,
+/// so it cannot overwrite a new sign-in's token; the closed provider hands out nothing.
+#[tokio::test]
+async fn closed_provider_never_writes_again() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let store = FlakyStore::seeded("a", "old").await;
+    let gate = store.hold();
+    let old = resume(fake.client(), store.clone(), "a");
+    // The refresh is granted; its write waits (as on a keyring prompt).
+    let dropped = tokio::time::timeout(Duration::from_millis(300), old.access_token()).await;
+    assert!(dropped.is_err());
+    assert!(settle(|| store.saves() == 1).await);
+
+    old.close().await;
+    // The new sign-in's token lands in the store.
+    store
+        .inner
+        .save(&account("a"), &RefreshToken::new("new-chain"))
+        .await?;
+    gate.add_permits(100);
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(store.stored("a").as_deref(), Some("new-chain"));
+    let r = old.access_token().await;
+    assert!(matches!(r, Err(TokenError::Closed { .. })), "{r:?}");
+    old.retry_store_now();
+    old.flush().await?;
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(store.stored("a").as_deref(), Some("new-chain"));
+    assert_eq!(store.saves(), 1, "no write after close");
+    Ok(())
+}
+
+/// Second review item 6: `flush` writes an unsaved token at once, ignoring the backoff,
+/// and the warning reports when the next automatic retry is due.
+#[tokio::test]
+async fn flush_writes_unsaved_token_now() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let store = FlakyStore::seeded("a", "old").await;
+    store.set_mode(SaveMode::Fail);
+    let provider = resume(fake.client(), store.clone(), "a");
+    provider.access_token().await?;
+    let w = provider.store_warning().ok_or("expected a warning")?;
+    let retry_in = w.retry_in.ok_or("expected a retry time")?;
+    assert!(
+        retry_in <= STORE_RETRY_INITIAL && retry_in > STORE_RETRY_INITIAL / 2,
+        "{retry_in:?}"
+    );
+
+    let still_failing = provider.flush().await;
+    assert!(
+        matches!(still_failing, Err(StoreError::Failed { .. })),
+        "{still_failing:?}"
+    );
+    store.set_mode(SaveMode::Succeed);
+    provider.flush().await?;
+    assert_eq!(store.stored("a").as_deref(), Some("fake-refresh-1"));
+    assert!(provider.store_warning().is_none());
+    assert_eq!(store.saves(), 3);
+    Ok(())
+}
+
+/// Second review item 6: `retry_store_now` retries at once, even inside the long pause
+/// after a dismissed prompt.
+#[tokio::test]
+async fn retry_store_now_ignores_the_pause() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let store = FlakyStore::seeded("a", "old").await;
+    store.set_mode(SaveMode::Dismiss);
+    let provider = resume(fake.client(), store.clone(), "a");
+    provider.access_token().await?;
+    let w = provider.store_warning().ok_or("expected a warning")?;
+    assert!(matches!(w.error, StoreError::Dismissed { .. }));
+    assert!(w.retry_in.ok_or("expected a retry time")? > Duration::from_secs(50 * 60));
+    store.set_mode(SaveMode::Succeed);
+    provider.retry_store_now();
+    assert!(settle(|| store.stored("a").as_deref() == Some("fake-refresh-1")).await);
+    Ok(())
+}
+
+/// Second review item 7: a dismissed prompt while reading the refresh token is not asked
+/// again for a long time, not even by `force_refresh`; `reset_backoff` (a user action)
+/// tries again.
+#[tokio::test]
+async fn dismissed_read_is_not_retried_soon() -> TestResult {
+    let fake = FakeAuthority::start().await?;
+    let store = FlakyStore::seeded("a", "old").await;
+    store.set_load_mode(LoadMode::Dismiss);
+    let provider = resume(fake.client(), store.clone(), "a");
+    let r = provider.access_token().await;
+    assert!(
+        matches!(
+            r,
+            Err(TokenError::Store {
+                source: StoreError::Dismissed { .. },
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    assert_eq!(store.loads(), 1);
+    jump(Duration::from_secs(20 * 60)).await;
+    assert!(provider.access_token().await.is_err());
+    assert!(
+        provider
+            .force_refresh(&AccessToken::new("x"))
+            .await
+            .is_err()
+    );
+    assert_eq!(store.loads(), 1, "no new prompt so soon");
+
+    store.set_load_mode(LoadMode::Normal);
+    provider.reset_backoff();
+    assert_eq!(
+        provider.access_token().await?.expose_secret(),
+        "fake-access-1"
+    );
+    assert_eq!(store.loads(), 2);
     Ok(())
 }

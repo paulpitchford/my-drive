@@ -240,6 +240,12 @@ pub enum TokenError {
         /// The account.
         account: AccountId,
     },
+    /// The provider was closed (sign-out, or a new sign-in replaced it).
+    #[error("the token provider of account {account} is closed")]
+    Closed {
+        /// The account.
+        account: AccountId,
+    },
 }
 
 impl TokenError {

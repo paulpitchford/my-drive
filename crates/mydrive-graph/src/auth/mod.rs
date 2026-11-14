@@ -27,13 +27,13 @@ pub use config::{
     INITIAL_SCOPES, NATIVE_CLIENT_REDIRECT_URI, SITE_SEARCH_SCOPE, Scopes,
 };
 pub use error::{ConfigError, SignInError, StoreError, TokenError, TokenRequestError};
-pub use loopback::{CONNECTION_READ_TIMEOUT, LOOPBACK_TIMEOUT, LoopbackSignIn};
+pub use loopback::{CONNECTION_READ_TIMEOUT, LOOPBACK_TIMEOUT, LoopbackSignIn, MAX_CONNECTIONS};
 pub use pkce::{CODE_CHALLENGE_METHOD, State};
 pub use provider::{
     REFRESH_MARGIN, REFRESH_RETRY_INITIAL, REFRESH_RETRY_MAX, RefreshingTokenProvider,
-    STORE_RETRY_AFTER_DISMISSED, STORE_RETRY_INITIAL, STORE_RETRY_MAX, TokenProvider,
+    STORE_RETRY_AFTER_DISMISSED, STORE_RETRY_INITIAL, STORE_RETRY_MAX, StoreWarning, TokenProvider,
 };
 pub use secret::{AccessToken, AuthorizationCode, IdToken, PkceVerifier, RefreshToken};
-pub use secret_service::SecretServiceStore;
+pub use secret_service::{PROMPT_TIMEOUT, SecretServiceStore};
 pub use store::{BoxFuture, MemoryTokenStore, TokenStore};
 pub use token::{TokenClient, TokenSet};

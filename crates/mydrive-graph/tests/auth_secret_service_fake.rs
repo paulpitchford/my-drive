@@ -1,14 +1,27 @@
 //! `SecretServiceStore` against a fake Secret Service on a private peer-to-peer D-Bus
 //! connection (a Unix socket pair). No session bus and no real keyring is involved.
+//!
+//! The fake models the default-collection alias, several collections, locked items, and
+//! prompts that complete, are dismissed, or are never answered.
+
+#[path = "auth_support.rs"]
+mod support;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use mydrive_core::ids::AccountId;
-use mydrive_graph::auth::{RefreshToken, SecretServiceStore, StoreError, TokenStore};
+use mydrive_graph::auth::{
+    RefreshToken, RefreshingTokenProvider, STORE_RETRY_AFTER_DISMISSED, Scopes, SecretServiceStore,
+    StoreError, TokenProvider, TokenStore,
+};
 use serde::{Deserialize, Serialize};
 use zbus::connection::Builder;
-use zbus::{Connection, Guid, ObjectServer, OwnedObjectPath, OwnedVariant, Type, fdo, interface};
+use zbus::object_server::SignalEmitter;
+use zbus::{
+    Connection, Guid, ObjectServer, OwnedObjectPath, OwnedVariant, Type, Variant, fdo, interface,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -31,12 +44,32 @@ struct StoredItem {
     value: Vec<u8>,
 }
 
+/// What the fake does when a prompt is shown.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum PromptMode {
+    /// The user accepts.
+    #[default]
+    Complete,
+    /// The user dismisses it.
+    Dismiss,
+    /// The user never answers.
+    Never,
+}
+
 #[derive(Default)]
 struct Keyring {
     default_alias: Option<String>,
     fail_create: bool,
+    /// CreateItem needs a prompt (for example a confirmation).
+    prompt_on_create: bool,
+    /// The keyring is locked: reading needs an unlock prompt.
+    locked: bool,
+    prompt_mode: PromptMode,
     items: Vec<StoredItem>,
     next: u32,
+    create_calls: u32,
+    prompts_shown: u32,
+    dismiss_calls: u32,
 }
 
 type Shared = Arc<Mutex<Keyring>>;
@@ -49,10 +82,79 @@ fn path(p: &str) -> fdo::Result<OwnedObjectPath> {
     OwnedObjectPath::try_from(p).map_err(|e| fdo::Error::Failed(e.to_string()))
 }
 
+fn failed(e: impl std::fmt::Display) -> fdo::Error {
+    fdo::Error::Failed(e.to_string())
+}
+
 fn matches(item: &StoredItem, wanted: &HashMap<String, String>) -> bool {
     wanted
         .iter()
         .all(|(k, v)| item.attributes.get(k) == Some(v))
+}
+
+/// Creates or replaces an item and serves it. Returns its path.
+async fn put_item(
+    keyring: &Shared,
+    server: &ObjectServer,
+    collection: &str,
+    attributes: HashMap<String, String>,
+    value: Vec<u8>,
+) -> fdo::Result<String> {
+    let new_path = {
+        let mut k = lock(keyring);
+        if let Some(item) = k
+            .items
+            .iter_mut()
+            .find(|i| i.collection == collection && i.attributes == attributes)
+        {
+            item.value = value;
+            return Ok(item.path.clone());
+        }
+        k.next += 1;
+        let p = format!("{collection}/{}", k.next);
+        k.items.push(StoredItem {
+            path: p.clone(),
+            collection: collection.to_owned(),
+            attributes,
+            value,
+        });
+        p
+    };
+    server
+        .at(
+            new_path.as_str(),
+            Item {
+                keyring: keyring.clone(),
+                path: new_path.clone(),
+            },
+        )
+        .await
+        .map_err(failed)?;
+    Ok(new_path)
+}
+
+/// Registers a prompt that performs `action` when accepted. Returns its path.
+async fn new_prompt(
+    keyring: &Shared,
+    server: &ObjectServer,
+    action: Action,
+) -> fdo::Result<String> {
+    let p = {
+        let mut k = lock(keyring);
+        k.next += 1;
+        format!("/org/freedesktop/secrets/prompt/p{}", k.next)
+    };
+    server
+        .at(
+            p.as_str(),
+            Prompt {
+                keyring: keyring.clone(),
+                action: Mutex::new(Some(action)),
+            },
+        )
+        .await
+        .map_err(failed)?;
+    Ok(p)
 }
 
 struct Service(Shared);
@@ -64,8 +166,7 @@ impl Service {
         _algorithm: &str,
         _input: OwnedVariant,
     ) -> fdo::Result<(OwnedVariant, OwnedObjectPath)> {
-        let output = OwnedVariant::try_from(zbus::Variant::from(""))
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        let output = OwnedVariant::try_from(Variant::from("")).map_err(failed)?;
         Ok((output, path(SESSION)?))
     }
 
@@ -77,11 +178,16 @@ impl Service {
         }
     }
 
-    fn unlock(
+    async fn unlock(
         &self,
+        #[zbus(object_server)] server: &ObjectServer,
         objects: Vec<OwnedObjectPath>,
     ) -> fdo::Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
-        Ok((objects, path("/")?))
+        if !lock(&self.0).locked {
+            return Ok((objects, path("/")?));
+        }
+        let p = new_prompt(&self.0, server, Action::Unlock).await?;
+        Ok((Vec::new(), path(&p)?))
     }
 
     /// Searches every collection, as the real service does. The store must not use it.
@@ -124,53 +230,38 @@ impl Collection {
         #[zbus(object_server)] server: &ObjectServer,
         properties: HashMap<String, OwnedVariant>,
         secret: FakeSecret,
-        replace: bool,
+        _replace: bool,
     ) -> fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
         let attributes: HashMap<String, String> = properties
             .get("org.freedesktop.Secret.Item.Attributes")
             .ok_or_else(|| fdo::Error::InvalidArgs("no attributes".into()))?
             .try_clone()
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?
+            .map_err(failed)?
             .try_into()
-            .map_err(|e: zbus::Error| fdo::Error::Failed(e.to_string()))?;
-        let new_path = {
+            .map_err(|e: zbus::Error| failed(e))?;
+        let (fail, needs_prompt) = {
             let mut k = lock(&self.keyring);
-            if k.fail_create {
-                return Err(fdo::Error::Failed("cannot create the item".into()));
-            }
-            let existing = k
-                .items
-                .iter_mut()
-                .find(|i| i.collection == self.path && i.attributes == attributes);
-            match (existing, replace) {
-                (Some(item), true) => {
-                    item.value = secret.value;
-                    return Ok((path(&item.path)?, path("/")?));
-                }
-                _ => {
-                    k.next += 1;
-                    let p = format!("{}/{}", self.path, k.next);
-                    k.items.push(StoredItem {
-                        path: p.clone(),
-                        collection: self.path.clone(),
-                        attributes,
-                        value: secret.value,
-                    });
-                    p
-                }
-            }
+            k.create_calls += 1;
+            (k.fail_create, k.prompt_on_create)
         };
-        server
-            .at(
-                new_path.as_str(),
-                Item {
-                    keyring: self.keyring.clone(),
-                    path: new_path.clone(),
+        if fail {
+            return Err(fdo::Error::Failed("cannot create the item".into()));
+        }
+        if needs_prompt {
+            let p = new_prompt(
+                &self.keyring,
+                server,
+                Action::Create {
+                    collection: self.path.clone(),
+                    attributes,
+                    value: secret.value,
                 },
             )
-            .await
-            .map_err(|e| fdo::Error::Failed(e.to_string()))?;
-        Ok((path(&new_path)?, path("/")?))
+            .await?;
+            return Ok((path("/")?, path(&p)?));
+        }
+        let item = put_item(&self.keyring, server, &self.path, attributes, secret.value).await?;
+        Ok((path(&item)?, path("/")?))
     }
 }
 
@@ -183,6 +274,11 @@ struct Item {
 impl Item {
     fn get_secret(&self, session: OwnedObjectPath) -> fdo::Result<FakeSecret> {
         let k = lock(&self.keyring);
+        if k.locked {
+            return Err(fdo::Error::Failed(
+                "org.freedesktop.Secret.Error.IsLocked".into(),
+            ));
+        }
         let item = k
             .items
             .iter()
@@ -200,6 +296,88 @@ impl Item {
         lock(&self.keyring).items.retain(|i| i.path != self.path);
         path("/")
     }
+}
+
+enum Action {
+    Unlock,
+    Create {
+        collection: String,
+        attributes: HashMap<String, String>,
+        value: Vec<u8>,
+    },
+}
+
+struct Prompt {
+    keyring: Shared,
+    action: Mutex<Option<Action>>,
+}
+
+#[interface(name = "org.freedesktop.Secret.Prompt")]
+impl Prompt {
+    async fn prompt(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        #[zbus(object_server)] server: &ObjectServer,
+        _window_id: &str,
+    ) -> fdo::Result<()> {
+        let mode = {
+            let mut k = lock(&self.keyring);
+            k.prompts_shown += 1;
+            k.prompt_mode
+        };
+        match mode {
+            PromptMode::Never => Ok(()),
+            PromptMode::Dismiss => {
+                self.action
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                Self::completed(&emitter, true, Variant::from(""))
+                    .await
+                    .map_err(failed)
+            }
+            PromptMode::Complete => {
+                let action = self
+                    .action
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                let result = match action {
+                    Some(Action::Unlock) => {
+                        lock(&self.keyring).locked = false;
+                        String::new()
+                    }
+                    Some(Action::Create {
+                        collection,
+                        attributes,
+                        value,
+                    }) => put_item(&self.keyring, server, &collection, attributes, value).await?,
+                    None => String::new(),
+                };
+                Self::completed(&emitter, false, Variant::from(result.as_str()))
+                    .await
+                    .map_err(failed)
+            }
+        }
+    }
+
+    async fn dismiss(&self, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) -> fdo::Result<()> {
+        lock(&self.keyring).dismiss_calls += 1;
+        self.action
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        Self::completed(&emitter, true, Variant::from(""))
+            .await
+            .map_err(failed)
+    }
+
+    #[zbus(signal)]
+    async fn completed(
+        emitter: &SignalEmitter<'_>,
+        dismissed: bool,
+        result: Variant<'_>,
+    ) -> zbus::Result<()>;
 }
 
 struct Session;
@@ -267,6 +445,26 @@ fn our_attributes() -> HashMap<String, String> {
         ("application".into(), "mydrive".into()),
         ("account".into(), "acct-1".into()),
     ])
+}
+
+fn our_item(value: &str) -> StoredItem {
+    StoredItem {
+        path: format!("{LOGIN}/1"),
+        collection: LOGIN.into(),
+        attributes: our_attributes(),
+        value: value.as_bytes().to_vec(),
+    }
+}
+
+/// Waits (bounded) for the fake to reach a state; the fake runs on other tasks.
+async fn eventually(keyring: &Shared, cond: impl Fn(&Keyring) -> bool) -> bool {
+    for _ in 0..200 {
+        if cond(&lock(keyring)) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cond(&lock(keyring))
 }
 
 /// ADR-0010 R6, review item 11: tokens round-trip through the default collection with a
@@ -372,5 +570,156 @@ async fn create_failure_names_doctor() -> TestResult {
     let shown = e.to_string();
     assert!(shown.contains("mydrive doctor"), "{shown}");
     assert!(!shown.contains("dummy"), "{shown}");
+    Ok(())
+}
+
+/// Review item 9 (J01 V4): a write that needs a prompt completes when the user accepts.
+#[tokio::test]
+async fn prompt_that_completes_stores_the_token() -> TestResult {
+    let (conn, keyring) = fake_service(Keyring {
+        default_alias: Some(LOGIN.into()),
+        prompt_on_create: true,
+        ..Keyring::default()
+    })
+    .await?;
+    let store = SecretServiceStore::with_connection(conn).await?;
+    store
+        .save(&account(), &RefreshToken::new("dummy-1"))
+        .await?;
+    assert_eq!(lock(&keyring).prompts_shown, 1);
+    assert_eq!(
+        store
+            .load(&account())
+            .await?
+            .as_ref()
+            .map(RefreshToken::expose_secret),
+        Some("dummy-1")
+    );
+    Ok(())
+}
+
+/// Review item 9 (J01 V4): a locked keyring is unlocked through its prompt on read.
+#[tokio::test]
+async fn locked_item_is_unlocked_on_read() -> TestResult {
+    let (conn, keyring) = fake_service(Keyring {
+        default_alias: Some(LOGIN.into()),
+        locked: true,
+        items: vec![our_item("dummy-locked")],
+        next: 10,
+        ..Keyring::default()
+    })
+    .await?;
+    let store = SecretServiceStore::with_connection(conn).await?;
+    assert_eq!(
+        store
+            .load(&account())
+            .await?
+            .as_ref()
+            .map(RefreshToken::expose_secret),
+        Some("dummy-locked")
+    );
+    assert_eq!(lock(&keyring).prompts_shown, 1);
+    Ok(())
+}
+
+/// Review item 9: a dismissed prompt is `StoreError::Dismissed`, naming `mydrive doctor`.
+#[tokio::test]
+async fn dismissed_prompt_is_dismissed_error() -> TestResult {
+    let (conn, _) = fake_service(Keyring {
+        default_alias: Some(LOGIN.into()),
+        prompt_on_create: true,
+        prompt_mode: PromptMode::Dismiss,
+        ..Keyring::default()
+    })
+    .await?;
+    let store = SecretServiceStore::with_connection(conn).await?;
+    let e = store
+        .save(&account(), &RefreshToken::new("dummy"))
+        .await
+        .err()
+        .ok_or("save must fail")?;
+    assert!(matches!(e, StoreError::Dismissed { .. }), "{e:?}");
+    assert!(e.to_string().contains("mydrive doctor"), "{e}");
+    Ok(())
+}
+
+/// Review item 9: an unanswered prompt times out with an error naming `mydrive doctor`,
+/// and is dismissed so it cannot complete the write later.
+#[tokio::test]
+async fn unanswered_prompt_times_out_and_is_dismissed() -> TestResult {
+    let (conn, keyring) = fake_service(Keyring {
+        default_alias: Some(LOGIN.into()),
+        prompt_on_create: true,
+        prompt_mode: PromptMode::Never,
+        ..Keyring::default()
+    })
+    .await?;
+    let store = SecretServiceStore::with_connection(conn)
+        .await?
+        .with_prompt_timeout(Duration::from_millis(200));
+    let e = store
+        .save(&account(), &RefreshToken::new("dummy"))
+        .await
+        .err()
+        .ok_or("save must fail")?;
+    assert!(matches!(e, StoreError::Failed { .. }), "{e:?}");
+    assert!(e.to_string().contains("mydrive doctor"), "{e}");
+    assert!(eventually(&keyring, |k| k.dismiss_calls == 1).await);
+    assert!(lock(&keyring).items.is_empty());
+    Ok(())
+}
+
+/// Review items 5 and 9: a write abandoned while its prompt is showing (for example by
+/// `RefreshingTokenProvider::close`) dismisses the prompt.
+#[tokio::test]
+async fn abandoned_prompt_is_dismissed() -> TestResult {
+    let (conn, keyring) = fake_service(Keyring {
+        default_alias: Some(LOGIN.into()),
+        prompt_on_create: true,
+        prompt_mode: PromptMode::Never,
+        ..Keyring::default()
+    })
+    .await?;
+    let store = SecretServiceStore::with_connection(conn).await?;
+    let token = RefreshToken::new("dummy");
+    let abandoned =
+        tokio::time::timeout(Duration::from_millis(300), store.save(&account(), &token)).await;
+    assert!(abandoned.is_err());
+    assert!(eventually(&keyring, |k| k.dismiss_calls == 1).await);
+    assert!(lock(&keyring).items.is_empty());
+    Ok(())
+}
+
+/// Review items 7 and 9: a dismissed prompt on write, through the provider, gives a
+/// `Dismissed` warning and no new prompt for a long time.
+#[tokio::test]
+async fn dismissed_write_prompt_pauses_the_provider() -> TestResult {
+    let fake = support::FakeAuthority::start().await?;
+    let (conn, keyring) = fake_service(Keyring {
+        default_alias: Some(LOGIN.into()),
+        prompt_on_create: true,
+        prompt_mode: PromptMode::Dismiss,
+        items: vec![our_item("seed")],
+        next: 10,
+        ..Keyring::default()
+    })
+    .await?;
+    let store = Arc::new(SecretServiceStore::with_connection(conn).await?);
+    let provider =
+        RefreshingTokenProvider::resume(account(), Scopes::initial_sign_in(), fake.client(), store);
+    let t = provider.access_token().await?;
+    let w = provider.store_warning().ok_or("expected a warning")?;
+    assert!(matches!(w.error, StoreError::Dismissed { .. }), "{w:?}");
+    let retry_in = w.retry_in.ok_or("expected a retry time")?;
+    assert!(retry_in > STORE_RETRY_AFTER_DISMISSED - Duration::from_secs(60));
+    assert_eq!(lock(&keyring).prompts_shown, 1);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(20 * 60)).await;
+    tokio::time::resume();
+    assert_eq!(provider.access_token().await?, t);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(lock(&keyring).prompts_shown, 1, "no new prompt so soon");
+    assert_eq!(lock(&keyring).create_calls, 1);
     Ok(())
 }

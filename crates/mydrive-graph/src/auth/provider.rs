@@ -6,11 +6,20 @@
 //! refresh token) runs in a spawned task that the caller cannot cancel; callers only wait
 //! for its result. Dropping a caller's future therefore never loses a granted refresh
 //! token. The rolled token becomes the in-memory newest before the store write starts, and
-//! is marked as saved only when the write succeeds.
+//! is marked as saved only when the write succeeds. If a refresh or write task ends without
+//! finishing (a panic in the store, an abort), a drop guard clears its state and records a
+//! failure or warning, so the next call starts afresh.
 //!
 //! No keyring or network I/O happens while the state lock is held, and the fast path
 //! (a fresh cached token) never waits for I/O. Retries of an unsaved refresh token run in
 //! the background with backoff.
+//!
+//! # Replacing a provider
+//!
+//! Before signing the same account in again, or signing it out, call
+//! [`RefreshingTokenProvider::close`] on the old provider and wait for it. Otherwise a
+//! late write from the old provider (for example one held up by a keyring prompt) could
+//! overwrite the new sign-in's token, or bring a token back after sign-out.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +27,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use mydrive_core::ids::AccountId;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 
 use super::config::Scopes;
@@ -38,8 +48,11 @@ pub const STORE_RETRY_INITIAL: Duration = Duration::from_secs(30);
 /// Longest delay between retries of a failed store write.
 pub const STORE_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 
-/// After the user dismisses a keyring prompt, no write is retried for this long, so they
-/// are not prompted again and again. The warning stays visible meanwhile.
+/// After the user dismisses a keyring prompt, while writing or while reading, the keyring
+/// is not asked again for this long, so the user is not prompted again and again. The
+/// warning or error stays visible meanwhile; [`RefreshingTokenProvider::reset_backoff`],
+/// [`RefreshingTokenProvider::retry_store_now`] and [`RefreshingTokenProvider::flush`]
+/// are the explicit ways to try sooner.
 pub const STORE_RETRY_AFTER_DISMISSED: Duration = Duration::from_secs(60 * 60);
 
 /// After a failed refresh, callers get the same failure without a new request for this
@@ -56,16 +69,26 @@ const STORE_WRITE_WAIT: Duration = Duration::from_secs(10);
 /// Gives the Graph client a valid access token for one account.
 pub trait TokenProvider: Send + Sync {
     /// A token that is not near expiry, refreshing first if needed. Concurrent callers that
-    /// all need a refresh share one refresh request.
+    /// all need a refresh share one refresh request. If an early refresh fails transiently
+    /// while the cached token is still valid, the cached token is returned.
     fn access_token(&self) -> BoxFuture<'_, Result<AccessToken, TokenError>>;
 
     /// Refreshes because Graph answered 401 to `rejected`, although it looked valid (F01).
     /// If another caller has already replaced `rejected`, the newer token is returned
-    /// without a second refresh.
+    /// without a second refresh. Bypasses the refresh-failure backoff.
     fn force_refresh<'a>(
         &'a self,
         rejected: &'a AccessToken,
     ) -> BoxFuture<'a, Result<AccessToken, TokenError>>;
+}
+
+/// The keyring warning of a provider: the newest refresh token is held only in memory.
+#[derive(Clone, Debug)]
+pub struct StoreWarning {
+    /// Why the last write failed.
+    pub error: StoreError,
+    /// How long until the write is retried automatically, if it is scheduled.
+    pub retry_in: Option<Duration>,
 }
 
 /// The access token held in memory, with deadlines on both clocks.
@@ -107,6 +130,15 @@ impl Cached {
 
 type Outcome = Result<AccessToken, TokenError>;
 
+/// A refresh failure reused until `until`.
+struct Failure {
+    error: TokenError,
+    until: Instant,
+    /// The user dismissed a keyring prompt while the refresh token was read; not even
+    /// `force_refresh` asks again before `until`.
+    dismissed: bool,
+}
+
 /// Everything guarded by the state lock. The lock is never held across an `.await`.
 #[derive(Default)]
 struct State {
@@ -117,28 +149,53 @@ struct State {
     unsaved: bool,
     /// The refresh in progress, if any.
     inflight: Option<watch::Receiver<Option<Outcome>>>,
-    /// The last refresh failure and until when it is reused.
-    failure: Option<(TokenError, Instant)>,
+    failure: Option<Failure>,
     refresh_backoff: Duration,
-    /// A store write is running.
+    /// A store write is running, and how to stop it.
     writer_running: bool,
-    /// No store write before this.
+    writer_abort: Option<AbortHandle>,
+    /// No automatic store write before this.
     next_store_attempt: Option<Instant>,
     store_backoff: Duration,
     warning: Option<StoreError>,
+    /// `close` was called: no more writes, no more tokens.
+    closed: bool,
 }
 
-struct Inner<S: TokenStore + ?Sized> {
+impl State {
+    fn next_refresh_backoff(&mut self) -> Duration {
+        self.refresh_backoff =
+            (self.refresh_backoff * 2).clamp(REFRESH_RETRY_INITIAL, REFRESH_RETRY_MAX);
+        self.refresh_backoff
+    }
+
+    fn next_store_backoff(&mut self) -> Duration {
+        self.store_backoff = (self.store_backoff * 2).clamp(STORE_RETRY_INITIAL, STORE_RETRY_MAX);
+        self.store_backoff
+    }
+
+    fn valid_token(&self) -> Option<AccessToken> {
+        self.cache
+            .as_ref()
+            .filter(|c| c.is_valid())
+            .map(|c| c.token.clone())
+    }
+}
+
+struct Inner<S: TokenStore + ?Sized + 'static> {
     account: AccountId,
     scopes: Scopes,
     client: TokenClient,
     store: Arc<S>,
     state: Mutex<State>,
     needs_sign_in: AtomicBool,
+    /// Notified whenever a store writer stops.
+    writer_done: Notify,
 }
 
 /// A [`TokenProvider`] that refreshes through a [`TokenClient`] and keeps the refresh token
-/// in a [`TokenStore`]. See the module documentation for its concurrency guarantees.
+/// in a [`TokenStore`]. See the module documentation for its concurrency guarantees and
+/// for closing it before a new sign-in or a sign-out.
 pub struct RefreshingTokenProvider<S: TokenStore + ?Sized + 'static> {
     inner: Arc<Inner<S>>,
 }
@@ -164,12 +221,14 @@ impl<S: TokenStore + ?Sized + 'static> RefreshingTokenProvider<S> {
                 store,
                 state: Mutex::new(State::default()),
                 needs_sign_in: AtomicBool::new(false),
+                writer_done: Notify::new(),
             }),
         }
     }
 
     /// Finishes a sign-in: stores the refresh token from `tokens`, then keeps the access
-    /// token in memory. If storing fails nothing is kept (ADR-0010 R7).
+    /// token in memory. If storing fails nothing is kept (ADR-0010 R7). Close any previous
+    /// provider for the account first.
     ///
     /// # Errors
     ///
@@ -225,13 +284,156 @@ impl<S: TokenStore + ?Sized + 'static> RefreshingTokenProvider<S> {
     }
 
     /// The non-fatal keyring warning: `Some` while the newest refresh token could not be
-    /// stored and is held only in memory (F01 step 9). Tokens are still handed out; the
-    /// write is retried in the background, and this clears once it succeeds. A
-    /// [`StoreError::Dismissed`] here means the user dismissed the keyring prompt; it is
-    /// not retried for [`STORE_RETRY_AFTER_DISMISSED`]. For `mydrive doctor` and status.
+    /// stored and is held only in memory (F01 step 9), with when the write is retried.
+    /// Tokens are still handed out, and this clears once a write succeeds. A
+    /// [`StoreError::Dismissed`] means the user dismissed the keyring prompt; it is not
+    /// retried automatically for [`STORE_RETRY_AFTER_DISMISSED`]. For `mydrive doctor`.
     #[must_use]
-    pub fn store_warning(&self) -> Option<StoreError> {
-        self.inner.lock().warning.clone()
+    pub fn store_warning(&self) -> Option<StoreWarning> {
+        let st = self.inner.lock();
+        st.warning.clone().map(|error| StoreWarning {
+            error,
+            retry_in: st
+                .next_store_attempt
+                .map(|t| t.saturating_duration_since(Instant::now())),
+        })
+    }
+
+    /// Forgets the refresh-failure backoff, so the next call refreshes at once. For the
+    /// engine to call when the network comes back or the user asks to retry. This also
+    /// ends the pause after a dismissed keyring prompt on read.
+    pub fn reset_backoff(&self) {
+        let mut st = self.inner.lock();
+        st.failure = None;
+        st.refresh_backoff = Duration::ZERO;
+    }
+
+    /// Retries writing an unsaved refresh token now, in the background, ignoring the
+    /// retry schedule (including the pause after a dismissed prompt). For a user action
+    /// such as "fix keyring" in `mydrive doctor`.
+    pub fn retry_store_now(&self) {
+        let mut st = self.inner.lock();
+        st.next_store_attempt = None;
+        drop(self.inner.start_writer(&mut st));
+    }
+
+    /// Writes an unsaved refresh token now and waits for the result, ignoring the retry
+    /// schedule. For shutdown, so the newest token is not lost with the process. Does
+    /// nothing once the provider is closed.
+    ///
+    /// # Errors
+    ///
+    /// The [`StoreError`] of the write, if the newest token is still unsaved afterwards.
+    pub async fn flush(&self) -> Result<(), StoreError> {
+        loop {
+            let notified = self.inner.writer_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let writer = {
+                let mut st = self.inner.lock();
+                if st.closed || !st.unsaved {
+                    return Ok(());
+                }
+                if st.writer_running {
+                    None
+                } else {
+                    st.next_store_attempt = None;
+                    self.inner.start_writer(&mut st)
+                }
+            };
+            match writer {
+                Some(writer) => {
+                    let _ = writer.await;
+                    break;
+                }
+                None => notified.await,
+            }
+        }
+        let st = self.inner.lock();
+        match (&st.warning, st.unsaved) {
+            (Some(e), true) => Err(e.clone()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Stops this provider: a running store write is stopped and no further write is
+    /// made, and later calls get [`TokenError::Closed`]. Call it, and wait for it, before
+    /// signing the account in again or out, so a late write cannot overwrite the new
+    /// token or restore a removed one.
+    pub async fn close(&self) {
+        let abort = {
+            let mut st = self.inner.lock();
+            st.closed = true;
+            st.cache = None;
+            st.writer_abort.take()
+        };
+        if let Some(abort) = abort {
+            abort.abort();
+        }
+        loop {
+            let notified = self.inner.writer_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.inner.lock().writer_running {
+                break;
+            }
+            notified.await;
+        }
+        // Let the work started by the stopped write's drop (such as dismissing a pending
+        // keyring prompt) be sent before the caller goes on.
+        tokio::task::yield_now().await;
+        tracing::info!(account = %self.inner.account, "token provider closed");
+    }
+}
+
+/// Clears a refresh that ended without finishing (panic or abort).
+struct RefreshGuard<S: TokenStore + ?Sized + 'static> {
+    inner: Arc<Inner<S>>,
+    armed: bool,
+}
+
+impl<S: TokenStore + ?Sized + 'static> Drop for RefreshGuard<S> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut st = self.inner.lock();
+        st.inflight = None;
+        let backoff = st.next_refresh_backoff();
+        st.failure = Some(Failure {
+            error: TokenError::RefreshAborted {
+                account: self.inner.account.clone(),
+            },
+            until: Instant::now() + backoff,
+            dismissed: false,
+        });
+        tracing::warn!(account = %self.inner.account, "token refresh ended without a result");
+    }
+}
+
+/// Clears a store write that ended without finishing (panic or abort).
+struct WriterGuard<S: TokenStore + ?Sized + 'static> {
+    inner: Arc<Inner<S>>,
+    armed: bool,
+}
+
+impl<S: TokenStore + ?Sized + 'static> Drop for WriterGuard<S> {
+    fn drop(&mut self) {
+        {
+            let mut st = self.inner.lock();
+            st.writer_running = false;
+            st.writer_abort = None;
+            if self.armed && !st.closed {
+                let delay = st.next_store_backoff();
+                st.next_store_attempt = Some(Instant::now() + delay);
+                st.warning = Some(StoreError::Failed {
+                    operation: "storing the newest refresh token",
+                    reason: "the write was interrupted".to_owned(),
+                });
+                tracing::warn!(account = %self.inner.account, "refresh token write ended without a result");
+            }
+        }
+        self.inner.writer_done.notify_waiters();
     }
 }
 
@@ -249,6 +451,11 @@ impl<S: TokenStore + ?Sized + 'static> Inner<S> {
     async fn get(self: &Arc<Self>, rejected: Option<&AccessToken>) -> Outcome {
         let mut rx = {
             let mut st = self.lock();
+            if st.closed {
+                return Err(TokenError::Closed {
+                    account: self.account.clone(),
+                });
+            }
             if self.needs_sign_in.load(Ordering::Acquire) {
                 return Err(self.needs_sign_in_error());
             }
@@ -267,10 +474,16 @@ impl<S: TokenStore + ?Sized + 'static> Inner<S> {
             match st.inflight.clone() {
                 Some(rx) => rx,
                 None => {
-                    if let Some((e, until)) = &st.failure
-                        && Instant::now() < *until
+                    if let Some(f) = &st.failure
+                        && Instant::now() < f.until
+                        && (rejected.is_none() || f.dismissed)
                     {
-                        return Err(e.clone());
+                        if rejected.is_none()
+                            && let Some(t) = st.valid_token()
+                        {
+                            return Ok(t);
+                        }
+                        return Err(f.error.clone());
                     }
                     let (tx, rx) = watch::channel(None);
                     st.inflight = Some(rx.clone());
@@ -283,40 +496,67 @@ impl<S: TokenStore + ?Sized + 'static> Inner<S> {
             .wait_for(Option::is_some)
             .await
             .ok()
-            .and_then(|v| (*v).clone());
-        outcome.unwrap_or_else(|| {
-            Err(TokenError::RefreshAborted {
-                account: self.account.clone(),
-            })
-        })
+            .and_then(|v| (*v).clone())
+            .unwrap_or_else(|| {
+                Err(TokenError::RefreshAborted {
+                    account: self.account.clone(),
+                })
+            });
+        match outcome {
+            // An early refresh failed for a reason that may pass, and the cached token has
+            // not expired: keep using it.
+            Err(e) if rejected.is_none() && Self::is_soft(&e) => match self.lock().valid_token() {
+                Some(t) => {
+                    tracing::debug!(account = %self.account, "early refresh failed; using the cached token");
+                    Ok(t)
+                }
+                None => Err(e),
+            },
+            other => other,
+        }
+    }
+
+    fn is_soft(e: &TokenError) -> bool {
+        matches!(
+            e,
+            TokenError::Transient { .. }
+                | TokenError::RefreshAborted { .. }
+                | TokenError::Store { .. }
+        )
     }
 
     /// Starts the background store writer if a write is due and none is running.
-    fn start_writer(self: &Arc<Self>, st: &mut State) -> Option<tokio::task::JoinHandle<()>> {
+    fn start_writer(self: &Arc<Self>, st: &mut State) -> Option<JoinHandle<()>> {
         let due = st.next_store_attempt.is_none_or(|t| Instant::now() >= t);
-        if !st.unsaved || st.writer_running || !due {
+        if st.closed || !st.unsaved || st.writer_running || !due {
             return None;
         }
         st.writer_running = true;
-        Some(tokio::spawn(Arc::clone(self).write_newest()))
+        let handle = tokio::spawn(Arc::clone(self).write_newest());
+        st.writer_abort = Some(handle.abort_handle());
+        Some(handle)
     }
 
     /// Writes the newest refresh token until the store holds it, or a write fails.
     async fn write_newest(self: Arc<Self>) {
+        let mut guard = WriterGuard {
+            inner: Arc::clone(&self),
+            armed: true,
+        };
         let account = &self.account;
         loop {
             let token = {
-                let mut st = self.lock();
-                match (&st.newest, st.unsaved) {
-                    (Some(t), true) => t.clone(),
-                    _ => {
-                        st.writer_running = false;
-                        return;
-                    }
+                let st = self.lock();
+                match (&st.newest, st.unsaved, st.closed) {
+                    (Some(t), true, false) => t.clone(),
+                    _ => break,
                 }
             };
             let result = self.store.save(account, &token).await;
             let mut st = self.lock();
+            if st.closed {
+                break;
+            }
             match result {
                 Ok(()) if st.newest.as_ref() == Some(&token) => {
                     if st.warning.is_some() {
@@ -326,8 +566,7 @@ impl<S: TokenStore + ?Sized + 'static> Inner<S> {
                     st.warning = None;
                     st.store_backoff = Duration::ZERO;
                     st.next_store_attempt = None;
-                    st.writer_running = false;
-                    return;
+                    break;
                 }
                 // A newer token arrived during the write: store that one too.
                 Ok(()) => {}
@@ -335,10 +574,7 @@ impl<S: TokenStore + ?Sized + 'static> Inner<S> {
                     let delay = if matches!(e, StoreError::Dismissed { .. }) {
                         STORE_RETRY_AFTER_DISMISSED
                     } else {
-                        let next =
-                            (st.store_backoff * 2).clamp(STORE_RETRY_INITIAL, STORE_RETRY_MAX);
-                        st.store_backoff = next;
-                        next
+                        st.next_store_backoff()
                     };
                     tracing::warn!(
                         %account,
@@ -348,16 +584,21 @@ impl<S: TokenStore + ?Sized + 'static> Inner<S> {
                     );
                     st.next_store_attempt = Some(Instant::now() + delay);
                     st.warning = Some(e);
-                    st.writer_running = false;
-                    return;
+                    break;
                 }
             }
         }
+        guard.armed = false;
     }
 
     /// One refresh, in its own task so a dropped caller cannot cancel it.
     async fn run_refresh(self: Arc<Self>, tx: watch::Sender<Option<Outcome>>) {
+        let mut guard = RefreshGuard {
+            inner: Arc::clone(&self),
+            armed: true,
+        };
         let outcome = self.refresh().await;
+        guard.armed = false;
         {
             let mut st = self.lock();
             st.inflight = None;
@@ -368,10 +609,23 @@ impl<S: TokenStore + ?Sized + 'static> Inner<S> {
                 }
                 Err(e) if e.is_needs_sign_in() => {}
                 Err(e) => {
-                    let backoff =
-                        (st.refresh_backoff * 2).clamp(REFRESH_RETRY_INITIAL, REFRESH_RETRY_MAX);
-                    st.refresh_backoff = backoff;
-                    st.failure = Some((e.clone(), Instant::now() + backoff));
+                    let dismissed = matches!(
+                        e,
+                        TokenError::Store {
+                            source: StoreError::Dismissed { .. },
+                            ..
+                        }
+                    );
+                    let backoff = if dismissed {
+                        STORE_RETRY_AFTER_DISMISSED
+                    } else {
+                        st.next_refresh_backoff()
+                    };
+                    st.failure = Some(Failure {
+                        error: e.clone(),
+                        until: Instant::now() + backoff,
+                        dismissed,
+                    });
                 }
             }
         }

@@ -275,7 +275,58 @@ async fn idle_connections_do_not_delay_the_redirect() -> TestResult {
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
     let tokens = attempt.await??;
     assert_eq!(tokens.access_token.expose_secret(), "fake-access-1");
+    // The idle connection's read deadline has not even passed: the server has neither
+    // answered nor closed it. A listener that read connections one at a time would have
+    // waited it out (and answered it) before reaching the redirect.
+    let mut buf = [0u8; 16];
+    assert!(
+        matches!(idle.try_read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the redirect waited for the idle connection"
+    );
     drop((idle, partial));
+    Ok(())
+}
+
+/// Second review item 2: beyond `MAX_CONNECTIONS` connections in flight, extra
+/// connections are closed at once rather than held; once the idle ones time out, the real
+/// redirect is accepted.
+#[tokio::test]
+async fn connection_flood_is_capped() -> TestResult {
+    use tokio::io::AsyncReadExt as _;
+    let fake = FakeAuthority::start().await?;
+    let sign_in = LoopbackSignIn::start(&fake.config(), Scopes::initial_sign_in()).await?;
+    let port = sign_in.local_addr().port();
+    let state = query(sign_in.authorization_url())["state"].clone();
+    let client = fake.client();
+    let attempt =
+        tokio::spawn(async move { sign_in.complete(&client, Duration::from_secs(20)).await });
+
+    let mut idle = Vec::new();
+    for _ in 0..mydrive_graph::auth::MAX_CONNECTIONS {
+        idle.push(TcpStream::connect(("127.0.0.1", port)).await?);
+    }
+    let mut extra = TcpStream::connect(("127.0.0.1", port)).await?;
+    let mut buf = [0u8; 16];
+    let closed = tokio::time::timeout(
+        mydrive_graph::auth::CONNECTION_READ_TIMEOUT / 2,
+        extra.read(&mut buf),
+    )
+    .await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "the extra connection must be closed at once, got {closed:?}"
+    );
+
+    // The idle connections time out and free their slots; then the redirect gets in.
+    let page = loop {
+        match browser_get(port, &format!("/?code=real&state={state}")).await {
+            Ok(page) if page.starts_with("HTTP/1.1 200") => break page,
+            _ => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    };
+    assert!(page.contains("You can close this tab"));
+    attempt.await??;
+    drop(idle);
     Ok(())
 }
 

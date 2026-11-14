@@ -15,11 +15,12 @@
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
 use url::Url;
 
@@ -40,6 +41,13 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The largest request head read from one connection.
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
+
+/// Most connections handled at once; more are closed at once, so a flood cannot use up
+/// the process's file descriptors.
+pub const MAX_CONNECTIONS: usize = 32;
+
+/// Pause after a failed `accept` (for example `EMFILE`) before trying again.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 
 /// How many ports to try before giving up on finding one free on both loopback addresses.
 const BIND_ATTEMPTS: usize = 16;
@@ -125,8 +133,9 @@ impl LoopbackSignIn {
     ///
     /// # Errors
     ///
-    /// [`SignInError::Bind`] if no loopback port can be bound, and
-    /// [`SignInError::Config`] if the authority's endpoint cannot be built.
+    /// [`SignInError::Bind`] if no loopback port can be bound, or the redirect host is
+    /// `[::1]` but IPv6 loopback cannot be bound; [`SignInError::Config`] if the
+    /// authority's endpoint cannot be built.
     pub async fn start(config: &AuthConfig, scopes: Scopes) -> Result<Self, SignInError> {
         let (v4, v6) = bind_loopback(std::iter::repeat_n(0, BIND_ATTEMPTS))
             .await
@@ -141,6 +150,7 @@ impl LoopbackSignIn {
                     .map_err(|source| SignInError::Bind { source })?,
             );
         }
+        check_redirect_host(config.loopback_host(), v6.is_some())?;
         let port = local_addrs[0].port();
         let redirect = RedirectUri::parse(&format!("http://{}:{port}", config.loopback_host()))?;
         let pending = PendingSignIn::new(config, redirect, scopes)?;
@@ -199,13 +209,14 @@ impl LoopbackSignIn {
 
     /// Accepts connections until the redirect with the matching `state` arrives or
     /// `timeout` passes, then stops listening. Anything else gets a 400 and is ignored,
-    /// including a redirect with a wrong or missing `state`.
+    /// including a redirect with a wrong or missing `state`. At most [`MAX_CONNECTIONS`]
+    /// connections are handled at once; more are closed straight away. A failed `accept`
+    /// (such as running out of file descriptors) is logged and retried after a pause.
     ///
     /// # Errors
     ///
-    /// [`SignInError::TimedOut`], [`SignInError::Authorization`] for an error redirect
-    /// with the matching `state` (such as `access_denied`), or [`SignInError::Listener`]
-    /// if accepting fails.
+    /// [`SignInError::TimedOut`], or [`SignInError::Authorization`] for an error redirect
+    /// with the matching `state` (such as `access_denied`).
     pub async fn wait_for_code(
         self,
         timeout: Duration,
@@ -215,19 +226,29 @@ impl LoopbackSignIn {
         let Self {
             v4, v6, pending, ..
         } = self;
-        let (heads_tx, mut heads) = mpsc::channel::<(TcpStream, Option<String>)>(16);
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let (heads_tx, mut heads) =
+            mpsc::channel::<(TcpStream, Option<String>, OwnedSemaphorePermit)>(MAX_CONNECTIONS);
         let result = loop {
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => {
                     break Err(SignInError::TimedOut { after: timeout });
                 }
                 accepted = accept_any(&v4, v6.as_ref()) => match accepted {
-                    Err(source) => break Err(SignInError::Listener { source }),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accepting a sign-in connection failed; retrying");
+                        tokio::time::sleep_until(deadline.min(Instant::now() + ACCEPT_ERROR_PAUSE)).await;
+                    }
                     Ok((stream, peer)) => {
                         if !peer.ip().is_loopback() {
                             // Unreachable while bound to loopback; a second line of defence.
                             continue;
                         }
+                        let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
+                            tracing::debug!("too many sign-in connections; closed one");
+                            drop(stream);
+                            continue;
+                        };
                         let tx = heads_tx.clone();
                         tokio::spawn(async move {
                             let mut stream = stream;
@@ -238,14 +259,21 @@ impl LoopbackSignIn {
                             .await
                             .ok()
                             .flatten();
-                            let _ = tx.send((stream, target)).await;
+                            let _ = tx.send((stream, target, permit)).await;
                         });
                     }
                 },
-                Some((stream, target)) = heads.recv() => {
+                Some((stream, target, permit)) = heads.recv() => {
                     match judge(&pending, target) {
                         Verdict::Ignore(page) => {
-                            tokio::spawn(respond(stream, "400 Bad Request", page));
+                            tokio::spawn(async move {
+                                let _ = tokio::time::timeout(
+                                    CONNECTION_READ_TIMEOUT,
+                                    respond(stream, "400 Bad Request", page),
+                                )
+                                .await;
+                                drop(permit);
+                            });
                         }
                         Verdict::Finish(status, page, result) => {
                             let _ = tokio::time::timeout(
@@ -267,6 +295,20 @@ impl LoopbackSignIn {
         }
         result.map(|code| (code, pending))
     }
+}
+
+/// A `[::1]` redirect host needs the IPv6 listener: without it, the redirect could reach
+/// whoever else listens there.
+fn check_redirect_host(host: &str, have_ipv6: bool) -> Result<(), SignInError> {
+    if host == "[::1]" && !have_ipv6 {
+        return Err(SignInError::Bind {
+            source: io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "the redirect host is [::1] but IPv6 loopback cannot be bound; use localhost",
+            ),
+        });
+    }
+    Ok(())
 }
 
 async fn accept_any(
@@ -352,6 +394,18 @@ async fn respond(mut stream: TcpStream, status: &'static str, body: &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review item 8: `[::1]` is refused as the redirect host without an IPv6 listener.
+    #[test]
+    fn ipv6_host_needs_ipv6_listener() {
+        assert!(matches!(
+            check_redirect_host("[::1]", false),
+            Err(SignInError::Bind { .. })
+        ));
+        assert!(check_redirect_host("[::1]", true).is_ok());
+        assert!(check_redirect_host("localhost", false).is_ok());
+        assert!(check_redirect_host("127.0.0.1", false).is_ok());
+    }
 
     /// Review item 5: if the port is taken on `::1` by another process, another port is
     /// chosen so both loopback addresses are ours.

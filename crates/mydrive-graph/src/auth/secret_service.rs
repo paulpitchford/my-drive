@@ -44,8 +44,8 @@ const ATTR_APPLICATION: &str = "application";
 const APPLICATION: &str = "mydrive";
 const ATTR_ACCOUNT: &str = "account";
 
-/// How long we wait for the user to answer a keyring prompt.
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How long we wait for the user to answer a keyring prompt, by default.
+pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// The Secret Service `Secret` struct, `(oayays)`. No `Debug`: it carries the secret.
 #[derive(Serialize, Deserialize, Type)]
@@ -60,6 +60,7 @@ struct WireSecret {
 #[derive(Clone)]
 pub struct SecretServiceStore {
     conn: Connection,
+    prompt_timeout: Duration,
 }
 
 impl fmt::Debug for SecretServiceStore {
@@ -114,10 +115,21 @@ impl SecretServiceStore {
     ///
     /// As [`SecretServiceStore::connect`].
     pub async fn with_connection(conn: Connection) -> Result<Self, StoreError> {
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            prompt_timeout: PROMPT_TIMEOUT,
+        };
         let session = store.open_session().await.map_err(|e| unavailable(&e))?;
         store.close_session(&session).await;
         Ok(store)
+    }
+
+    /// Sets how long to wait for the user to answer a keyring prompt before giving up
+    /// (and dismissing it). Default [`PROMPT_TIMEOUT`].
+    #[must_use]
+    pub fn with_prompt_timeout(mut self, timeout: Duration) -> Self {
+        self.prompt_timeout = timeout;
+        self
     }
 
     async fn call<B, R>(
@@ -240,12 +252,20 @@ impl SecretServiceStore {
             .receive_signal("Completed")
             .await
             .map_err(failed(operation))?;
+        // From here on, a prompt we stop waiting for (timeout, or this future dropped, for
+        // example by `RefreshingTokenProvider::close`) is dismissed, so the user cannot
+        // later complete a write nobody wants any more.
+        let mut guard = PromptGuard {
+            conn: self.conn.clone(),
+            prompt: prompt.clone(),
+            armed: true,
+        };
         proxy
             .call_method("Prompt", &"")
             .await
             .map_err(failed(operation))?;
         let next = std::future::poll_fn(|cx| std::pin::Pin::new(&mut completed).poll_next(cx));
-        let message = tokio::time::timeout(PROMPT_TIMEOUT, next)
+        let message = tokio::time::timeout(self.prompt_timeout, next)
             .await
             .map_err(|_| StoreError::Failed {
                 operation,
@@ -255,6 +275,7 @@ impl SecretServiceStore {
                 operation,
                 reason: "the Secret Service went away during a prompt".to_owned(),
             })?;
+        guard.armed = false;
         let (dismissed, _result): (bool, OwnedVariant) =
             message.body().deserialize().map_err(failed(operation))?;
         if dismissed {
@@ -334,6 +355,40 @@ impl SecretServiceStore {
             self.run_prompt(&prompt, OP).await?;
         }
         Ok(())
+    }
+}
+
+/// Dismisses a shown prompt that nobody waits for any more.
+struct PromptGuard {
+    conn: Connection,
+    prompt: OwnedObjectPath,
+    armed: bool,
+}
+
+impl Drop for PromptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let conn = self.conn.clone();
+        let prompt = self.prompt.clone();
+        runtime.spawn(async move {
+            let dismissed = conn
+                .call_method(
+                    Some(SERVICE),
+                    prompt.as_str(),
+                    Some(PROMPT_IFACE),
+                    "Dismiss",
+                    &(),
+                )
+                .await;
+            if let Err(e) = dismissed {
+                tracing::debug!(error = %e, "dismissing an abandoned keyring prompt failed");
+            }
+        });
     }
 }
 

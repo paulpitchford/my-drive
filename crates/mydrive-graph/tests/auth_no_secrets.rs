@@ -148,14 +148,19 @@ async fn scenario() -> Result<(String, Vec<String>), Box<dyn std::error::Error +
         store.clone(),
     );
     let t = provider.access_token().await?;
-    let w = provider.store_warning();
-    seen += &format!(
-        "{t:?} {provider:?} {w:?} {}",
-        w.as_ref().map(ToString::to_string).unwrap_or_default()
-    );
-    store.set_mode(SaveMode::Dismiss);
+    let w = provider.store_warning().ok_or("expected a store warning")?;
+    seen += &format!("{t:?} {provider:?} {w:?} {}", w.error);
+    // The dismissed path: a refresh rolls the token again, then a write is forced and
+    // the keyring prompt is "dismissed".
     let t = provider.force_refresh(&t).await?;
-    seen += &format!("{t:?} {provider:?}");
+    store.set_mode(SaveMode::Dismiss);
+    let flushed = provider.flush().await;
+    let w = provider.store_warning().ok_or("expected a store warning")?;
+    assert!(
+        matches!(w.error, mydrive_graph::auth::StoreError::Dismissed { .. }),
+        "{w:?}"
+    );
+    seen += &format!("{t:?} {provider:?} {flushed:?} {w:?} {}", w.error);
 
     // A rejected refresh.
     fake.error(400, "invalid_grant");
