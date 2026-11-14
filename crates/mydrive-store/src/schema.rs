@@ -1,9 +1,10 @@
 //! Opening the database, connection settings and forward-only migrations (ADR-0006 R2, R3).
 //!
-//! The schema version lives in SQLite's `user_version`. Migrations are numbered from 1,
-//! each strictly greater than the one before, and there is no down-migration. All pending
-//! migrations run in one transaction together with the `user_version` update, so a crash
-//! leaves the database either at its old version, untouched, or fully migrated.
+//! The schema version lives in SQLite's `user_version`, and the file is marked as a
+//! my-drive store by `application_id`. Migrations are numbered from 1, each strictly
+//! greater than the one before, and there is no down-migration. All pending migrations run
+//! in one transaction together with the `user_version` update, so a crash leaves the
+//! database either at its old version, untouched, or fully migrated.
 //!
 //! A migration's SQL is frozen once released: a later change to the schema is a new
 //! migration, never an edit to an old one. `docs/architecture/store-schema.md` describes
@@ -12,12 +13,15 @@
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior};
 
 use crate::error::{SqlContext, StoreError};
 
 /// The newest schema version this build understands.
 pub const SCHEMA_VERSION: i64 = 1;
+
+/// The `application_id` that marks a SQLite file as a my-drive state store: ASCII `MYDV`.
+pub const APPLICATION_ID: i64 = 0x4D59_4456;
 
 /// How long a statement waits for a lock held by another connection, such as `sqlite3`
 /// inspecting the file, before failing.
@@ -40,8 +44,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[Migration {
 
 /// Schema v1. The CHECK lists are the wire forms of `mydrive-core`'s state enums as of
 /// this migration; a test keeps them equal to `WIRE_FORMS`. Adding a state value needs a
-/// new migration.
+/// new migration. `kind` has no CHECK, so a new item kind needs no table rebuild; the Rust
+/// type validates it. The application ID literal equals [`APPLICATION_ID`] (tested).
 const V1: &str = r"
+PRAGMA application_id = 1297695830;
+
 CREATE TABLE accounts (
     account_id TEXT PRIMARY KEY NOT NULL CHECK (account_id <> ''),
     tenant_id  TEXT CHECK (tenant_id IS NULL OR tenant_id <> '')
@@ -64,11 +71,11 @@ CREATE TABLE items (
     item_id        TEXT NOT NULL CHECK (item_id <> ''),
     parent_item_id TEXT CHECK (parent_item_id IS NULL OR parent_item_id <> ''),
     name           TEXT NOT NULL CHECK (name <> ''),
-    kind           TEXT NOT NULL CHECK (kind IN ('file', 'folder')),
+    kind           TEXT NOT NULL,
     size           INTEGER NOT NULL CHECK (size >= 0),
     created_at     INTEGER NOT NULL,
     modified_at    INTEGER NOT NULL,
-    etag           TEXT NOT NULL,
+    etag           TEXT,
     ctag           TEXT,
     server_hash    TEXT,
     local_hash     TEXT,
@@ -77,6 +84,7 @@ CREATE TABLE items (
     sync           TEXT NOT NULL CHECK (sync IN ('in-sync', 'pending-download',
                        'pending-upload', 'uploading', 'conflict', 'error', 'blocked')),
     last_error     TEXT,
+    is_provisional INTEGER NOT NULL DEFAULT 0 CHECK (is_provisional IN (0, 1)),
     PRIMARY KEY (drive_id, item_id)
 ) STRICT, WITHOUT ROWID;
 
@@ -89,7 +97,7 @@ CREATE TABLE hydrated_ranges (
     range_start INTEGER NOT NULL CHECK (range_start >= 0),
     range_end   INTEGER NOT NULL CHECK (range_end > range_start),
     PRIMARY KEY (drive_id, item_id, range_start),
-    FOREIGN KEY (drive_id, item_id) REFERENCES items (drive_id, item_id)
+    FOREIGN KEY (drive_id, item_id) REFERENCES items (drive_id, item_id) ON UPDATE CASCADE
 ) STRICT, WITHOUT ROWID;
 ";
 
@@ -141,34 +149,61 @@ pub(crate) fn open(path: &Path) -> Result<Connection, StoreError> {
     Ok(conn)
 }
 
-/// Refuses a database that is newer than this build or is not a state store. Reads only.
+/// Refuses a file that is not a my-drive store or is newer than this build, and returns
+/// its schema version otherwise. Reads only.
 fn check_openable(conn: &Connection, path: &Path) -> Result<i64, StoreError> {
-    let found = user_version(conn, path)?;
-    if found > SCHEMA_VERSION {
+    let not_ours = |reason: &str| StoreError::NotAStateStore {
+        path: path.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let read = |pragma: &str| -> Result<i64, StoreError> {
+        conn.pragma_query_value(None, pragma, |row| row.get(0))
+            .map_err(|e| classify(e, path, pragma))
+    };
+    let app_id = read("application_id")?;
+    let version = read("user_version")?;
+    if app_id == 0 && version == 0 {
+        let has_objects: bool = conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM sqlite_schema)", [], |row| {
+                row.get(0)
+            })
+            .map_err(|e| classify(e, path, "sqlite_schema"))?;
+        if has_objects {
+            return Err(not_ours("it holds tables but no my-drive application ID"));
+        }
+        // An empty database: a first start.
+        return Ok(0);
+    }
+    if app_id != APPLICATION_ID {
+        return Err(not_ours(&format!("its application ID is {app_id:#x}")));
+    }
+    if version > SCHEMA_VERSION {
         return Err(StoreError::SchemaTooNew {
             path: path.to_owned(),
-            found,
+            found: version,
             supported: SCHEMA_VERSION,
         });
     }
-    if found < 0 || (found == 0 && has_schema_objects(conn, path)?) {
-        return Err(StoreError::NotAStateStore {
-            path: path.to_owned(),
-        });
+    if version < 1 {
+        return Err(not_ours(&format!("its schema version is {version}")));
     }
-    Ok(found)
+    Ok(version)
 }
 
-fn user_version(conn: &Connection, path: &Path) -> Result<i64, StoreError> {
-    conn.pragma_query_value(None, "user_version", |row| row.get(0))
-        .ctx(|| format!("read the schema version of {}", path.display()))
-}
-
-fn has_schema_objects(conn: &Connection, path: &Path) -> Result<bool, StoreError> {
-    conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_schema)", [], |row| {
-        row.get(0)
-    })
-    .ctx(|| format!("check whether {} is empty", path.display()))
+/// A file SQLite cannot read as a database is not a state store; any other error is
+/// reported as it is.
+fn classify(source: rusqlite::Error, path: &Path, what: &str) -> StoreError {
+    if source.sqlite_error_code() == Some(ErrorCode::NotADatabase) {
+        StoreError::NotAStateStore {
+            path: path.to_owned(),
+            reason: "it is not an SQLite database".to_owned(),
+        }
+    } else {
+        StoreError::Sqlite {
+            action: format!("read {what} of {}", path.display()),
+            source,
+        }
+    }
 }
 
 /// Applies every migration newer than the database, in one transaction.
@@ -243,6 +278,18 @@ mod tests {
             let expected = format!("CHECK ({column} IN ({list}))");
             assert!(normalised.contains(&expected), "missing {expected}");
         }
+    }
+
+    /// Migration 1 sets exactly [`APPLICATION_ID`].
+    #[test]
+    fn v1_sets_the_application_id() {
+        assert!(V1.contains(&format!("PRAGMA application_id = {APPLICATION_ID};")));
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("state.db")).unwrap();
+        let id: i64 = conn
+            .pragma_query_value(None, "application_id", |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, APPLICATION_ID);
     }
 
     /// ADR-0006 R3: each migration's number is greater than all previous ones, numbering

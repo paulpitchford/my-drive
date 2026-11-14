@@ -2,9 +2,13 @@
 //! [`Transaction`](crate::Transaction).
 //!
 //! Every operation that runs more than one statement runs inside its own savepoint, so it
-//! is atomic whether it is called on its own or inside a caller's transaction: if it fails
-//! part way, none of its statements take effect, and a caller who carries on and commits
-//! cannot commit half of it.
+//! is atomic whether it is called on its own or inside a caller's transaction. When the
+//! store refuses an operation, or one of its statements fails a constraint, the savepoint
+//! undoes the operation's earlier statements and the caller's transaction stays usable.
+//! That does not hold when SQLite rolls the whole transaction back by itself (for example
+//! `SQLITE_FULL` or an I/O error): [`Transaction`](crate::Transaction) then refuses every
+//! further call with [`StoreError::TransactionAborted`], and the batch must be retried from
+//! the start.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -15,25 +19,42 @@ use mydrive_core::state::{Hydration, ItemState, Pin, Sync as SyncState};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::{SqlContext, StoreError};
-use crate::types::{Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, Timestamp};
+use crate::types::{
+    Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, PendingChanges,
+    RemoteApplied, RemoteMetadata, Timestamp,
+};
 
 pub(crate) mod sealed {
+    use crate::StoreError;
+
     /// Proof of being inside this crate; nothing outside can build one.
     #[derive(Debug, Clone, Copy)]
     pub struct Token(pub(super) ());
 
-    /// Gives [`Queries`](super::Queries) its connection without exposing it.
+    /// Gives [`Queries`](super::Queries) its connection without exposing it, and lets a
+    /// transaction check its own state around every operation.
     pub trait Connected {
-        /// The connection to run statements on.
-        fn connection(&self, token: Token) -> &rusqlite::Connection;
+        /// Runs one operation on the connection.
+        fn run<T, F>(&self, token: Token, op: F) -> Result<T, StoreError>
+        where
+            F: FnOnce(&rusqlite::Connection) -> Result<T, StoreError>;
     }
 }
 
 const ITEM_COLUMNS: &str = "drive_id, item_id, parent_item_id, name, kind, size, created_at, \
-     modified_at, etag, ctag, server_hash, local_hash, hydration, pin, sync, last_error";
+     modified_at, etag, ctag, server_hash, local_hash, hydration, pin, sync, last_error, \
+     is_provisional";
 
-const MOUNT_COLUMNS: &str = "mount_id, account_id, drive_id, root_item_id, mount_point, delta_token, read_only, \
-     blocked_reason";
+const MOUNT_COLUMNS: &str = "mount_id, account_id, drive_id, root_item_id, mount_point, \
+     delta_token, read_only, blocked_reason";
+
+/// Sync states that mean local changes may not be on the server. A delete is refused for
+/// them unless the server confirmed it.
+const PENDING_LOCAL: [SyncState; 3] = [
+    SyncState::PendingUpload,
+    SyncState::Uploading,
+    SyncState::Conflict,
+];
 
 /// Every typed operation on the store.
 ///
@@ -52,8 +73,8 @@ pub trait Queries: sealed::Connected {
     ///
     /// [`StoreError::Sqlite`] if the write fails.
     fn upsert_account(&self, account: &Account) -> Result<(), StoreError> {
-        conn(self)
-            .execute(
+        run(self, |c| {
+            c.execute(
                 "INSERT INTO accounts (account_id, tenant_id) VALUES (?1, ?2) \
                  ON CONFLICT (account_id) DO UPDATE SET tenant_id = excluded.tenant_id",
                 params![
@@ -62,7 +83,8 @@ pub trait Queries: sealed::Connected {
                 ],
             )
             .ctx(|| format!("store account {}", account.account_id))?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Fetches an account by ID.
@@ -72,29 +94,35 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if the row holds
     /// an invalid identifier.
     fn account(&self, account_id: &AccountId) -> Result<Option<Account>, StoreError> {
-        let raw: Option<(String, Option<String>)> = conn(self)
-            .query_row(
-                "SELECT account_id, tenant_id FROM accounts WHERE account_id = ?1",
-                [account_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .ctx(|| format!("read account {account_id}"))?;
-        raw.map(|(id, tenant)| {
-            let what = format!("account {id}");
-            Ok(Account {
-                account_id: parse_id(&what, "account_id", id.clone(), AccountId::new)?,
-                tenant_id: tenant
-                    .map(|t| parse_id(&what, "tenant_id", t, TenantId::new))
-                    .transpose()?,
+        run(self, |c| {
+            let raw: Option<(String, Option<String>)> = c
+                .query_row(
+                    "SELECT account_id, tenant_id FROM accounts WHERE account_id = ?1",
+                    [account_id.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .ctx(|| format!("read account {account_id}"))?;
+            raw.map(|(id, tenant)| {
+                let what = format!("account {id}");
+                Ok(Account {
+                    account_id: parse_id(&what, "account_id", id.clone(), AccountId::new)?,
+                    tenant_id: tenant
+                        .map(|t| parse_id(&what, "tenant_id", t, TenantId::new))
+                        .transpose()?,
+                })
             })
+            .transpose()
         })
-        .transpose()
     }
 
     // ------------------------------------------------------------------ mounts
 
     /// Adds a mount.
+    ///
+    /// The mount point is not a key and is not checked here: refusing a mount point that
+    /// is in use, nested or overlapping is the engine's check (overview, "Rulings on
+    /// details"), and ADR-0007 R6 forbids paths as keys.
     ///
     /// # Errors
     ///
@@ -102,76 +130,8 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::MountExists`] if the mount ID is taken, [`StoreError::MountRootTaken`]
     /// if another mount has the same root (`drive_id`, `item_id`) (ADR-0007 R4),
     /// [`StoreError::NonUtf8Path`] if the mount point is not UTF-8.
-    ///
-    /// The mount point is not a key and is not checked here: refusing a mount point that
-    /// is in use, nested or overlapping is the engine's check (overview, "Rulings on
-    /// details"), and ADR-0007 R6 forbids paths as keys.
     fn insert_mount(&self, mount: &Mount) -> Result<(), StoreError> {
-        atomic(conn(self), |c| {
-            let mount_point =
-                mount
-                    .mount_point
-                    .to_str()
-                    .ok_or_else(|| StoreError::NonUtf8Path {
-                        what: format!("mount point of mount {}", mount.mount_id),
-                        path: mount.mount_point.clone(),
-                    })?;
-            let account_known: bool = c
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM accounts WHERE account_id = ?1)",
-                    [mount.account_id.as_str()],
-                    |row| row.get(0),
-                )
-                .ctx(|| format!("look up account {}", mount.account_id))?;
-            if !account_known {
-                return Err(StoreError::AccountNotFound {
-                    action: "add a mount",
-                    account_id: mount.account_id.clone(),
-                });
-            }
-            if mount_exists(c, &mount.mount_id)? {
-                return Err(StoreError::MountExists {
-                    mount_id: mount.mount_id.clone(),
-                });
-            }
-            let same_root: Option<String> = c
-                .query_row(
-                    "SELECT mount_id FROM mounts WHERE drive_id = ?1 AND root_item_id = ?2",
-                    [mount.drive_id.as_str(), mount.root_item_id.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()
-                .ctx(|| {
-                    format!(
-                        "check whether the root of mount {} is mounted",
-                        mount.mount_id
-                    )
-                })?;
-            if let Some(existing) = same_root {
-                return Err(StoreError::MountRootTaken {
-                    mount_id: mount.mount_id.clone(),
-                    root: ItemKey::new(mount.drive_id.clone(), mount.root_item_id.clone()),
-                    existing: parse_id("mount row", "mount_id", existing, MountId::new)?,
-                });
-            }
-            c.execute(
-                &format!(
-                    "INSERT INTO mounts ({MOUNT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-                ),
-                params![
-                    mount.mount_id.as_str(),
-                    mount.account_id.as_str(),
-                    mount.drive_id.as_str(),
-                    mount.root_item_id.as_str(),
-                    mount_point,
-                    mount.delta_token.as_deref(),
-                    mount.read_only,
-                    mount.blocked_reason.as_deref(),
-                ],
-            )
-            .ctx(|| format!("insert mount {}", mount.mount_id))?;
-            Ok(())
-        })
+        run(self, |c| atomic(c, |c| insert_mount(c, mount)))
     }
 
     /// Fetches a mount by ID.
@@ -181,8 +141,8 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if the row is
     /// invalid.
     fn mount(&self, mount_id: &MountId) -> Result<Option<Mount>, StoreError> {
-        conn(self)
-            .query_row(
+        run(self, |c| {
+            c.query_row(
                 &format!("SELECT {MOUNT_COLUMNS} FROM mounts WHERE mount_id = ?1"),
                 [mount_id.as_str()],
                 RawMount::from_row,
@@ -191,6 +151,7 @@ pub trait Queries: sealed::Connected {
             .ctx(|| format!("read mount {mount_id}"))?
             .map(RawMount::into_mount)
             .transpose()
+        })
     }
 
     /// Lists every mount, ordered by mount ID.
@@ -200,17 +161,18 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if a row is
     /// invalid.
     fn mounts(&self) -> Result<Vec<Mount>, StoreError> {
-        let c = conn(self);
-        let mut stmt = c
-            .prepare_cached(&format!(
-                "SELECT {MOUNT_COLUMNS} FROM mounts ORDER BY mount_id"
-            ))
-            .ctx(|| "list mounts")?;
-        let raws = stmt
-            .query_map([], RawMount::from_row)
-            .and_then(Iterator::collect::<Result<Vec<_>, _>>)
-            .ctx(|| "list mounts")?;
-        raws.into_iter().map(RawMount::into_mount).collect()
+        run(self, |c| {
+            let mut stmt = c
+                .prepare_cached(&format!(
+                    "SELECT {MOUNT_COLUMNS} FROM mounts ORDER BY mount_id"
+                ))
+                .ctx(|| "list mounts")?;
+            let raws = stmt
+                .query_map([], RawMount::from_row)
+                .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+                .ctx(|| "list mounts")?;
+            raws.into_iter().map(RawMount::into_mount).collect()
+        })
     }
 
     /// Reads a mount's delta token (ADR-0007 R2). `None` means no token has been saved.
@@ -219,8 +181,8 @@ pub trait Queries: sealed::Connected {
     ///
     /// [`StoreError::MountNotFound`] if the mount is not stored.
     fn delta_token(&self, mount_id: &MountId) -> Result<Option<String>, StoreError> {
-        conn(self)
-            .query_row(
+        run(self, |c| {
+            c.query_row(
                 "SELECT delta_token FROM mounts WHERE mount_id = ?1",
                 [mount_id.as_str()],
                 |row| row.get::<_, Option<String>>(0),
@@ -231,6 +193,7 @@ pub trait Queries: sealed::Connected {
                 action: "read the delta token",
                 mount_id: mount_id.clone(),
             })
+        })
     }
 
     /// Replaces a mount's delta token; `None` clears it, so the next delta enumerates the
@@ -240,19 +203,9 @@ pub trait Queries: sealed::Connected {
     ///
     /// [`StoreError::MountNotFound`] if the mount is not stored.
     fn set_delta_token(&self, mount_id: &MountId, token: Option<&str>) -> Result<(), StoreError> {
-        let changed = conn(self)
-            .execute(
-                "UPDATE mounts SET delta_token = ?2 WHERE mount_id = ?1",
-                params![mount_id.as_str(), token],
-            )
-            .ctx(|| format!("write the delta token of mount {mount_id}"))?;
-        if changed == 0 {
-            return Err(StoreError::MountNotFound {
-                action: "write the delta token",
-                mount_id: mount_id.clone(),
-            });
-        }
-        Ok(())
+        run(self, |c| {
+            update_mount(c, mount_id, "delta_token", token, "write the delta token")
+        })
     }
 
     /// Sets why organisation policy blocks a mount; `None` clears the block.
@@ -265,101 +218,210 @@ pub trait Queries: sealed::Connected {
         mount_id: &MountId,
         reason: Option<&str>,
     ) -> Result<(), StoreError> {
-        let changed = conn(self)
-            .execute(
-                "UPDATE mounts SET blocked_reason = ?2 WHERE mount_id = ?1",
-                params![mount_id.as_str(), reason],
+        run(self, |c| {
+            update_mount(
+                c,
+                mount_id,
+                "blocked_reason",
+                reason,
+                "write the blocked reason",
             )
-            .ctx(|| format!("write the blocked reason of mount {mount_id}"))?;
-        if changed == 0 {
-            return Err(StoreError::MountNotFound {
-                action: "write the blocked reason",
-                mount_id: mount_id.clone(),
-            });
-        }
-        Ok(())
+        })
     }
 
     // ------------------------------------------------------------------- items
 
-    /// Inserts the item, or replaces every column of the stored item with the same key.
-    ///
-    /// Moving or renaming an item is an upsert with a new parent or name: one row changes,
-    /// and every descendant's resolved path follows (WP-006 AC4).
+    /// Inserts a new item with every column as given: an item first seen in a delta, or
+    /// one created locally (`is_provisional`, with a provisional `item_id`).
     ///
     /// # Errors
     ///
-    /// [`StoreError::InvalidName`] if the name is empty, `.`, `..`, or contains `/` or NUL;
-    /// [`StoreError::SizeTooLarge`] if the size exceeds `i64::MAX`;
-    /// [`StoreError::RangesWouldExceedItem`] if the item has hydrated ranges that the new
-    /// kind or size cannot hold (clear them first).
-    fn upsert_item(&self, item: &Item) -> Result<(), StoreError> {
-        let key = &item.key;
-        if let Some(reason) = name_problem(&item.name) {
-            return Err(StoreError::InvalidName {
-                key: key.clone(),
-                name: item.name.clone(),
-                reason,
-            });
-        }
-        let size = i64::try_from(item.size).map_err(|_| StoreError::SizeTooLarge {
-            key: key.clone(),
-            size: item.size,
-        })?;
-        atomic(conn(self), |c| {
-            let covered_end: Option<i64> = c
-                .query_row(
-                    "SELECT MAX(range_end) FROM hydrated_ranges \
-                     WHERE drive_id = ?1 AND item_id = ?2",
-                    [key.drive_id.as_str(), key.item_id.as_str()],
-                    |row| row.get(0),
-                )
-                .ctx(|| describe("read the hydrated ranges of", key))?;
-            if let Some(end) = covered_end
-                && (item.kind == ItemKind::Folder || end > size)
-            {
-                return Err(StoreError::RangesWouldExceedItem {
+    /// [`StoreError::ItemExists`] if the key is taken, [`StoreError::InvalidName`] if the
+    /// name is empty, `.`, `..`, or contains `/` or NUL, [`StoreError::SizeTooLarge`] if
+    /// the size exceeds `i64::MAX`.
+    fn insert_item(&self, item: &Item) -> Result<(), StoreError> {
+        run(self, |c| atomic(c, |c| insert_item(c, item)))
+    }
+
+    /// Applies what the server reports about an existing item, writing only server-owned
+    /// columns: parent, name, kind, size, timestamps, eTag, cTag and server hash. Local
+    /// hash, hydration, pin, sync and last error are never written here, except as below.
+    ///
+    /// The content identity has changed when the server hash differs, or, where neither
+    /// side has a hash, when the eTag or size differs; a kind change also counts.
+    ///
+    /// - Unchanged: every server-owned column is written.
+    /// - Changed, sync `in-sync` or `pending-download`: every server-owned column is
+    ///   written, the hydrated ranges are cleared and hydration is set to `placeholder`
+    ///   (`full` for a folder), in one operation, so the ranges never describe another
+    ///   version than the hashes.
+    /// - Changed, any other sync: only parent and name are written; content columns,
+    ///   ranges and local state are untouched, and the result says so, so the engine can
+    ///   run conflict handling. The old eTag stays, so an upload still meets 412.
+    ///
+    /// A move or rename is one row update; every descendant's resolved path follows
+    /// (WP-006 AC4).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`] if the item is not stored (use
+    /// [`insert_item`](Self::insert_item)); [`StoreError::FolderHasChildren`] if a folder
+    /// with children would become a file; [`StoreError::InvalidName`];
+    /// [`StoreError::SizeTooLarge`].
+    fn apply_remote_metadata(&self, remote: &RemoteMetadata) -> Result<RemoteApplied, StoreError> {
+        run(self, |c| atomic(c, |c| apply_remote_metadata(c, remote)))
+    }
+
+    /// Sets the sync state to `new` if it is currently `expected` (compare-and-set).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`], and [`StoreError::SyncMismatch`] with the stored
+    /// value if it is not `expected`; nothing changes.
+    fn set_sync(
+        &self,
+        key: &ItemKey,
+        expected: SyncState,
+        new: SyncState,
+    ) -> Result<(), StoreError> {
+        run(self, |c| {
+            atomic(c, |c| {
+                let changed = c
+                    .execute(
+                        "UPDATE items SET sync = ?4 \
+                         WHERE drive_id = ?1 AND item_id = ?2 AND sync = ?3",
+                        params![
+                            key.drive_id.as_str(),
+                            key.item_id.as_str(),
+                            expected.as_str(),
+                            new.as_str()
+                        ],
+                    )
+                    .ctx(|| describe("set the sync state of", key))?;
+                if changed == 1 {
+                    return Ok(());
+                }
+                let actual = load_item(c, key, "set the sync state")?.state.sync;
+                Err(StoreError::SyncMismatch {
                     key: key.clone(),
-                    kind: item.kind,
-                    size: item.size,
-                    covered_end: to_u64(end, "hydrated_ranges", "range_end", key)?,
-                });
-            }
-            c.execute(
-                &format!(
-                    "INSERT INTO items ({ITEM_COLUMNS}) VALUES \
-                     (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
-                     ON CONFLICT (drive_id, item_id) DO UPDATE SET \
-                     parent_item_id = excluded.parent_item_id, name = excluded.name, \
-                     kind = excluded.kind, size = excluded.size, \
-                     created_at = excluded.created_at, modified_at = excluded.modified_at, \
-                     etag = excluded.etag, ctag = excluded.ctag, \
-                     server_hash = excluded.server_hash, local_hash = excluded.local_hash, \
-                     hydration = excluded.hydration, pin = excluded.pin, sync = excluded.sync, \
-                     last_error = excluded.last_error"
-                ),
-                params![
-                    key.drive_id.as_str(),
-                    key.item_id.as_str(),
-                    item.parent_item_id.as_ref().map(ItemId::as_str),
-                    item.name,
-                    item.kind.as_str(),
-                    size,
-                    item.created.as_unix_seconds(),
-                    item.modified.as_unix_seconds(),
-                    item.etag,
-                    item.ctag.as_deref(),
-                    item.server_hash.as_ref().map(QuickXorHash::to_base64),
-                    item.local_hash.as_ref().map(QuickXorHash::to_base64),
-                    item.state.hydration.as_str(),
-                    item.state.pin.as_str(),
-                    item.state.sync.as_str(),
-                    item.last_error.as_deref(),
-                ],
-            )
-            .ctx(|| describe("store", key))?;
-            Ok(())
+                    expected,
+                    actual,
+                    new,
+                })
+            })
         })
+    }
+
+    /// Sets the item's own pin.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`].
+    fn set_pin(&self, key: &ItemKey, pin: Pin) -> Result<(), StoreError> {
+        run(self, |c| {
+            update_item(c, key, "pin", pin.as_str(), "set the pin")
+        })
+    }
+
+    /// Sets the hydration state.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`].
+    fn set_hydration(&self, key: &ItemKey, hydration: Hydration) -> Result<(), StoreError> {
+        run(self, |c| {
+            update_item(c, key, "hydration", hydration.as_str(), "set the hydration")
+        })
+    }
+
+    /// Sets both hashes, for example after an upload: `local_hash` is the hash of the bytes
+    /// sent, `server_hash` the one the server reported (ADR-0012 "Two hashes"). Call it
+    /// before [`apply_remote_metadata`](Self::apply_remote_metadata) with the upload
+    /// response, so the response is not mistaken for a remote content change.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`].
+    fn set_hashes(
+        &self,
+        key: &ItemKey,
+        local_hash: Option<QuickXorHash>,
+        server_hash: Option<QuickXorHash>,
+    ) -> Result<(), StoreError> {
+        run(self, |c| {
+            let changed = c
+                .execute(
+                    "UPDATE items SET local_hash = ?3, server_hash = ?4 \
+                     WHERE drive_id = ?1 AND item_id = ?2",
+                    params![
+                        key.drive_id.as_str(),
+                        key.item_id.as_str(),
+                        local_hash.as_ref().map(QuickXorHash::to_base64),
+                        server_hash.as_ref().map(QuickXorHash::to_base64),
+                    ],
+                )
+                .ctx(|| describe("set the hashes of", key))?;
+            found(changed, key, "set the hashes")
+        })
+    }
+
+    /// Sets the size after a local write or truncate.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`], [`StoreError::SizeTooLarge`], and
+    /// [`StoreError::RangesWouldExceedItem`] if recorded ranges reach past the new size
+    /// (clear or re-record them first, in the same transaction).
+    fn set_local_size(&self, key: &ItemKey, size: u64) -> Result<(), StoreError> {
+        run(self, |c| {
+            atomic(c, |c| {
+                let stored = to_i64_checked(size, key)?;
+                load_item(c, key, "set the size")?;
+                if let Some(end) = covered_end(c, key)?
+                    && end > size
+                {
+                    return Err(StoreError::RangesWouldExceedItem {
+                        key: key.clone(),
+                        size,
+                        covered_end: end,
+                    });
+                }
+                c.execute(
+                    "UPDATE items SET size = ?3 WHERE drive_id = ?1 AND item_id = ?2",
+                    params![key.drive_id.as_str(), key.item_id.as_str(), stored],
+                )
+                .ctx(|| describe("set the size of", key))?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Sets or clears the item's last error.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`].
+    fn set_last_error(&self, key: &ItemKey, error: Option<&str>) -> Result<(), StoreError> {
+        run(self, |c| {
+            let changed = c
+                .execute(
+                    "UPDATE items SET last_error = ?3 WHERE drive_id = ?1 AND item_id = ?2",
+                    params![key.drive_id.as_str(), key.item_id.as_str(), error],
+                )
+                .ctx(|| describe("set the last error of", key))?;
+            found(changed, key, "set the last error")
+        })
+    }
+
+    /// Gives a provisional item its server ID: changes its `item_id`, its children's
+    /// `parent_item_id` and its hydrated ranges together, and clears `is_provisional`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`], [`StoreError::NotProvisional`] for an item that
+    /// already has a server ID, and [`StoreError::ItemExists`] if the new key is taken.
+    fn rekey_item(&self, old: &ItemKey, new_item_id: &ItemId) -> Result<(), StoreError> {
+        run(self, |c| atomic(c, |c| rekey_item(c, old, new_item_id)))
     }
 
     /// Fetches an item by key.
@@ -369,16 +431,7 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if the row is
     /// invalid.
     fn item(&self, key: &ItemKey) -> Result<Option<Item>, StoreError> {
-        conn(self)
-            .query_row(
-                &format!("SELECT {ITEM_COLUMNS} FROM items WHERE drive_id = ?1 AND item_id = ?2"),
-                [key.drive_id.as_str(), key.item_id.as_str()],
-                RawItem::from_row,
-            )
-            .optional()
-            .ctx(|| describe("read", key))?
-            .map(RawItem::into_item)
-            .transpose()
+        run(self, |c| fetch_item(c, key))
     }
 
     /// Lists the items whose parent is `parent`, ordered by name then item ID.
@@ -388,15 +441,17 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if a row is
     /// invalid.
     fn children(&self, parent: &ItemKey) -> Result<Vec<Item>, StoreError> {
-        query_items(
-            conn(self),
-            &format!(
-                "SELECT {ITEM_COLUMNS} FROM items WHERE drive_id = ?1 AND parent_item_id = ?2 \
-                 ORDER BY name, item_id"
-            ),
-            &[parent.drive_id.as_str(), parent.item_id.as_str()],
-            || describe("list the children of", parent),
-        )
+        run(self, |c| {
+            query_items(
+                c,
+                &format!(
+                    "SELECT {ITEM_COLUMNS} FROM items \
+                     WHERE drive_id = ?1 AND parent_item_id = ?2 ORDER BY name, item_id"
+                ),
+                &[parent.drive_id.as_str(), parent.item_id.as_str()],
+                || describe("list the children of", parent),
+            )
+        })
     }
 
     /// Lists every item, in any drive, whose sync state is `sync`, ordered by key.
@@ -406,87 +461,42 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if a row is
     /// invalid.
     fn items_with_sync(&self, sync: SyncState) -> Result<Vec<Item>, StoreError> {
-        query_items(
-            conn(self),
-            &format!("SELECT {ITEM_COLUMNS} FROM items WHERE sync = ?1 ORDER BY drive_id, item_id"),
-            &[sync.as_str()],
-            || format!("list items with sync state {sync}"),
-        )
+        run(self, |c| {
+            query_items(
+                c,
+                &format!(
+                    "SELECT {ITEM_COLUMNS} FROM items WHERE sync = ?1 \
+                     ORDER BY drive_id, item_id"
+                ),
+                &[sync.as_str()],
+                || format!("list items with sync state {sync}"),
+            )
+        })
     }
 
     /// Deletes an item and its hydrated ranges, and returns how many items were deleted.
     ///
     /// With [`DeleteMode::ItemOnly`] an item that has children is refused. With
-    /// [`DeleteMode::Recursive`] every descendant goes too, with its ranges. Deleting rows
-    /// never touches the backing directory; whether a delete is allowed for an item with
-    /// pending local changes is the engine's decision.
+    /// [`DeleteMode::Recursive`] every descendant goes too, with its ranges.
+    ///
+    /// With [`PendingChanges::Refuse`], a delete that would remove any item whose sync is
+    /// `pending-upload`, `uploading` or `conflict` is refused, naming every such item.
+    /// [`PendingChanges::ServerConfirmedLocalDelete`] is only for the case where the server
+    /// confirmed a delete the user made locally. Deleting rows never touches a backing
+    /// directory.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`] if the item is not stored, [`StoreError::HasChildren`]
-    /// for a non-recursive delete of an item with children.
-    fn delete_item(&self, key: &ItemKey, mode: DeleteMode) -> Result<u64, StoreError> {
-        atomic(conn(self), |c| {
-            if !item_exists(c, key)? {
-                return Err(StoreError::ItemNotFound {
-                    action: "delete an item",
-                    key: key.clone(),
-                });
-            }
-            let ids = [key.drive_id.as_str(), key.item_id.as_str()];
-            let deleted = match mode {
-                DeleteMode::ItemOnly => {
-                    let children: i64 = c
-                        .query_row(
-                            "SELECT COUNT(*) FROM items \
-                             WHERE drive_id = ?1 AND parent_item_id = ?2",
-                            ids,
-                            |row| row.get(0),
-                        )
-                        .ctx(|| describe("count the children of", key))?;
-                    if children > 0 {
-                        return Err(StoreError::HasChildren {
-                            key: key.clone(),
-                            children: to_u64(children, "items", "COUNT(*)", key)?,
-                        });
-                    }
-                    c.execute(
-                        "DELETE FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2",
-                        ids,
-                    )
-                    .ctx(|| describe("delete the hydrated ranges of", key))?;
-                    c.execute(
-                        "DELETE FROM items WHERE drive_id = ?1 AND item_id = ?2",
-                        ids,
-                    )
-                    .ctx(|| describe("delete", key))?
-                }
-                DeleteMode::Recursive => {
-                    // UNION, not UNION ALL: a parent cycle cannot make this loop forever.
-                    const SUBTREE: &str = "WITH RECURSIVE subtree (item_id) AS ( \
-                         SELECT ?2 UNION \
-                         SELECT i.item_id FROM items AS i JOIN subtree AS s \
-                         ON i.drive_id = ?1 AND i.parent_item_id = s.item_id) ";
-                    c.execute(
-                        &format!(
-                            "{SUBTREE} DELETE FROM hydrated_ranges WHERE drive_id = ?1 \
-                             AND item_id IN (SELECT item_id FROM subtree)"
-                        ),
-                        ids,
-                    )
-                    .ctx(|| describe("delete the hydrated ranges below", key))?;
-                    c.execute(
-                        &format!(
-                            "{SUBTREE} DELETE FROM items WHERE drive_id = ?1 \
-                             AND item_id IN (SELECT item_id FROM subtree)"
-                        ),
-                        ids,
-                    )
-                    .ctx(|| describe("delete the subtree of", key))?
-                }
-            };
-            Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
-        })
+    /// [`StoreError::ItemNotFound`], [`StoreError::HasChildren`] for a non-recursive
+    /// delete of an item with children, [`StoreError::HasPendingLocalChanges`]. A refused
+    /// delete changes nothing.
+    fn delete_item(
+        &self,
+        key: &ItemKey,
+        mode: DeleteMode,
+        pending: PendingChanges,
+    ) -> Result<u64, StoreError> {
+        run(self, |c| atomic(c, |c| delete_item(c, key, mode, pending)))
     }
 
     /// Resolves an item's path within a mount by walking its parents up to the mount's
@@ -500,72 +510,7 @@ pub trait Queries: sealed::Connected {
     /// mount root; [`StoreError::MissingAncestor`] if a parent is not stored;
     /// [`StoreError::ParentCycle`] if the chain loops (WP-006 AC8).
     fn resolve_path(&self, mount_id: &MountId, key: &ItemKey) -> Result<MountPath, StoreError> {
-        atomic(conn(self), |c| {
-            let (drive_id, root): (String, String) = c
-                .query_row(
-                    "SELECT drive_id, root_item_id FROM mounts WHERE mount_id = ?1",
-                    [mount_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .ctx(|| format!("read mount {mount_id}"))?
-                .ok_or_else(|| StoreError::MountNotFound {
-                    action: "resolve a path",
-                    mount_id: mount_id.clone(),
-                })?;
-            if drive_id != key.drive_id.as_str() {
-                return Err(StoreError::WrongDrive {
-                    key: key.clone(),
-                    mount_id: mount_id.clone(),
-                });
-            }
-            if !item_exists(c, key)? {
-                return Err(StoreError::ItemNotFound {
-                    action: "resolve a path",
-                    key: key.clone(),
-                });
-            }
-            let mut stmt = c
-                .prepare_cached(
-                    "SELECT parent_item_id, name FROM items WHERE drive_id = ?1 AND item_id = ?2",
-                )
-                .ctx(|| describe("resolve the path of", key))?;
-            let mut visited: HashSet<String> = HashSet::new();
-            let mut names = Vec::new();
-            let mut current = key.item_id.as_str().to_owned();
-            while current != root {
-                if !visited.insert(current.clone()) {
-                    return Err(StoreError::ParentCycle {
-                        key: key.clone(),
-                        repeated: parse_id("items row", "item_id", current, ItemId::new)?,
-                    });
-                }
-                let row: Option<(Option<String>, String)> = stmt
-                    .query_row([drive_id.as_str(), current.as_str()], |row| {
-                        Ok((row.get(0)?, row.get(1)?))
-                    })
-                    .optional()
-                    .ctx(|| describe("resolve the path of", key))?;
-                let Some((parent, name)) = row else {
-                    return Err(StoreError::MissingAncestor {
-                        key: key.clone(),
-                        missing: parse_id("items row", "parent_item_id", current, ItemId::new)?,
-                    });
-                };
-                names.push(name);
-                match parent {
-                    Some(parent) => current = parent,
-                    None => {
-                        return Err(StoreError::NotInMount {
-                            key: key.clone(),
-                            mount_id: mount_id.clone(),
-                        });
-                    }
-                }
-            }
-            names.reverse();
-            Ok(MountPath::new(names))
-        })
+        run(self, |c| atomic(c, |c| resolve_path(c, mount_id, key)))
     }
 
     // --------------------------------------------------------- hydrated ranges
@@ -578,42 +523,7 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`] for a folder, and
     /// [`StoreError::RangeOutOfBounds`] if the range ends past the item's size.
     fn record_hydrated_range(&self, key: &ItemKey, range: ByteRange) -> Result<(), StoreError> {
-        const ACTION: &str = "record a hydrated range";
-        atomic(conn(self), |c| {
-            file_size_checked(c, key, range, ACTION)?;
-            if range.is_empty() {
-                return Ok(());
-            }
-            let start = to_i64(range.start());
-            let end = to_i64(range.end());
-            let ids = [key.drive_id.as_str(), key.item_id.as_str()];
-            // Ranges are stored merged: no two overlap or touch. Every stored range that
-            // overlaps or touches the new one is replaced by their union.
-            let (merged_start, merged_end): (Option<i64>, Option<i64>) = c
-                .query_row(
-                    "SELECT MIN(range_start), MAX(range_end) FROM hydrated_ranges \
-                     WHERE drive_id = ?1 AND item_id = ?2 \
-                     AND range_start <= ?4 AND range_end >= ?3",
-                    params![ids[0], ids[1], start, end],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .ctx(|| describe("read the hydrated ranges of", key))?;
-            let merged_start = merged_start.map_or(start, |s| s.min(start));
-            let merged_end = merged_end.map_or(end, |e| e.max(end));
-            c.execute(
-                "DELETE FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2 \
-                 AND range_start <= ?4 AND range_end >= ?3",
-                params![ids[0], ids[1], start, end],
-            )
-            .ctx(|| describe("merge the hydrated ranges of", key))?;
-            c.execute(
-                "INSERT INTO hydrated_ranges (drive_id, item_id, range_start, range_end) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![ids[0], ids[1], merged_start, merged_end],
-            )
-            .ctx(|| describe("record a hydrated range of", key))?;
-            Ok(())
-        })
+        run(self, |c| atomic(c, |c| record_range(c, key, range)))
     }
 
     /// Whether every byte of `range` is recorded as hydrated. An empty range is trivially
@@ -625,29 +535,7 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`] for a folder, and
     /// [`StoreError::RangeOutOfBounds`] if the range ends past the item's size.
     fn is_range_hydrated(&self, key: &ItemKey, range: ByteRange) -> Result<bool, StoreError> {
-        atomic(conn(self), |c| {
-            file_size_checked(c, key, range, "check a hydrated range")?;
-            if range.is_empty() {
-                return Ok(true);
-            }
-            // Stored ranges never overlap or touch, so one stored range must hold the whole
-            // query: the last one starting at or before the query's start.
-            let covering_end: Option<i64> = c
-                .query_row(
-                    "SELECT range_end FROM hydrated_ranges \
-                     WHERE drive_id = ?1 AND item_id = ?2 AND range_start <= ?3 \
-                     ORDER BY range_start DESC LIMIT 1",
-                    params![
-                        key.drive_id.as_str(),
-                        key.item_id.as_str(),
-                        to_i64(range.start())
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()
-                .ctx(|| describe("check the hydrated ranges of", key))?;
-            Ok(covering_end.is_some_and(|end| end >= to_i64(range.end())))
-        })
+        run(self, |c| atomic(c, |c| is_range_hydrated(c, key, range)))
     }
 
     /// The recorded hydrated ranges of a file, in order. They never overlap or touch.
@@ -656,31 +544,11 @@ pub trait Queries: sealed::Connected {
     ///
     /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`] for a folder.
     fn hydrated_ranges(&self, key: &ItemKey) -> Result<Vec<ByteRange>, StoreError> {
-        atomic(conn(self), |c| {
-            file_size(c, key, "list hydrated ranges")?;
-            let mut stmt = c
-                .prepare_cached(
-                    "SELECT range_start, range_end FROM hydrated_ranges \
-                     WHERE drive_id = ?1 AND item_id = ?2 ORDER BY range_start",
-                )
-                .ctx(|| describe("list the hydrated ranges of", key))?;
-            let raw: Vec<(i64, i64)> = stmt
-                .query_map([key.drive_id.as_str(), key.item_id.as_str()], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .and_then(Iterator::collect)
-                .ctx(|| describe("list the hydrated ranges of", key))?;
-            raw.into_iter()
-                .map(|(s, e)| {
-                    let start = to_u64(s, "hydrated_ranges", "range_start", key)?;
-                    let end = to_u64(e, "hydrated_ranges", "range_end", key)?;
-                    ByteRange::new(start, end).map_err(|_| StoreError::Corrupt {
-                        what: describe("hydrated_ranges row of", key),
-                        value: format!("{s}..{e}"),
-                        reason: "end is before start".to_owned(),
-                    })
-                })
-                .collect()
+        run(self, |c| {
+            atomic(c, |c| {
+                file_size(c, key, "list hydrated ranges")?;
+                ranges_of(c, key)
+            })
         })
     }
 
@@ -691,29 +559,601 @@ pub trait Queries: sealed::Connected {
     ///
     /// [`StoreError::ItemNotFound`] if the item is not stored.
     fn clear_hydrated_ranges(&self, key: &ItemKey) -> Result<u64, StoreError> {
-        atomic(conn(self), |c| {
-            if !item_exists(c, key)? {
-                return Err(StoreError::ItemNotFound {
-                    action: "clear hydrated ranges",
-                    key: key.clone(),
-                });
-            }
-            let removed = c
-                .execute(
-                    "DELETE FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2",
-                    [key.drive_id.as_str(), key.item_id.as_str()],
-                )
-                .ctx(|| describe("clear the hydrated ranges of", key))?;
-            Ok(u64::try_from(removed).unwrap_or(u64::MAX))
+        run(self, |c| {
+            atomic(c, |c| {
+                load_item(c, key, "clear hydrated ranges")?;
+                clear_ranges(c, key)
+            })
         })
     }
 }
 
-// ------------------------------------------------------------------- helpers
+// ------------------------------------------------------------- implementations
 
-fn conn<Q: Queries + ?Sized>(q: &Q) -> &Connection {
-    q.connection(sealed::Token(()))
+fn run<Q, T, F>(q: &Q, op: F) -> Result<T, StoreError>
+where
+    Q: Queries + ?Sized,
+    F: FnOnce(&Connection) -> Result<T, StoreError>,
+{
+    q.run(sealed::Token(()), op)
 }
+
+fn insert_mount(c: &Connection, mount: &Mount) -> Result<(), StoreError> {
+    let mount_point = mount
+        .mount_point
+        .to_str()
+        .ok_or_else(|| StoreError::NonUtf8Path {
+            what: format!("mount point of mount {}", mount.mount_id),
+            path: mount.mount_point.clone(),
+        })?;
+    let account_known: bool = c
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM accounts WHERE account_id = ?1)",
+            [mount.account_id.as_str()],
+            |row| row.get(0),
+        )
+        .ctx(|| format!("look up account {}", mount.account_id))?;
+    if !account_known {
+        return Err(StoreError::AccountNotFound {
+            action: "add a mount",
+            account_id: mount.account_id.clone(),
+        });
+    }
+    let taken: bool = c
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM mounts WHERE mount_id = ?1)",
+            [mount.mount_id.as_str()],
+            |row| row.get(0),
+        )
+        .ctx(|| format!("look up mount {}", mount.mount_id))?;
+    if taken {
+        return Err(StoreError::MountExists {
+            mount_id: mount.mount_id.clone(),
+        });
+    }
+    let same_root: Option<String> = c
+        .query_row(
+            "SELECT mount_id FROM mounts WHERE drive_id = ?1 AND root_item_id = ?2",
+            [mount.drive_id.as_str(), mount.root_item_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .ctx(|| {
+            format!(
+                "check whether the root of mount {} is mounted",
+                mount.mount_id
+            )
+        })?;
+    if let Some(existing) = same_root {
+        return Err(StoreError::MountRootTaken {
+            mount_id: mount.mount_id.clone(),
+            root: ItemKey::new(mount.drive_id.clone(), mount.root_item_id.clone()),
+            existing: parse_id("mount row", "mount_id", existing, MountId::new)?,
+        });
+    }
+    c.execute(
+        &format!("INSERT INTO mounts ({MOUNT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+        params![
+            mount.mount_id.as_str(),
+            mount.account_id.as_str(),
+            mount.drive_id.as_str(),
+            mount.root_item_id.as_str(),
+            mount_point,
+            mount.delta_token.as_deref(),
+            mount.read_only,
+            mount.blocked_reason.as_deref(),
+        ],
+    )
+    .ctx(|| format!("insert mount {}", mount.mount_id))?;
+    Ok(())
+}
+
+fn update_mount(
+    c: &Connection,
+    mount_id: &MountId,
+    column: &str,
+    value: Option<&str>,
+    action: &'static str,
+) -> Result<(), StoreError> {
+    let changed = c
+        .execute(
+            &format!("UPDATE mounts SET {column} = ?2 WHERE mount_id = ?1"),
+            params![mount_id.as_str(), value],
+        )
+        .ctx(|| format!("{action} of mount {mount_id}"))?;
+    if changed == 0 {
+        return Err(StoreError::MountNotFound {
+            action,
+            mount_id: mount_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn update_item(
+    c: &Connection,
+    key: &ItemKey,
+    column: &str,
+    value: &str,
+    action: &'static str,
+) -> Result<(), StoreError> {
+    let changed = c
+        .execute(
+            &format!("UPDATE items SET {column} = ?3 WHERE drive_id = ?1 AND item_id = ?2"),
+            params![key.drive_id.as_str(), key.item_id.as_str(), value],
+        )
+        .ctx(|| describe(action, key))?;
+    found(changed, key, action)
+}
+
+fn found(changed: usize, key: &ItemKey, action: &'static str) -> Result<(), StoreError> {
+    if changed == 0 {
+        return Err(StoreError::ItemNotFound {
+            action,
+            key: key.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn check_name(key: &ItemKey, name: &str) -> Result<(), StoreError> {
+    let reason = if name.is_empty() {
+        "is empty"
+    } else if name == "." || name == ".." {
+        "is a relative path component"
+    } else if name.contains('/') {
+        "contains '/'"
+    } else if name.contains('\0') {
+        "contains NUL"
+    } else {
+        return Ok(());
+    };
+    Err(StoreError::InvalidName {
+        key: key.clone(),
+        name: name.to_owned(),
+        reason,
+    })
+}
+
+fn to_i64_checked(size: u64, key: &ItemKey) -> Result<i64, StoreError> {
+    i64::try_from(size).map_err(|_| StoreError::SizeTooLarge {
+        key: key.clone(),
+        size,
+    })
+}
+
+fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
+    let key = &item.key;
+    check_name(key, &item.name)?;
+    let size = to_i64_checked(item.size, key)?;
+    if item_exists(c, key)? {
+        return Err(StoreError::ItemExists {
+            action: "insert an item",
+            key: key.clone(),
+        });
+    }
+    c.execute(
+        &format!(
+            "INSERT INTO items ({ITEM_COLUMNS}) VALUES \
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+        ),
+        params![
+            key.drive_id.as_str(),
+            key.item_id.as_str(),
+            item.parent_item_id.as_ref().map(ItemId::as_str),
+            item.name,
+            item.kind.as_str(),
+            size,
+            item.created.as_unix_seconds(),
+            item.modified.as_unix_seconds(),
+            item.etag.as_deref(),
+            item.ctag.as_deref(),
+            item.server_hash.as_ref().map(QuickXorHash::to_base64),
+            item.local_hash.as_ref().map(QuickXorHash::to_base64),
+            item.state.hydration.as_str(),
+            item.state.pin.as_str(),
+            item.state.sync.as_str(),
+            item.last_error.as_deref(),
+            item.is_provisional,
+        ],
+    )
+    .ctx(|| describe("insert", key))?;
+    Ok(())
+}
+
+/// Whether the server's content differs from what the stored row describes.
+fn content_changed(old: &Item, new: &RemoteMetadata) -> bool {
+    if old.kind != new.kind {
+        return true;
+    }
+    if old.kind == ItemKind::Folder {
+        return false;
+    }
+    match (&old.server_hash, &new.server_hash) {
+        (None, None) => old.etag != new.etag || old.size != new.size,
+        (old_hash, new_hash) => old_hash != new_hash,
+    }
+}
+
+fn apply_remote_metadata(
+    c: &Connection,
+    remote: &RemoteMetadata,
+) -> Result<RemoteApplied, StoreError> {
+    let key = &remote.key;
+    check_name(key, &remote.name)?;
+    let size = to_i64_checked(remote.size, key)?;
+    let old = load_item(c, key, "apply remote metadata")?;
+    if old.kind == ItemKind::Folder && remote.kind == ItemKind::File {
+        let children = child_count(c, key)?;
+        if children > 0 {
+            return Err(StoreError::FolderHasChildren {
+                key: key.clone(),
+                children,
+            });
+        }
+    }
+    let ids = [key.drive_id.as_str(), key.item_id.as_str()];
+    let parent = remote.parent_item_id.as_ref().map(ItemId::as_str);
+
+    if content_changed(&old, remote)
+        && !matches!(
+            old.state.sync,
+            SyncState::InSync | SyncState::PendingDownload
+        )
+    {
+        // Local state that may not be on the server: change nothing about content.
+        c.execute(
+            "UPDATE items SET parent_item_id = ?3, name = ?4 \
+             WHERE drive_id = ?1 AND item_id = ?2",
+            params![ids[0], ids[1], parent, remote.name],
+        )
+        .ctx(|| describe("apply a remote move of", key))?;
+        return Ok(RemoteApplied::ContentChangedUnderLocalState {
+            sync: old.state.sync,
+        });
+    }
+
+    let replaced = content_changed(&old, remote);
+    c.execute(
+        "UPDATE items SET parent_item_id = ?3, name = ?4, kind = ?5, size = ?6, \
+         created_at = ?7, modified_at = ?8, etag = ?9, ctag = ?10, server_hash = ?11 \
+         WHERE drive_id = ?1 AND item_id = ?2",
+        params![
+            ids[0],
+            ids[1],
+            parent,
+            remote.name,
+            remote.kind.as_str(),
+            size,
+            remote.created.as_unix_seconds(),
+            remote.modified.as_unix_seconds(),
+            remote.etag.as_deref(),
+            remote.ctag.as_deref(),
+            remote.server_hash.as_ref().map(QuickXorHash::to_base64),
+        ],
+    )
+    .ctx(|| describe("apply remote metadata to", key))?;
+    if !replaced {
+        return Ok(RemoteApplied::ContentUnchanged);
+    }
+    let ranges_cleared = clear_ranges(c, key)?;
+    let hydration = match remote.kind {
+        ItemKind::File => Hydration::Placeholder,
+        ItemKind::Folder => Hydration::Full,
+    };
+    c.execute(
+        "UPDATE items SET hydration = ?3 WHERE drive_id = ?1 AND item_id = ?2",
+        params![ids[0], ids[1], hydration.as_str()],
+    )
+    .ctx(|| describe("reset the hydration of", key))?;
+    Ok(RemoteApplied::ContentReplaced { ranges_cleared })
+}
+
+fn rekey_item(c: &Connection, old: &ItemKey, new_item_id: &ItemId) -> Result<(), StoreError> {
+    let item = load_item(c, old, "re-key an item")?;
+    if !item.is_provisional {
+        return Err(StoreError::NotProvisional { key: old.clone() });
+    }
+    let new = ItemKey::new(old.drive_id.clone(), new_item_id.clone());
+    if item_exists(c, &new)? {
+        return Err(StoreError::ItemExists {
+            action: "re-key an item",
+            key: new,
+        });
+    }
+    // Hydrated ranges follow through the foreign key's ON UPDATE CASCADE.
+    c.execute(
+        "UPDATE items SET item_id = ?3, is_provisional = 0 \
+         WHERE drive_id = ?1 AND item_id = ?2",
+        params![
+            old.drive_id.as_str(),
+            old.item_id.as_str(),
+            new_item_id.as_str()
+        ],
+    )
+    .ctx(|| describe("re-key", old))?;
+    c.execute(
+        "UPDATE items SET parent_item_id = ?3 WHERE drive_id = ?1 AND parent_item_id = ?2",
+        params![
+            old.drive_id.as_str(),
+            old.item_id.as_str(),
+            new_item_id.as_str()
+        ],
+    )
+    .ctx(|| describe("re-parent the children of", old))?;
+    Ok(())
+}
+
+/// The recursive set of `?2` and its descendants in drive `?1`. UNION, not UNION ALL, so
+/// a parent cycle cannot make it loop forever.
+const SUBTREE: &str = "WITH RECURSIVE subtree (item_id) AS ( \
+     SELECT ?2 UNION \
+     SELECT i.item_id FROM items AS i JOIN subtree AS s \
+     ON i.drive_id = ?1 AND i.parent_item_id = s.item_id) ";
+
+fn delete_item(
+    c: &Connection,
+    key: &ItemKey,
+    mode: DeleteMode,
+    pending: PendingChanges,
+) -> Result<u64, StoreError> {
+    if !item_exists(c, key)? {
+        return Err(StoreError::ItemNotFound {
+            action: "delete an item",
+            key: key.clone(),
+        });
+    }
+    let ids = [key.drive_id.as_str(), key.item_id.as_str()];
+    if mode == DeleteMode::ItemOnly {
+        let children = child_count(c, key)?;
+        if children > 0 {
+            return Err(StoreError::HasChildren {
+                key: key.clone(),
+                children,
+            });
+        }
+    }
+    if pending == PendingChanges::Refuse {
+        let states = PENDING_LOCAL
+            .iter()
+            .map(|s| format!("'{}'", s.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = c
+            .prepare(&format!(
+                "{SUBTREE} SELECT item_id FROM items WHERE drive_id = ?1 \
+                 AND item_id IN (SELECT item_id FROM subtree) AND sync IN ({states}) \
+                 ORDER BY item_id"
+            ))
+            .ctx(|| describe("look for pending local changes below", key))?;
+        let blocking: Vec<String> = stmt
+            .query_map(ids, |row| row.get(0))
+            .and_then(Iterator::collect)
+            .ctx(|| describe("look for pending local changes below", key))?;
+        if !blocking.is_empty() {
+            let pending = blocking
+                .into_iter()
+                .map(|id| {
+                    parse_id("items row", "item_id", id, ItemId::new)
+                        .map(|item_id| ItemKey::new(key.drive_id.clone(), item_id))
+                })
+                .collect::<Result<_, _>>()?;
+            return Err(StoreError::HasPendingLocalChanges {
+                key: key.clone(),
+                pending,
+            });
+        }
+    }
+    c.execute(
+        &format!(
+            "{SUBTREE} DELETE FROM hydrated_ranges WHERE drive_id = ?1 \
+             AND item_id IN (SELECT item_id FROM subtree)"
+        ),
+        ids,
+    )
+    .ctx(|| describe("delete the hydrated ranges below", key))?;
+    let deleted = c
+        .execute(
+            &format!(
+                "{SUBTREE} DELETE FROM items WHERE drive_id = ?1 \
+                 AND item_id IN (SELECT item_id FROM subtree)"
+            ),
+            ids,
+        )
+        .ctx(|| describe("delete", key))?;
+    Ok(u64::try_from(deleted).unwrap_or(u64::MAX))
+}
+
+fn resolve_path(
+    c: &Connection,
+    mount_id: &MountId,
+    key: &ItemKey,
+) -> Result<MountPath, StoreError> {
+    let (drive_id, root): (String, String) = c
+        .query_row(
+            "SELECT drive_id, root_item_id FROM mounts WHERE mount_id = ?1",
+            [mount_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .ctx(|| format!("read mount {mount_id}"))?
+        .ok_or_else(|| StoreError::MountNotFound {
+            action: "resolve a path",
+            mount_id: mount_id.clone(),
+        })?;
+    if drive_id != key.drive_id.as_str() {
+        return Err(StoreError::WrongDrive {
+            key: key.clone(),
+            mount_id: mount_id.clone(),
+        });
+    }
+    if !item_exists(c, key)? {
+        return Err(StoreError::ItemNotFound {
+            action: "resolve a path",
+            key: key.clone(),
+        });
+    }
+    let mut stmt = c
+        .prepare_cached(
+            "SELECT parent_item_id, name FROM items WHERE drive_id = ?1 AND item_id = ?2",
+        )
+        .ctx(|| describe("resolve the path of", key))?;
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut names = Vec::new();
+    let mut current = key.item_id.as_str().to_owned();
+    while current != root {
+        if !visited.insert(current.clone()) {
+            return Err(StoreError::ParentCycle {
+                key: key.clone(),
+                repeated: parse_id("items row", "item_id", current, ItemId::new)?,
+            });
+        }
+        let row: Option<(Option<String>, String)> = stmt
+            .query_row([drive_id.as_str(), current.as_str()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()
+            .ctx(|| describe("resolve the path of", key))?;
+        let Some((parent, name)) = row else {
+            return Err(StoreError::MissingAncestor {
+                key: key.clone(),
+                missing: parse_id("items row", "parent_item_id", current, ItemId::new)?,
+            });
+        };
+        names.push(name);
+        match parent {
+            Some(parent) => current = parent,
+            None => {
+                return Err(StoreError::NotInMount {
+                    key: key.clone(),
+                    mount_id: mount_id.clone(),
+                });
+            }
+        }
+    }
+    names.reverse();
+    Ok(MountPath::new(names))
+}
+
+fn record_range(c: &Connection, key: &ItemKey, range: ByteRange) -> Result<(), StoreError> {
+    file_size_checked(c, key, range, "record a hydrated range")?;
+    if range.is_empty() {
+        return Ok(());
+    }
+    let start = to_i64(range.start());
+    let end = to_i64(range.end());
+    let ids = [key.drive_id.as_str(), key.item_id.as_str()];
+    // Ranges are stored merged: no two overlap or touch. Every stored range that overlaps
+    // or touches the new one is replaced by their union.
+    let (merged_start, merged_end): (Option<i64>, Option<i64>) = c
+        .query_row(
+            "SELECT MIN(range_start), MAX(range_end) FROM hydrated_ranges \
+             WHERE drive_id = ?1 AND item_id = ?2 AND range_start <= ?4 AND range_end >= ?3",
+            params![ids[0], ids[1], start, end],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ctx(|| describe("read the hydrated ranges of", key))?;
+    let merged_start = merged_start.map_or(start, |s| s.min(start));
+    let merged_end = merged_end.map_or(end, |e| e.max(end));
+    c.execute(
+        "DELETE FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2 \
+         AND range_start <= ?4 AND range_end >= ?3",
+        params![ids[0], ids[1], start, end],
+    )
+    .ctx(|| describe("merge the hydrated ranges of", key))?;
+    c.execute(
+        "INSERT INTO hydrated_ranges (drive_id, item_id, range_start, range_end) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![ids[0], ids[1], merged_start, merged_end],
+    )
+    .ctx(|| describe("record a hydrated range of", key))?;
+    Ok(())
+}
+
+fn is_range_hydrated(c: &Connection, key: &ItemKey, range: ByteRange) -> Result<bool, StoreError> {
+    file_size_checked(c, key, range, "check a hydrated range")?;
+    if range.is_empty() {
+        return Ok(true);
+    }
+    // Stored ranges never overlap or touch, so one stored range must hold the whole
+    // query: the last one starting at or before the query's start.
+    let covering_end: Option<i64> = c
+        .query_row(
+            "SELECT range_end FROM hydrated_ranges \
+             WHERE drive_id = ?1 AND item_id = ?2 AND range_start <= ?3 \
+             ORDER BY range_start DESC LIMIT 1",
+            params![
+                key.drive_id.as_str(),
+                key.item_id.as_str(),
+                to_i64(range.start())
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .ctx(|| describe("check the hydrated ranges of", key))?;
+    Ok(covering_end.is_some_and(|end| end >= to_i64(range.end())))
+}
+
+fn ranges_of(c: &Connection, key: &ItemKey) -> Result<Vec<ByteRange>, StoreError> {
+    let mut stmt = c
+        .prepare_cached(
+            "SELECT range_start, range_end FROM hydrated_ranges \
+             WHERE drive_id = ?1 AND item_id = ?2 ORDER BY range_start",
+        )
+        .ctx(|| describe("list the hydrated ranges of", key))?;
+    let raw: Vec<(i64, i64)> = stmt
+        .query_map([key.drive_id.as_str(), key.item_id.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .and_then(Iterator::collect)
+        .ctx(|| describe("list the hydrated ranges of", key))?;
+    raw.into_iter()
+        .map(|(s, e)| {
+            let start = to_u64(s, "hydrated_ranges", "range_start", key)?;
+            let end = to_u64(e, "hydrated_ranges", "range_end", key)?;
+            ByteRange::new(start, end).map_err(|_| StoreError::Corrupt {
+                what: describe("hydrated_ranges row of", key),
+                value: format!("{s}..{e}"),
+                reason: "end is before start".to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn clear_ranges(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
+    let removed = c
+        .execute(
+            "DELETE FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2",
+            [key.drive_id.as_str(), key.item_id.as_str()],
+        )
+        .ctx(|| describe("clear the hydrated ranges of", key))?;
+    Ok(u64::try_from(removed).unwrap_or(u64::MAX))
+}
+
+fn covered_end(c: &Connection, key: &ItemKey) -> Result<Option<u64>, StoreError> {
+    let end: Option<i64> = c
+        .query_row(
+            "SELECT MAX(range_end) FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2",
+            [key.drive_id.as_str(), key.item_id.as_str()],
+            |row| row.get(0),
+        )
+        .ctx(|| describe("read the hydrated ranges of", key))?;
+    end.map(|e| to_u64(e, "hydrated_ranges", "range_end", key))
+        .transpose()
+}
+
+fn child_count(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM items WHERE drive_id = ?1 AND parent_item_id = ?2",
+            [key.drive_id.as_str(), key.item_id.as_str()],
+            |row| row.get(0),
+        )
+        .ctx(|| describe("count the children of", key))?;
+    to_u64(n, "items", "COUNT(*)", key)
+}
+
+// ------------------------------------------------------------------- helpers
 
 /// Runs `f` inside a savepoint: all of its statements take effect, or none do.
 ///
@@ -780,21 +1220,6 @@ fn describe(action: &str, key: &ItemKey) -> String {
     format!("{action} item {} in drive {}", key.item_id, key.drive_id)
 }
 
-/// Why a name would make a resolved path ambiguous, if it would.
-fn name_problem(name: &str) -> Option<&'static str> {
-    if name.is_empty() {
-        Some("is empty")
-    } else if name == "." || name == ".." {
-        Some("is a relative path component")
-    } else if name.contains('/') {
-        Some("contains '/'")
-    } else if name.contains('\0') {
-        Some("contains NUL")
-    } else {
-        None
-    }
-}
-
 /// Converts a value already checked to fit (sizes are at most `i64::MAX`).
 fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
@@ -817,38 +1242,35 @@ fn item_exists(c: &Connection, key: &ItemKey) -> Result<bool, StoreError> {
     .ctx(|| describe("look up", key))
 }
 
-fn mount_exists(c: &Connection, mount_id: &MountId) -> Result<bool, StoreError> {
+fn fetch_item(c: &Connection, key: &ItemKey) -> Result<Option<Item>, StoreError> {
     c.query_row(
-        "SELECT EXISTS (SELECT 1 FROM mounts WHERE mount_id = ?1)",
-        [mount_id.as_str()],
-        |row| row.get(0),
+        &format!("SELECT {ITEM_COLUMNS} FROM items WHERE drive_id = ?1 AND item_id = ?2"),
+        [key.drive_id.as_str(), key.item_id.as_str()],
+        RawItem::from_row,
     )
-    .ctx(|| format!("look up mount {mount_id}"))
+    .optional()
+    .ctx(|| describe("read", key))?
+    .map(RawItem::into_item)
+    .transpose()
+}
+
+fn load_item(c: &Connection, key: &ItemKey, action: &'static str) -> Result<Item, StoreError> {
+    fetch_item(c, key)?.ok_or_else(|| StoreError::ItemNotFound {
+        action,
+        key: key.clone(),
+    })
 }
 
 /// The size of a file, refusing missing items and folders.
 fn file_size(c: &Connection, key: &ItemKey, action: &'static str) -> Result<u64, StoreError> {
-    let row: Option<(String, i64)> = c
-        .query_row(
-            "SELECT kind, size FROM items WHERE drive_id = ?1 AND item_id = ?2",
-            [key.drive_id.as_str(), key.item_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .ctx(|| describe("look up", key))?;
-    let Some((kind, size)) = row else {
-        return Err(StoreError::ItemNotFound {
-            action,
-            key: key.clone(),
-        });
-    };
-    if parse_kind(kind, key)? == ItemKind::Folder {
+    let item = load_item(c, key, action)?;
+    if item.kind == ItemKind::Folder {
         return Err(StoreError::NotAFile {
             action,
             key: key.clone(),
         });
     }
-    to_u64(size, "items", "size", key)
+    Ok(item.size)
 }
 
 /// As [`file_size`], and refuses a range that ends past the end of the file.
@@ -897,14 +1319,6 @@ fn parse_id<T, E: std::fmt::Display>(
     })
 }
 
-fn parse_kind(value: String, key: &ItemKey) -> Result<ItemKind, StoreError> {
-    value.parse().map_err(|reason| StoreError::Corrupt {
-        what: describe("items row of", key) + " kind",
-        value,
-        reason,
-    })
-}
-
 fn parse_state<T: std::str::FromStr<Err = mydrive_core::state::ParseStateError>>(
     value: String,
     column: &str,
@@ -945,7 +1359,7 @@ struct RawItem {
     size: i64,
     created_at: i64,
     modified_at: i64,
-    etag: String,
+    etag: Option<String>,
     ctag: Option<String>,
     server_hash: Option<String>,
     local_hash: Option<String>,
@@ -953,6 +1367,7 @@ struct RawItem {
     pin: String,
     sync: String,
     last_error: Option<String>,
+    is_provisional: bool,
 }
 
 impl RawItem {
@@ -974,6 +1389,7 @@ impl RawItem {
             pin: row.get(13)?,
             sync: row.get(14)?,
             last_error: row.get(15)?,
+            is_provisional: row.get(16)?,
         })
     }
 
@@ -983,13 +1399,18 @@ impl RawItem {
             parse_id(&what, "drive_id", self.drive_id, DriveId::new)?,
             parse_id(&what, "item_id", self.item_id, ItemId::new)?,
         );
+        let kind = self.kind.parse().map_err(|reason| StoreError::Corrupt {
+            what: format!("{what} kind"),
+            value: self.kind.clone(),
+            reason,
+        })?;
         Ok(Item {
             parent_item_id: self
                 .parent_item_id
                 .map(|p| parse_id(&what, "parent_item_id", p, ItemId::new))
                 .transpose()?,
             name: self.name,
-            kind: parse_kind(self.kind, &key)?,
+            kind,
             size: to_u64(self.size, "items", "size", &key)?,
             created: Timestamp::from_unix_seconds(self.created_at),
             modified: Timestamp::from_unix_seconds(self.modified_at),
@@ -1003,6 +1424,7 @@ impl RawItem {
                 sync: parse_state::<SyncState>(self.sync, "sync", &key)?,
             },
             last_error: self.last_error,
+            is_provisional: self.is_provisional,
             key,
         })
     }
@@ -1070,8 +1492,9 @@ mod tests {
         })
     }
 
-    /// An operation that fails part way leaves none of its statements applied, on a bare
-    /// connection and inside a transaction that then commits.
+    /// An operation that fails part way (here a statement error, not a SQLite-initiated
+    /// rollback) leaves none of its statements applied, on a bare connection and inside a
+    /// transaction that then commits.
     #[test]
     fn atomic_rolls_back_a_partly_applied_operation() {
         let mut c = Connection::open_in_memory().unwrap();

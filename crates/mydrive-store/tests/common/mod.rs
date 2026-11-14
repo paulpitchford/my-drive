@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use mydrive_core::ids::{AccountId, DriveId, ItemId, ItemKey, MountId};
 use mydrive_core::state::{Hydration, ItemState, Pin, Sync as SyncState};
-use mydrive_store::{Account, Item, ItemKind, Mount, Queries, Store, Timestamp};
+use mydrive_store::{Account, Item, ItemKind, Mount, Queries, RemoteMetadata, Store, Timestamp};
 use tempfile::TempDir;
 
 pub const DRIVE: &str = "drive-a";
@@ -42,9 +42,34 @@ impl Fixture {
         store
             .insert_mount(&mount(MOUNT, ROOT, "/home/u/OneDrive"))
             .unwrap();
-        store.upsert_item(&folder(ROOT, None, "root")).unwrap();
+        store.insert_item(&folder(ROOT, None, "root")).unwrap();
         store
     }
+}
+
+/// Kills this process with SIGKILL: no destructors, no rollback, no clean close, and no
+/// core dump. Exits normally only if the kill failed, which makes the parent's check fail.
+pub fn kill_self() -> ! {
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &std::process::id().to_string()])
+        .status();
+    std::process::exit(0);
+}
+
+/// Re-runs `test` (in the current test binary) as a child process with `env` set to
+/// `value`, and checks that it was killed by SIGKILL.
+pub fn run_child_until_killed(test: &str, env: &str, value: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(env, value)
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "the child must be killed, not exit: {status}"
+    );
 }
 
 pub fn raw(path: &Path) -> rusqlite::Connection {
@@ -88,7 +113,7 @@ pub fn file(id: &str, parent: Option<&str>, name: &str, size: u64) -> Item {
         size,
         created: Timestamp::from_unix_seconds(1_700_000_000),
         modified: Timestamp::from_unix_seconds(1_700_000_100),
-        etag: format!("etag-{id}"),
+        etag: Some(format!("etag-{id}")),
         ctag: None,
         server_hash: None,
         local_hash: None,
@@ -98,6 +123,23 @@ pub fn file(id: &str, parent: Option<&str>, name: &str, size: u64) -> Item {
             sync: SyncState::InSync,
         },
         last_error: None,
+        is_provisional: false,
+    }
+}
+
+/// The server-owned part of `item`, as a delta would report it unchanged.
+pub fn remote(item: &Item) -> RemoteMetadata {
+    RemoteMetadata {
+        key: item.key.clone(),
+        parent_item_id: item.parent_item_id.clone(),
+        name: item.name.clone(),
+        kind: item.kind,
+        size: item.size,
+        created: item.created,
+        modified: item.modified,
+        etag: item.etag.clone(),
+        ctag: item.ctag.clone(),
+        server_hash: item.server_hash,
     }
 }
 

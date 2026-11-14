@@ -97,6 +97,17 @@ fn adr_0007_r4_same_root_cannot_be_mounted_twice() {
     assert_eq!(store.mounts().unwrap().len(), 1);
 }
 
+/// Lead ruling 6: `Mount`'s `Debug` never shows the delta token.
+#[test]
+fn mount_debug_redacts_the_delta_token() {
+    let mut m = mount(MOUNT, ROOT, "/home/u/OneDrive");
+    m.delta_token = Some("secret-token-value".to_owned());
+    let shown = format!("{m:?}");
+    assert!(!shown.contains("secret-token-value"), "{shown}");
+    assert!(shown.contains("<redacted>"), "{shown}");
+    assert!(shown.contains(MOUNT), "{shown}");
+}
+
 #[test]
 fn mount_insert_refusals() {
     let fx = Fixture::new();

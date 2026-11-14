@@ -34,15 +34,83 @@ pub enum StoreError {
         supported: i64,
     },
 
-    /// The file has tables but no schema version, so it is not a my-drive state store.
-    /// Nothing was changed.
+    /// The file is not a my-drive state store: not SQLite, or SQLite with another
+    /// application ID, or with tables but no my-drive schema. Nothing was changed.
     #[error(
-        "cannot open state store {path}: it holds tables but no my-drive schema version, so it \
-         is not a my-drive state store; the file was not modified"
+        "cannot open state store {path}: {reason}, so it is not a my-drive state store; the \
+         file was not modified"
     )]
     NotAStateStore {
         /// The database file.
         path: PathBuf,
+        /// What gave it away.
+        reason: String,
+    },
+
+    /// SQLite rolled the transaction back on its own (for example after `SQLITE_FULL` or an
+    /// I/O error). Nothing in it was applied, and every further call on it is refused so
+    /// that no later statement can commit on its own.
+    #[error("state store: the transaction was rolled back by SQLite and can no longer be used")]
+    TransactionAborted {
+        /// The error that ended the transaction, when this call saw it.
+        #[source]
+        cause: Option<Box<StoreError>>,
+    },
+
+    /// An item with this key already exists.
+    #[error("state store: {action}: item {item_id} in drive {drive_id} already exists",
+        drive_id = .key.drive_id, item_id = .key.item_id)]
+    ItemExists {
+        /// What was being done.
+        action: &'static str,
+        /// The existing key.
+        key: ItemKey,
+    },
+
+    /// Only a provisional item can be given its server ID.
+    #[error("state store: cannot re-key item {item_id} in drive {drive_id}: it is not \
+             provisional", drive_id = .key.drive_id, item_id = .key.item_id)]
+    NotProvisional {
+        /// The item.
+        key: ItemKey,
+    },
+
+    /// A compare-and-set of the sync state found another value.
+    #[error("state store: cannot set sync of item {item_id} in drive {drive_id} to {new}: \
+             expected {expected}, found {actual}",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    SyncMismatch {
+        /// The item.
+        key: ItemKey,
+        /// The value the caller expected.
+        expected: mydrive_core::state::Sync,
+        /// The value stored.
+        actual: mydrive_core::state::Sync,
+        /// The value the caller wanted to set.
+        new: mydrive_core::state::Sync,
+    },
+
+    /// A folder that has children cannot become a file.
+    #[error("state store: refusing to turn folder {item_id} in drive {drive_id} into a file: \
+             it has {children} children", drive_id = .key.drive_id, item_id = .key.item_id)]
+    FolderHasChildren {
+        /// The folder.
+        key: ItemKey,
+        /// How many direct children it has.
+        children: u64,
+    },
+
+    /// A delete would remove local changes that have not reached the server.
+    #[error("state store: refusing to delete item {item_id} in drive {drive_id}: {count} \
+             item(s) have local changes not on the server: {listed}",
+             drive_id = .key.drive_id, item_id = .key.item_id,
+             count = .pending.len(), listed = list_keys(.pending))]
+    HasPendingLocalChanges {
+        /// The item asked to be deleted.
+        key: ItemKey,
+        /// Every item in the delete whose sync is `pending-upload`, `uploading` or
+        /// `conflict`.
+        pending: Vec<ItemKey>,
     },
 
     /// SQLite would not switch the database to WAL mode (ADR-0006 R2).
@@ -147,20 +215,17 @@ pub enum StoreError {
         size: u64,
     },
 
-    /// An upsert would leave hydrated ranges that the item can no longer hold, because the
-    /// new size is smaller than the ranges or the item became a folder. Clear the ranges
-    /// first, in the same transaction.
+    /// A local size change would leave hydrated ranges past the new end of the file.
+    /// Clear or re-record the ranges first, in the same transaction.
     #[error(
-        "state store: cannot update item {item_id} in drive {drive_id} to a {kind} of size \
-         {size}: its hydrated ranges reach byte {covered_end}; clear them first",
+        "state store: cannot set the size of item {item_id} in drive {drive_id} to {size}: \
+         its hydrated ranges reach byte {covered_end}; clear them first",
         drive_id = .key.drive_id, item_id = .key.item_id
     )]
     RangesWouldExceedItem {
         /// The item.
         key: ItemKey,
-        /// The kind the upsert asked for.
-        kind: crate::types::ItemKind,
-        /// The size the upsert asked for.
+        /// The size asked for.
         size: u64,
         /// One past the last hydrated byte.
         covered_end: u64,
@@ -256,6 +321,13 @@ pub enum StoreError {
         /// The first item seen twice.
         repeated: ItemId,
     },
+}
+
+fn list_keys(keys: &[ItemKey]) -> String {
+    keys.iter()
+        .map(|k| format!("{} in drive {}", k.item_id, k.drive_id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Adds what was being done to a SQLite error. The description is built only on failure.

@@ -20,7 +20,9 @@ pub struct Account {
 }
 
 /// A drive, or a folder within one, attached to a local mount point (ADR-0007).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` redacts the delta token, which must never reach a log.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Mount {
     /// The mount's identity.
     pub mount_id: MountId,
@@ -38,6 +40,24 @@ pub struct Mount {
     pub read_only: bool,
     /// Why organisation policy blocks the mount; `None` when it is not blocked.
     pub blocked_reason: Option<String>,
+}
+
+impl fmt::Debug for Mount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mount")
+            .field("mount_id", &self.mount_id)
+            .field("account_id", &self.account_id)
+            .field("drive_id", &self.drive_id)
+            .field("root_item_id", &self.root_item_id)
+            .field("mount_point", &self.mount_point)
+            .field(
+                "delta_token",
+                &self.delta_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("read_only", &self.read_only)
+            .field("blocked_reason", &self.blocked_reason)
+            .finish()
+    }
 }
 
 /// Whether an item is a file or a folder.
@@ -119,8 +139,9 @@ pub struct Item {
     pub created: Timestamp,
     /// When the item was last modified, as the server reports it.
     pub modified: Timestamp,
-    /// The server's eTag for the item.
-    pub etag: String,
+    /// The server's eTag for the item; `None` until the server has one (a provisional
+    /// item).
+    pub etag: Option<String>,
     /// The server's cTag; business delta omits it.
     pub ctag: Option<String>,
     /// The quickXorHash the server reports (ADR-0012 "Two hashes").
@@ -131,6 +152,73 @@ pub struct Item {
     pub state: ItemState,
     /// The most recent error for the item, for `mydrive activity` and `mydrive status`.
     pub last_error: Option<String>,
+    /// The item was created locally and the server has not assigned its ID yet: `item_id`
+    /// is a provisional value the engine generated. Cleared by
+    /// [`rekey_item`](crate::Queries::rekey_item).
+    pub is_provisional: bool,
+}
+
+/// The server-owned part of an item, as a delta or an upload response reports it.
+///
+/// [`apply_remote_metadata`](crate::Queries::apply_remote_metadata) writes only these
+/// fields; local hash, hydration, pin, sync and last error are never touched by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMetadata {
+    /// The item's identity.
+    pub key: ItemKey,
+    /// The parent folder in the same drive; `None` for the drive root.
+    pub parent_item_id: Option<ItemId>,
+    /// The item's name within its parent.
+    pub name: String,
+    /// File or folder.
+    pub kind: ItemKind,
+    /// Size in bytes.
+    pub size: u64,
+    /// When the item was created.
+    pub created: Timestamp,
+    /// When the item was last modified.
+    pub modified: Timestamp,
+    /// The server's eTag.
+    pub etag: Option<String>,
+    /// The server's cTag, if the server sent one.
+    pub ctag: Option<String>,
+    /// The quickXorHash the server reports, if any.
+    pub server_hash: Option<QuickXorHash>,
+}
+
+/// What [`apply_remote_metadata`](crate::Queries::apply_remote_metadata) did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteApplied {
+    /// The content identity did not change; every server-owned column was written.
+    ContentUnchanged,
+    /// The content changed and nothing local was pending (sync `in-sync` or
+    /// `pending-download`): every server-owned column was written, the hydrated ranges
+    /// were cleared and hydration set to `placeholder` (`full` for a folder).
+    ContentReplaced {
+        /// How many hydrated ranges were removed.
+        ranges_cleared: u64,
+    },
+    /// The content changed while the item holds local state that may not be on the server
+    /// (sync `pending-upload`, `uploading`, `conflict`, `error` or `blocked`). Only the
+    /// parent and name were written. Content columns (kind, size, timestamps, eTag, cTag,
+    /// server hash), ranges and every local column are untouched, so the stale eTag still
+    /// makes the next upload fail with 412. The engine runs conflict handling.
+    ContentChangedUnderLocalState {
+        /// The item's sync state, unchanged.
+        sync: mydrive_core::state::Sync,
+    },
+}
+
+/// Whether [`delete_item`](crate::Queries::delete_item) may remove items with local
+/// changes that have not reached the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingChanges {
+    /// Refuse if the item, or any descendant, has sync `pending-upload`, `uploading` or
+    /// `conflict`.
+    Refuse,
+    /// The server has confirmed a delete the user made locally, so the pending state is
+    /// that delete and removing the rows loses nothing.
+    ServerConfirmedLocalDelete,
 }
 
 /// A half-open byte range `[start, end)` within a file.

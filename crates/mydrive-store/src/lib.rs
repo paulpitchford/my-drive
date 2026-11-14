@@ -22,15 +22,17 @@ mod ops;
 mod schema;
 mod types;
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, TransactionBehavior};
 
 pub use crate::error::StoreError;
 pub use crate::ops::Queries;
-pub use crate::schema::SCHEMA_VERSION;
+pub use crate::schema::{APPLICATION_ID, SCHEMA_VERSION};
 pub use crate::types::{
-    Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, Timestamp,
+    Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, PendingChanges,
+    RemoteApplied, RemoteMetadata, Timestamp,
 };
 
 use crate::error::SqlContext;
@@ -51,9 +53,9 @@ impl Store {
     /// # Errors
     ///
     /// [`StoreError::SchemaTooNew`] if the file was written by a newer build, and
-    /// [`StoreError::NotAStateStore`] if it is some other SQLite database; in both cases
-    /// the file is not modified. [`StoreError::NotWal`] if WAL mode is unavailable, and
-    /// [`StoreError::Sqlite`] for any other failure.
+    /// [`StoreError::NotAStateStore`] if it is not SQLite or not a my-drive store; in both
+    /// cases the file is not modified. [`StoreError::NotWal`] if WAL mode is unavailable,
+    /// and [`StoreError::Sqlite`] for any other failure.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
         let conn = schema::open(path)?;
@@ -80,7 +82,10 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .ctx(|| "begin a transaction")?;
-        Ok(Transaction { tx })
+        Ok(Transaction {
+            tx,
+            aborted: Cell::new(false),
+        })
     }
 }
 
@@ -88,9 +93,16 @@ impl Store {
 /// token that follows it.
 ///
 /// Dropping a transaction without calling [`commit`](Self::commit) rolls it back.
+///
+/// An operation that the store refuses (a constraint, a missing item) changes nothing and
+/// leaves the transaction usable. If SQLite itself rolls the transaction back (after
+/// `SQLITE_FULL`, an I/O error, out of memory), every later call, including
+/// [`commit`](Self::commit), fails with [`StoreError::TransactionAborted`]: otherwise later
+/// statements would run outside any transaction and commit one by one.
 #[derive(Debug)]
 pub struct Transaction<'s> {
     tx: rusqlite::Transaction<'s>,
+    aborted: Cell<bool>,
 }
 
 impl Transaction<'_> {
@@ -98,8 +110,11 @@ impl Transaction<'_> {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Sqlite`] if the commit fails; nothing in the transaction is applied.
+    /// [`StoreError::TransactionAborted`] if SQLite already rolled it back, and
+    /// [`StoreError::Sqlite`] if the commit fails; in both cases nothing in the
+    /// transaction is applied.
     pub fn commit(self) -> Result<(), StoreError> {
+        self.check_live()?;
         self.tx.commit().ctx(|| "commit a transaction")
     }
 
@@ -109,21 +124,176 @@ impl Transaction<'_> {
     ///
     /// [`StoreError::Sqlite`] if SQLite reports a failure while rolling back.
     pub fn rollback(self) -> Result<(), StoreError> {
+        if self.tx.is_autocommit() {
+            // SQLite already rolled back; there is nothing left to undo.
+            return Ok(());
+        }
         self.tx.rollback().ctx(|| "roll back a transaction")
+    }
+
+    /// Fails, and stays failed, once SQLite has ended the transaction by itself.
+    fn check_live(&self) -> Result<(), StoreError> {
+        if self.aborted.get() || self.tx.is_autocommit() {
+            self.aborted.set(true);
+            return Err(StoreError::TransactionAborted { cause: None });
+        }
+        Ok(())
     }
 }
 
 impl ops::sealed::Connected for Store {
-    fn connection(&self, _: ops::sealed::Token) -> &Connection {
-        &self.conn
+    fn run<T, F>(&self, _: ops::sealed::Token, op: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Connection) -> Result<T, StoreError>,
+    {
+        op(&self.conn)
     }
 }
 
 impl ops::sealed::Connected for Transaction<'_> {
-    fn connection(&self, _: ops::sealed::Token) -> &Connection {
-        &self.tx
+    fn run<T, F>(&self, _: ops::sealed::Token, op: F) -> Result<T, StoreError>
+    where
+        F: FnOnce(&Connection) -> Result<T, StoreError>,
+    {
+        self.check_live()?;
+        let result = op(&self.tx);
+        if self.tx.is_autocommit() {
+            self.aborted.set(true);
+            return Err(StoreError::TransactionAborted {
+                cause: result.err().map(Box::new),
+            });
+        }
+        result
     }
 }
 
 impl Queries for Store {}
 impl Queries for Transaction<'_> {}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use mydrive_core::ids::{AccountId, DriveId, ItemId, ItemKey};
+    use mydrive_core::state::{Hydration, ItemState, Pin, Sync as SyncState};
+
+    use super::*;
+
+    fn account(n: usize) -> Account {
+        Account {
+            account_id: AccountId::new(format!("acct-{n}")).unwrap(),
+            tenant_id: None,
+        }
+    }
+
+    fn big_item(n: usize) -> Item {
+        Item {
+            key: ItemKey::new(
+                DriveId::new("d").unwrap(),
+                ItemId::new(format!("i{n}")).unwrap(),
+            ),
+            parent_item_id: None,
+            name: format!("{n}-{}", "x".repeat(2000)),
+            kind: ItemKind::File,
+            size: 1,
+            created: Timestamp::from_unix_seconds(0),
+            modified: Timestamp::from_unix_seconds(0),
+            etag: None,
+            ctag: None,
+            server_hash: None,
+            local_hash: None,
+            state: ItemState {
+                hydration: Hydration::Placeholder,
+                pin: Pin::Inherit,
+                sync: SyncState::InSync,
+            },
+            last_error: None,
+            is_provisional: false,
+        }
+    }
+
+    /// Review finding (blocking): after SQLite rolls a transaction back by itself, further
+    /// calls on the `Transaction` must not commit on their own. The database is capped with
+    /// `max_page_count` so a batch fails with `SQLITE_FULL`; then more calls are made, the
+    /// transaction is dropped and the store reopened: nothing from the batch is present.
+    #[test]
+    fn sqlite_full_aborts_the_transaction_and_nothing_from_the_batch_persists() {
+        let (path, _dir) = full_store_scenario(|tx| {
+            let commit = tx.commit();
+            assert!(
+                matches!(commit, Err(StoreError::TransactionAborted { .. })),
+                "{commit:?}"
+            );
+        });
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.account(&account(0).account_id).unwrap(), None);
+        assert_eq!(store.account(&account(1).account_id).unwrap(), None);
+        assert_eq!(store.item(&big_item(0).key).unwrap(), None);
+    }
+
+    /// The same, with the transaction dropped instead of committed.
+    #[test]
+    fn sqlite_full_then_drop_leaves_nothing_from_the_batch() {
+        let (path, _dir) = full_store_scenario(|tx| drop(tx));
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.account(&account(0).account_id).unwrap(), None);
+        assert_eq!(store.account(&account(1).account_id).unwrap(), None);
+        assert_eq!(store.item(&big_item(0).key).unwrap(), None);
+    }
+
+    /// Fills a capped store inside one transaction until SQLite rolls it back, checks that
+    /// further calls are refused, then hands the transaction to `finish`.
+    fn full_store_scenario(
+        finish: impl FnOnce(Transaction<'_>),
+    ) -> (std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut store = Store::open(&path).unwrap();
+        let pages: i64 = store
+            .conn
+            .pragma_query_value(None, "page_count", |r| r.get(0))
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "max_page_count", pages + 4)
+            .unwrap();
+
+        let tx = store.transaction().unwrap();
+        tx.upsert_account(&account(0)).unwrap();
+        let mut failure = None;
+        for n in 0..200 {
+            if let Err(e) = tx.insert_item(&big_item(n)) {
+                failure = Some(e);
+                break;
+            }
+        }
+        let failure = failure.unwrap();
+        let full = matches!(
+            &failure,
+            StoreError::TransactionAborted { cause: Some(cause) }
+                if matches!(**cause, StoreError::Sqlite { ref source, .. }
+                    if source.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull))
+        );
+        assert!(full, "the batch failed with SQLITE_FULL: {failure}");
+        assert!(
+            tx.tx.is_autocommit(),
+            "SQLite rolled the transaction back itself"
+        );
+
+        // The reviewer's scenario: carry on after the failure. Each call is refused, so
+        // none of them can commit on its own.
+        let after = tx.upsert_account(&account(1));
+        assert!(
+            matches!(after, Err(StoreError::TransactionAborted { cause: None })),
+            "{after:?}"
+        );
+        let read = tx.account(&account(0).account_id);
+        assert!(
+            matches!(read, Err(StoreError::TransactionAborted { .. })),
+            "{read:?}"
+        );
+        finish(tx);
+        drop(store);
+        (path, dir)
+    }
+}

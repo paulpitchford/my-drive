@@ -18,7 +18,7 @@ fn r(start: u64, end: u64) -> ByteRange {
 fn ac3_adjacent_and_overlapping_ranges_merge() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    store.upsert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
+    store.insert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
     let k = key("f");
 
     store.record_hydrated_range(&k, r(10, 20)).unwrap();
@@ -50,7 +50,7 @@ fn ac3_adjacent_and_overlapping_ranges_merge() {
 fn ac3_range_is_present_only_when_every_byte_is_covered() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    store.upsert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
+    store.insert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
     let k = key("f");
     store.record_hydrated_range(&k, r(10, 20)).unwrap();
     store.record_hydrated_range(&k, r(21, 30)).unwrap();
@@ -68,9 +68,9 @@ fn ac3_range_is_present_only_when_every_byte_is_covered() {
 fn ac3_zero_length_ranges_are_handled() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    store.upsert_item(&file("f", Some(ROOT), "f", 10)).unwrap();
+    store.insert_item(&file("f", Some(ROOT), "f", 10)).unwrap();
     store
-        .upsert_item(&file("empty", Some(ROOT), "e", 0))
+        .insert_item(&file("empty", Some(ROOT), "e", 0))
         .unwrap();
     let k = key("f");
 
@@ -102,7 +102,7 @@ fn ac3_reversed_range_cannot_be_built() {
 fn ac3_ranges_cannot_exceed_the_item_size() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    store.upsert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
+    store.insert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
     let k = key("f");
 
     let err = store.record_hydrated_range(&k, r(90, 101)).unwrap_err();
@@ -121,7 +121,7 @@ fn ac3_ranges_cannot_exceed_the_item_size() {
 fn ranges_are_refused_for_folders_and_unknown_items() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    store.upsert_item(&folder("d", Some(ROOT), "d")).unwrap();
+    store.insert_item(&folder("d", Some(ROOT), "d")).unwrap();
     let err = store.record_hydrated_range(&key("d"), r(0, 0)).unwrap_err();
     assert!(matches!(err, StoreError::NotAFile { .. }), "{err}");
     let err = store.record_hydrated_range(&key("x"), r(0, 1)).unwrap_err();
@@ -134,8 +134,8 @@ fn ranges_are_refused_for_folders_and_unknown_items() {
 fn clear_removes_every_range_of_one_item_only() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    store.upsert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
-    store.upsert_item(&file("g", Some(ROOT), "g", 100)).unwrap();
+    store.insert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
+    store.insert_item(&file("g", Some(ROOT), "g", 100)).unwrap();
     store.record_hydrated_range(&key("f"), r(0, 10)).unwrap();
     store.record_hydrated_range(&key("f"), r(50, 60)).unwrap();
     store.record_hydrated_range(&key("g"), r(0, 10)).unwrap();
@@ -154,7 +154,7 @@ fn adr_0006_r6_hydrated_ranges_come_from_the_store_only() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
     store
-        .upsert_item(&file("f", Some(ROOT), "f", 4096))
+        .insert_item(&file("f", Some(ROOT), "f", 4096))
         .unwrap();
     // A fully written (no holes) file next to the store has no bearing on the answer.
     std::fs::write(fx.dir.path().join("f"), vec![1u8; 4096]).unwrap();
@@ -205,7 +205,7 @@ proptest! {
         let fx = Fixture::new();
         let mut store = fx.open_with_mount();
         let tx = store.transaction().unwrap();
-        tx.upsert_item(&file("f", Some(ROOT), "f", size)).unwrap();
+        tx.insert_item(&file("f", Some(ROOT), "f", size)).unwrap();
         let k = key("f");
         let mut model: BTreeSet<u64> = BTreeSet::new();
 
