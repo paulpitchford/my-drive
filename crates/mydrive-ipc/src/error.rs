@@ -2,24 +2,27 @@
 //!
 //! The integer codes are part of the protocol: once released they never change meaning
 //! (ADR-0009 "Compatibility"). Codes from the JSON-RPC 2.0 specification keep their standard
-//! values; the protocol's own codes are in the 1000s, outside the range JSON-RPC reserves
-//! (-32768 to -32000).
+//! values; the protocol's own codes are positive, from 1001, outside the range JSON-RPC
+//! reserves (-32768 to -32000). Error codes are an open set (ADR-0019): [`RpcError`] keeps
+//! the raw integer, and `data` is kept as raw JSON read through tolerant accessors, so an
+//! unexpected code or data shape never fails the response that carries it.
 
 use std::fmt;
 
 use mydrive_core::state::{DehydrateRefusal, Sync as SyncState};
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
-/// Every error code the protocol defines, with its stable integer value.
-///
-/// An [`RpcError`] keeps the raw integer, so a client can still handle an error whose code
-/// was added in a later minor revision; [`RpcError::kind`] maps it back when it is known.
+use crate::values::RefusalReason;
+
+/// Every error code this build defines, with its stable integer value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     /// JSON-RPC: the line was not valid JSON (or not valid UTF-8).
     ParseError,
-    /// JSON-RPC: the JSON was not a valid request object, or the line was over the limit.
+    /// JSON-RPC: not a valid request object (including a batch array), or the line was over
+    /// the limit.
     InvalidRequest,
     /// JSON-RPC: no such method.
     MethodNotFound,
@@ -27,8 +30,7 @@ pub enum ErrorCode {
     InvalidParams,
     /// JSON-RPC: an internal daemon error.
     Internal,
-    /// The daemon cannot serve the request yet: `hello` has not completed on this connection,
-    /// or the daemon is still starting.
+    /// The daemon is still starting; retry later (ADR-0019 R5).
     NotReady,
     /// The path is under a mount point but no such item is known.
     UnknownPath,
@@ -47,6 +49,9 @@ pub enum ErrorCode {
     /// `hello` named no protocol version the daemon supports; `data.supported_versions`
     /// lists the ones it does (ADR-0009 R4).
     UnsupportedVersion,
+    /// A request other than `hello` before `hello` completed on this connection. A client
+    /// bug: retrying does not help (ADR-0019 R5).
+    HelloRequired,
 }
 
 impl ErrorCode {
@@ -66,6 +71,7 @@ impl ErrorCode {
         Self::ReadOnly,
         Self::Offline,
         Self::UnsupportedVersion,
+        Self::HelloRequired,
     ];
 
     /// The integer sent in `error.code`.
@@ -86,6 +92,7 @@ impl ErrorCode {
             Self::ReadOnly => 1007,
             Self::Offline => 1008,
             Self::UnsupportedVersion => 1009,
+            Self::HelloRequired => 1010,
         }
     }
 
@@ -107,10 +114,11 @@ impl ErrorCode {
             Self::ReadOnly => "read-only",
             Self::Offline => "offline",
             Self::UnsupportedVersion => "unsupported-version",
+            Self::HelloRequired => "hello-required",
         }
     }
 
-    /// The code with this integer value, if the protocol defines one.
+    /// The code with this integer value, if this build defines one.
     #[must_use]
     pub fn from_code(code: i64) -> Option<Self> {
         Self::ALL.iter().copied().find(|c| c.code() == code)
@@ -123,89 +131,7 @@ impl fmt::Display for ErrorCode {
     }
 }
 
-/// Why a [`ErrorCode::Refused`] request was refused.
-///
-/// The wire form is a kebab-case string. A reason this build does not know is kept as
-/// [`RefusalReason::Other`] rather than failing the whole response, so a newer daemon can add
-/// reasons without breaking older clients.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum RefusalReason {
-    /// The item's sync state is not `in-sync`; `data.sync` names it. Dehydrating would risk
-    /// content that is not on the server (ADR-0008 R5, R7).
-    NotInSync,
-    /// The item's effective pin is `pinned` (engine-level dehydrate, ADR-0008 R5).
-    Pinned,
-    /// The file has open handles (F06 step 9).
-    InUse,
-    /// The item changed on the server or is gone; delta must apply first (F06).
-    RemoteChanged,
-    /// The content does not fit on the backing filesystem (F06).
-    InsufficientSpace,
-    /// A reason this build does not know.
-    Other(String),
-}
-
-impl RefusalReason {
-    /// The wire form.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::NotInSync => "not-in-sync",
-            Self::Pinned => "pinned",
-            Self::InUse => "in-use",
-            Self::RemoteChanged => "remote-changed",
-            Self::InsufficientSpace => "insufficient-space",
-            Self::Other(other) => other,
-        }
-    }
-
-    /// Parses a wire form; unknown strings become [`RefusalReason::Other`].
-    #[must_use]
-    pub fn from_wire(value: &str) -> Self {
-        match value {
-            "not-in-sync" => Self::NotInSync,
-            "pinned" => Self::Pinned,
-            "in-use" => Self::InUse,
-            "remote-changed" => Self::RemoteChanged,
-            "insufficient-space" => Self::InsufficientSpace,
-            other => Self::Other(other.to_owned()),
-        }
-    }
-}
-
-impl fmt::Display for RefusalReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl Serialize for RefusalReason {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for RefusalReason {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ReasonVisitor;
-
-        impl Visitor<'_> for ReasonVisitor {
-            type Value = RefusalReason;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a refusal reason string")
-            }
-
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<RefusalReason, E> {
-                Ok(RefusalReason::from_wire(v))
-            }
-        }
-
-        deserializer.deserialize_str(ReasonVisitor)
-    }
-}
-
-/// Structured detail in `error.data`. Every field is optional; unknown fields are ignored.
+/// Structured detail for building `error.data`. Every field is optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorData {
     /// For `refused`: why.
@@ -220,14 +146,24 @@ pub struct ErrorData {
 }
 
 impl ErrorData {
-    fn is_empty(&self) -> bool {
-        self == &Self::default()
+    fn into_value(self) -> Option<Value> {
+        let mut map = Map::new();
+        if let Some(reason) = self.reason {
+            map.insert("reason".into(), Value::String(reason.as_str().to_owned()));
+        }
+        if let Some(sync) = self.sync {
+            map.insert("sync".into(), Value::String(sync.as_str().to_owned()));
+        }
+        if let Some(versions) = self.supported_versions {
+            map.insert("supported_versions".into(), Value::from(versions));
+        }
+        (!map.is_empty()).then_some(Value::Object(map))
     }
 }
 
 /// A JSON-RPC 2.0 error object: `{"code": ..., "message": ..., "data": ...}`.
 ///
-/// `message` is for people and may change; programs act on `code` and `data`.
+/// `message` is for people and may change; programs act on `code` and `data` (ADR-0019 R6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("{message} (error {code})")]
 pub struct RpcError {
@@ -235,9 +171,11 @@ pub struct RpcError {
     pub code: i64,
     /// A human-readable description that says what failed and why.
     pub message: String,
-    /// Structured detail, when the code defines any.
+    /// Structured detail as received. Read it with [`RpcError::reason`],
+    /// [`RpcError::sync`] and [`RpcError::supported_versions`], which return `None` for a
+    /// missing or unexpected shape instead of failing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<ErrorData>,
+    pub data: Option<Value>,
 }
 
 impl RpcError {
@@ -254,7 +192,7 @@ impl RpcError {
     /// Attaches structured detail. Empty detail is dropped so it is not sent as `{}`.
     #[must_use]
     pub fn with_data(mut self, data: ErrorData) -> Self {
-        self.data = if data.is_empty() { None } else { Some(data) };
+        self.data = data.into_value();
         self
     }
 
@@ -262,6 +200,29 @@ impl RpcError {
     #[must_use]
     pub fn kind(&self) -> Option<ErrorCode> {
         ErrorCode::from_code(self.code)
+    }
+
+    fn data_field<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let value = self.data.as_ref()?.get(key)?;
+        T::deserialize(value).ok()
+    }
+
+    /// `data.reason`, if present and a string.
+    #[must_use]
+    pub fn reason(&self) -> Option<RefusalReason> {
+        self.data_field("reason")
+    }
+
+    /// `data.sync`, if present and a known sync state.
+    #[must_use]
+    pub fn sync(&self) -> Option<SyncState> {
+        self.data_field("sync")
+    }
+
+    /// `data.supported_versions`, if present and a list of integers.
+    #[must_use]
+    pub fn supported_versions(&self) -> Option<Vec<u32>> {
+        self.data_field("supported_versions")
     }
 
     /// `method-not-found` for `method`.
@@ -328,6 +289,8 @@ impl From<DehydrateRefusal> for RpcError {
 mod tests {
     use std::collections::HashSet;
 
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -366,35 +329,51 @@ mod tests {
                 ("read-only", 1007),
                 ("offline", 1008),
                 ("unsupported-version", 1009),
+                ("hello-required", 1010),
             ]
         );
     }
 
+    /// ADR-0019 R4: an unknown error code and an unknown reason parse and are preserved.
     #[test]
     fn unknown_codes_and_reasons_survive_parsing() {
-        let err: RpcError = serde_json::from_str(
-            r#"{"code":1999,"message":"new","data":{"reason":"brand-new","extra":1}}"#,
-        )
-        .unwrap();
+        let input = json!({"code":1999,"message":"new","data":{"reason":"brand-new","extra":1}});
+        let err: RpcError = serde_json::from_value(input.clone()).unwrap();
         assert_eq!(err.kind(), None);
-        let data = err.data.unwrap();
-        assert_eq!(data.reason, Some(RefusalReason::Other("brand-new".into())));
-        assert_eq!(
-            serde_json::to_value(&data).unwrap(),
-            serde_json::json!({"reason": "brand-new"})
-        );
+        assert_eq!(err.reason(), Some(RefusalReason::Other("brand-new".into())));
+        assert_eq!(serde_json::to_value(&err).unwrap(), input);
     }
 
+    /// An unexpected `data` shape does not fail the error; the accessors return `None`.
+    #[test]
+    fn unexpected_data_shapes_are_tolerated() {
+        for data in [
+            json!("text"),
+            json!([1, 2]),
+            json!({"reason": 5, "sync": "melting", "supported_versions": "1"}),
+        ] {
+            let input = json!({"code": 1004, "message": "m", "data": data});
+            let err: RpcError = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(err.reason(), None);
+            assert_eq!(err.sync(), None);
+            assert_eq!(err.supported_versions(), None);
+            assert_eq!(serde_json::to_value(&err).unwrap(), input);
+        }
+    }
+
+    /// ADR-0019 R6: a refusal is a kebab-case code in `data.reason`, separate from the message.
     #[test]
     fn dehydrate_refusal_maps_to_refused_with_sync_state() {
         let err = RpcError::from(DehydrateRefusal::NotInSync(SyncState::PendingUpload));
         assert_eq!(err.kind(), Some(ErrorCode::Refused));
         assert_eq!(
-            serde_json::to_value(&err.data).unwrap(),
-            serde_json::json!({"reason": "not-in-sync", "sync": "pending-upload"})
+            err.data,
+            Some(json!({"reason": "not-in-sync", "sync": "pending-upload"}))
         );
+        assert_eq!(err.reason(), Some(RefusalReason::NotInSync));
+        assert_eq!(err.sync(), Some(SyncState::PendingUpload));
         let err = RpcError::from(DehydrateRefusal::Pinned);
-        assert_eq!(err.data.unwrap().reason, Some(RefusalReason::Pinned));
+        assert_eq!(err.reason(), Some(RefusalReason::Pinned));
     }
 
     #[test]
@@ -402,7 +381,7 @@ mod tests {
         let err = RpcError::new(ErrorCode::Internal, "x").with_data(ErrorData::default());
         assert_eq!(
             serde_json::to_value(&err).unwrap(),
-            serde_json::json!({"code": -32603, "message": "x"})
+            json!({"code": -32603, "message": "x"})
         );
     }
 }

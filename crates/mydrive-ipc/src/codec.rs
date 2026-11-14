@@ -340,8 +340,10 @@ mod tests {
     /// the line arrives in one chunk or in many.
     #[test]
     fn oversize_line_then_stream_continues() {
-        let big = vec![b'x'; MAX_LINE_BYTES + 1];
-        for chunk in [usize::MAX, 4096, 1] {
+        // Several times the limit, so a decoder that buffered the whole line instead of
+        // discarding it, or that resynchronised early, would fail.
+        let big = vec![b'x'; 5 * MAX_LINE_BYTES + 3];
+        for chunk in [usize::MAX, 65_536, 3] {
             let mut stream = Vec::new();
             stream.extend_from_slice(b"{\"before\":true}\n");
             stream.extend_from_slice(&big);
@@ -350,6 +352,8 @@ mod tests {
             let mut out = Vec::new();
             for part in stream.chunks(chunk.min(stream.len())) {
                 d.push(part);
+                // Memory stays bounded: the oversize line is dropped, not buffered.
+                assert!(d.buf.len() <= MAX_LINE_BYTES, "chunk size {chunk}");
                 out.extend(drain(&mut d));
             }
             assert_eq!(out.len(), 3, "chunk size {chunk}");

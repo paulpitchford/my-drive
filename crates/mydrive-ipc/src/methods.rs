@@ -1,15 +1,15 @@
-//! The version 1 method catalogue: names, parameters and results (ADR-0009).
+//! The version 1 method catalogue: names, parameters and results (ADR-0009, ADR-0019).
 //!
 //! `docs/protocol/README.md` documents every type here with a JSON example; a test parses
 //! each example into these types (WP-005 AC1). The JSON is kept plain for adapters written in
 //! Python, shell and Lua: snake_case field names, strings for enums, no tagged-enum shapes.
 //!
-//! Item state uses the `mydrive-core` types directly (WP-005 AC4), so the wire strings are
-//! the ones `mydrive-core` defines and the display status is the one its single derivation
-//! function computes (ADR-0008 R2, R3).
+//! Item state uses the `mydrive-core` types directly (WP-005 AC4), so the wire strings of
+//! the closed sets are the ones `mydrive-core` defines and the display status is the one its
+//! single derivation function computes (ADR-0008 R2, R3). Open sets are in
+//! [`crate::values`].
 
 use mydrive_core::ids::{AccountId, DriveId, MountId, TenantId};
-use mydrive_core::names;
 use mydrive_core::state::{
     DisplayStatus, EffectivePin, Hydration, ItemState, Modifiers, Pin, Sync as SyncState,
     display_status, effective_pin,
@@ -21,6 +21,9 @@ use serde_json::Value;
 use crate::envelope::{Id, Request};
 use crate::error::{ErrorCode, RpcError};
 use crate::path::ProtocolPath;
+use crate::values::{
+    AccountKind, AccountState, BlockedReason, ItemReason, MountState, WireModifiers,
+};
 
 /// The protocol major version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -90,8 +93,8 @@ pub struct HelloParams {
 pub struct HelloResult {
     /// The chosen protocol major version.
     pub protocol_version: u32,
-    /// Optional features the daemon offers. Clients ignore capabilities they do not know
-    /// (ADR-0009 R5). Version 1 defines none.
+    /// Optional features the daemon offers. An open set: clients ignore capabilities they do
+    /// not know (ADR-0009 R5, ADR-0019). Version 1 defines none.
     pub capabilities: Vec<String>,
 }
 
@@ -120,55 +123,17 @@ pub struct DaemonStatusResult {
     pub ready: bool,
 }
 
-/// The kind of account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AccountKind {
-    /// A personal Microsoft account.
-    Personal,
-    /// A work or school account.
-    Work,
-}
-
-impl From<names::AccountKind> for AccountKind {
-    fn from(kind: names::AccountKind) -> Self {
-        match kind {
-            names::AccountKind::Personal => Self::Personal,
-            names::AccountKind::Work => Self::Work,
-        }
-    }
-}
-
-impl From<AccountKind> for names::AccountKind {
-    fn from(kind: AccountKind) -> Self {
-        match kind {
-            AccountKind::Personal => Self::Personal,
-            AccountKind::Work => Self::Work,
-        }
-    }
-}
-
-/// Account state (overview, "Account and mount states").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AccountState {
-    /// Tokens are valid.
-    SignedIn,
-    /// The refresh token was rejected; the account's mounts stop syncing.
-    NeedsSignIn,
-}
-
 /// One account in `account.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountInfo {
     /// The account's ID.
     pub account_id: AccountId,
-    /// Personal or work.
+    /// Personal or work. Open set.
     pub kind: AccountKind,
     /// The tenant, for a work account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<TenantId>,
-    /// Signed in, or needing sign-in.
+    /// Signed in, or needing sign-in. Open set.
     pub state: AccountState,
 }
 
@@ -177,20 +142,6 @@ pub struct AccountInfo {
 pub struct AccountListResult {
     /// Every account the daemon knows.
     pub accounts: Vec<AccountInfo>,
-}
-
-/// Mount state (overview, "Account and mount states").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum MountState {
-    /// Syncing normally.
-    Active,
-    /// Paused by the user.
-    Paused,
-    /// Refused by organisation policy; `blocked_reason` says why.
-    Blocked,
-    /// Enumerating; the mount point is not mounted until the first full delta is applied.
-    Resyncing,
 }
 
 /// One mount in `mount.list`.
@@ -204,11 +155,14 @@ pub struct MountInfo {
     pub drive_id: DriveId,
     /// Where the user sees it. Never the backing directory (ADR-0009 R8).
     pub mount_point: ProtocolPath,
-    /// Its state.
+    /// Its state. Open set.
     pub state: MountState,
-    /// Why it is blocked, when `state` is `blocked`.
+    /// Why it is blocked, as a code, when `state` is `blocked` (ADR-0019 R6). Open set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocked_reason: Option<String>,
+    pub blocked_reason: Option<BlockedReason>,
+    /// A human-readable explanation of the block, for display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_message: Option<String>,
     /// True for a read-only library.
     pub read_only: bool,
 }
@@ -220,16 +174,26 @@ pub struct MountListResult {
     pub mounts: Vec<MountInfo>,
 }
 
-/// What `item.status` asks about: a batch of paths, or one directory.
+/// What `item.status` asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemStatusTarget {
+    /// The state of each path, in request order.
+    Paths(Vec<ProtocolPath>),
+    /// The state of a directory and every child, in name order.
+    Directory(ProtocolPath),
+}
+
+/// `item.status` parameters.
 ///
-/// On the wire this is an object with exactly one of `paths` or `directory`.
+/// On the wire: an object with exactly one of `paths` or `directory`, and optionally
+/// `cursor` (ADR-0019 R1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ItemStatusWire", into = "ItemStatusWire")]
-pub enum ItemStatusParams {
-    /// The state of each path.
-    Paths(Vec<ProtocolPath>),
-    /// The state of a directory and every child, in one response (ADR-0009 R7).
-    Directory(ProtocolPath),
+pub struct ItemStatusParams {
+    /// What to report on.
+    pub target: ItemStatusTarget,
+    /// The `next_cursor` of the previous page; absent for the first page.
+    pub cursor: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -238,31 +202,36 @@ struct ItemStatusWire {
     paths: Option<Vec<ProtocolPath>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     directory: Option<ProtocolPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
 }
 
 impl TryFrom<ItemStatusWire> for ItemStatusParams {
     type Error = String;
 
     fn try_from(wire: ItemStatusWire) -> Result<Self, String> {
-        match (wire.paths, wire.directory) {
-            (Some(paths), None) => Ok(Self::Paths(paths)),
-            (None, Some(directory)) => Ok(Self::Directory(directory)),
-            _ => Err("give exactly one of \"paths\" or \"directory\"".into()),
-        }
+        let target = match (wire.paths, wire.directory) {
+            (Some(paths), None) => ItemStatusTarget::Paths(paths),
+            (None, Some(directory)) => ItemStatusTarget::Directory(directory),
+            _ => return Err("give exactly one of \"paths\" or \"directory\"".into()),
+        };
+        Ok(Self {
+            target,
+            cursor: wire.cursor,
+        })
     }
 }
 
 impl From<ItemStatusParams> for ItemStatusWire {
     fn from(params: ItemStatusParams) -> Self {
-        match params {
-            ItemStatusParams::Paths(paths) => Self {
-                paths: Some(paths),
-                directory: None,
-            },
-            ItemStatusParams::Directory(directory) => Self {
-                paths: None,
-                directory: Some(directory),
-            },
+        let (paths, directory) = match params.target {
+            ItemStatusTarget::Paths(paths) => (Some(paths), None),
+            ItemStatusTarget::Directory(directory) => (None, Some(directory)),
+        };
+        Self {
+            paths,
+            directory,
+            cursor: params.cursor,
         }
     }
 }
@@ -271,20 +240,26 @@ impl From<ItemStatusParams> for ItemStatusWire {
 ///
 /// Clients draw from `status` and `modifiers` and never derive a status from the axes
 /// (ADR-0014 R5); the axes are included for clients that want detail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemInfo {
-    /// The display status, from `mydrive_core::state::display_status`.
+    /// The display status, from `mydrive_core::state::display_status`. Closed set.
     pub status: DisplayStatus,
-    /// The `read-only` and `shortcut` indicators.
-    pub modifiers: Modifiers,
-    /// Hydration axis.
+    /// The `read-only` and `shortcut` indicators, as a list. Open set.
+    pub modifiers: WireModifiers,
+    /// Hydration axis. Closed set.
     pub hydration: Hydration,
-    /// Pin axis, as set on the item itself.
+    /// Pin axis, as set on the item itself. Closed set.
     pub pin: Pin,
-    /// The pin after inheritance.
+    /// The pin after inheritance. Closed set.
     pub effective_pin: EffectivePin,
-    /// Sync axis.
+    /// Sync axis. Closed set.
     pub sync: SyncState,
+    /// Why the status is `error` or `blocked`, as a code (ADR-0019 R6). Open set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ItemReason>,
+    /// A human-readable explanation to go with `reason`, for display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl ItemInfo {
@@ -302,12 +277,22 @@ impl ItemInfo {
         let effective = effective_pin(state.pin, [inherited_pin]);
         Self {
             status: display_status(&state, effective),
-            modifiers,
+            modifiers: modifiers.into(),
             hydration: state.hydration,
             pin: state.pin,
             effective_pin: effective,
             sync: state.sync,
+            reason: None,
+            message: None,
         }
+    }
+
+    /// Adds the reason code and message for an item in `error` or `blocked`.
+    #[must_use]
+    pub fn with_reason(mut self, reason: ItemReason, message: impl Into<String>) -> Self {
+        self.reason = Some(reason);
+        self.message = Some(message.into());
+        self
     }
 
     /// The three axes.
@@ -321,20 +306,71 @@ impl ItemInfo {
     }
 }
 
-/// The state of one path: either `item` or `error` is present.
+/// What is known about one path: its state, or why there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryOutcome {
+    /// The path names a known item.
+    Item(ItemInfo),
+    /// There is no state for this path: `not-in-a-mount` outside every mount,
+    /// `unknown-path` in a mount with no such item.
+    Error(RpcError),
+}
+
+/// The state of one path.
 ///
-/// A path outside every mount gets `error` with code `not-in-a-mount`; a path in a mount that
-/// names no known item gets `unknown-path`.
+/// On the wire: `{"path": ..., "item": {...}}` or `{"path": ..., "error": {...}}`. Exactly
+/// one of `item` and `error` must be present; anything else fails to deserialise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "EntryWire", into = "EntryWire")]
 pub struct ItemStatusEntry {
     /// The path asked about, or the child's path for a directory listing.
     pub path: ProtocolPath,
-    /// The item's state, when the path names a known item.
+    /// The item's state or the error.
+    pub outcome: EntryOutcome,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EntryWire {
+    path: ProtocolPath,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item: Option<ItemInfo>,
-    /// Why there is no state for this path.
+    item: Option<ItemInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<RpcError>,
+    error: Option<RpcError>,
+}
+
+impl TryFrom<EntryWire> for ItemStatusEntry {
+    type Error = String;
+
+    fn try_from(wire: EntryWire) -> Result<Self, String> {
+        let outcome = match (wire.item, wire.error) {
+            (Some(item), None) => EntryOutcome::Item(item),
+            (None, Some(error)) => EntryOutcome::Error(error),
+            _ => {
+                return Err(format!(
+                    "status entry for {} must have exactly one of \"item\" or \"error\"",
+                    wire.path
+                ));
+            }
+        };
+        Ok(Self {
+            path: wire.path,
+            outcome,
+        })
+    }
+}
+
+impl From<ItemStatusEntry> for EntryWire {
+    fn from(entry: ItemStatusEntry) -> Self {
+        let (item, error) = match entry.outcome {
+            EntryOutcome::Item(item) => (Some(item), None),
+            EntryOutcome::Error(error) => (None, Some(error)),
+        };
+        Self {
+            path: entry.path,
+            item,
+            error,
+        }
+    }
 }
 
 impl ItemStatusEntry {
@@ -343,8 +379,7 @@ impl ItemStatusEntry {
     pub fn known(path: ProtocolPath, item: ItemInfo) -> Self {
         Self {
             path,
-            item: Some(item),
-            error: None,
+            outcome: EntryOutcome::Item(item),
         }
     }
 
@@ -353,21 +388,42 @@ impl ItemStatusEntry {
     pub fn failed(path: ProtocolPath, error: RpcError) -> Self {
         Self {
             path,
-            item: None,
-            error: Some(error),
+            outcome: EntryOutcome::Error(error),
+        }
+    }
+
+    /// The item's state, if known.
+    #[must_use]
+    pub fn item(&self) -> Option<&ItemInfo> {
+        match &self.outcome {
+            EntryOutcome::Item(item) => Some(item),
+            EntryOutcome::Error(_) => None,
+        }
+    }
+
+    /// The error, if there is no state.
+    #[must_use]
+    pub fn error(&self) -> Option<&RpcError> {
+        match &self.outcome {
+            EntryOutcome::Item(_) => None,
+            EntryOutcome::Error(error) => Some(error),
         }
     }
 }
 
-/// `item.status` result.
+/// `item.status` result: one page (ADR-0019 R1, R3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemStatusResult {
-    /// For a `directory` request, the directory itself.
+    /// For a `directory` request, the directory itself (on every page).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<ItemStatusEntry>,
-    /// For a `paths` request, one entry per path in request order; for a `directory`
-    /// request, one entry per child.
+    /// This page's entries: for `paths`, in request order; for `directory`, the children in
+    /// name order.
     pub entries: Vec<ItemStatusEntry>,
+    /// Present when more entries remain: repeat the call with the same parameters plus this
+    /// cursor. Absent on the last page. The listing is complete only then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Parameters of `item.pin`, `item.unpin`, `item.hydrate` and `item.dehydrate`.
@@ -377,21 +433,38 @@ pub struct ItemPathsParams {
     pub paths: Vec<ProtocolPath>,
 }
 
-/// The outcome for one path of an item action: accepted when `error` is absent.
+/// A descendant of a requested folder that the action did not apply to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedItem {
+    /// The descendant's path.
+    pub path: ProtocolPath,
+    /// Why it was skipped. It is unchanged.
+    pub error: RpcError,
+}
+
+/// The outcome for one requested path of an item action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemActionEntry {
     /// The path acted on.
     pub path: ProtocolPath,
-    /// Why the action was not accepted for this path. A refused action changed nothing.
+    /// Why the action was not accepted for this path at all. A refused action changed
+    /// nothing. Absent when accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcError>,
+    /// For a folder: descendants that were not acted on, each with its reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedItem>,
+    /// For `item.dehydrate`: local bytes released.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_freed: Option<u64>,
 }
 
 /// Result of `item.pin`, `item.unpin`, `item.hydrate` and `item.dehydrate`: one entry per
 /// requested path, in request order.
 ///
-/// Acceptance means the request was recorded. Downloads that follow happen asynchronously and
-/// are reported through `status.changed`.
+/// `item.dehydrate` is decided per file before the response is sent. `item.pin` and
+/// `item.hydrate` are accepted when recorded; the downloads that follow are reported through
+/// `status.changed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemActionResult {
     /// Per-path outcomes.
@@ -412,11 +485,16 @@ pub struct StatusSubscribeParams {
 pub struct StatusSubscribeResult {}
 
 /// `status.changed` notification parameters.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusChangedParams {
-    /// The new state of each changed item. An entry with `error` `unknown-path` means the
-    /// item is gone.
+    /// The new state of each changed item. An entry with error `unknown-path` means the item
+    /// is gone.
+    #[serde(default)]
     pub entries: Vec<ItemStatusEntry>,
+    /// Directories whose listing changed too much to enumerate (for example a renamed folder
+    /// with many descendants); the client re-requests each one it is showing.
+    #[serde(default)]
+    pub refresh: Vec<ProtocolPath>,
 }
 
 /// A request decoded into its typed parameters.
@@ -595,14 +673,14 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// `not-ready` for anything but `hello` before `hello` has succeeded (ADR-0009 R3);
-    /// `invalid-request` for a second `hello`, and for any request on a subscribed
-    /// connection.
+    /// `hello-required` for anything but `hello` before `hello` has succeeded (ADR-0009 R3,
+    /// ADR-0019 R5); `invalid-request` for a second `hello`, and for any request on a
+    /// subscribed connection.
     pub fn admit(&self, call: &MethodCall) -> Result<(), RpcError> {
         match (self.phase, call) {
             (Phase::AwaitingHello, MethodCall::Hello(_)) => Ok(()),
             (Phase::AwaitingHello, other) => Err(RpcError::new(
-                ErrorCode::NotReady,
+                ErrorCode::HelloRequired,
                 format!(
                     "{} refused: the first request on a connection must be hello",
                     other.method()
@@ -660,6 +738,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::values::Modifier;
 
     fn p(s: &str) -> ProtocolPath {
         ProtocolPath::new(s).unwrap()
@@ -669,6 +748,12 @@ mod tests {
         HelloParams {
             client_name: "test".into(),
             protocol_versions: versions.to_vec(),
+        }
+    }
+
+    fn paths(list: &[&str]) -> ItemPathsParams {
+        ItemPathsParams {
+            paths: list.iter().map(|s| p(s)).collect(),
         }
     }
 
@@ -690,12 +775,7 @@ mod tests {
             Some(&json!({"paths": ["/home/u/OneDrive/a"], "recursive": true})),
         )
         .unwrap();
-        assert_eq!(
-            call,
-            MethodCall::ItemPin(ItemPathsParams {
-                paths: vec![p("/home/u/OneDrive/a")]
-            })
-        );
+        assert_eq!(call, MethodCall::ItemPin(paths(&["/home/u/OneDrive/a"])));
         let call = MethodCall::parse(method::DAEMON_STATUS, Some(&json!({"verbose": 1}))).unwrap();
         assert_eq!(call, MethodCall::DaemonStatus);
     }
@@ -736,6 +816,7 @@ mod tests {
                 Some(json!({"client_name": "x", "protocol_versions": [-1]})),
             ),
             (method::ITEM_STATUS, Some(json!({}))),
+            (method::ITEM_STATUS, Some(json!({"cursor": "0"}))),
             (
                 method::ITEM_STATUS,
                 Some(json!({"paths": ["/a"], "directory": "/a"})),
@@ -756,20 +837,18 @@ mod tests {
             MethodCall::DaemonStatus,
             MethodCall::AccountList,
             MethodCall::MountList,
-            MethodCall::ItemStatus(ItemStatusParams::Paths(vec![p("/a"), p("/b")])),
-            MethodCall::ItemStatus(ItemStatusParams::Directory(p("/a"))),
-            MethodCall::ItemPin(ItemPathsParams {
-                paths: vec![p("/a")],
+            MethodCall::ItemStatus(ItemStatusParams {
+                target: ItemStatusTarget::Paths(vec![p("/a"), p("/b")]),
+                cursor: None,
             }),
-            MethodCall::ItemUnpin(ItemPathsParams {
-                paths: vec![p("/a")],
+            MethodCall::ItemStatus(ItemStatusParams {
+                target: ItemStatusTarget::Directory(p("/a")),
+                cursor: Some("17".into()),
             }),
-            MethodCall::ItemHydrate(ItemPathsParams {
-                paths: vec![p("/a")],
-            }),
-            MethodCall::ItemDehydrate(ItemPathsParams {
-                paths: vec![p("/a")],
-            }),
+            MethodCall::ItemPin(paths(&["/a"])),
+            MethodCall::ItemUnpin(paths(&["/a"])),
+            MethodCall::ItemHydrate(paths(&["/a"])),
+            MethodCall::ItemDehydrate(paths(&["/a"])),
             MethodCall::StatusSubscribe(StatusSubscribeParams::default()),
         ];
         let mut seen = Vec::new();
@@ -789,7 +868,7 @@ mod tests {
         assert_eq!(negotiate(SUPPORTED_VERSIONS, &[1]), Ok(PROTOCOL_VERSION));
         let err = negotiate(SUPPORTED_VERSIONS, &[2, 3]).unwrap_err();
         assert_eq!(err.kind(), Some(ErrorCode::UnsupportedVersion));
-        assert_eq!(err.data.unwrap().supported_versions, Some(vec![1]));
+        assert_eq!(err.supported_versions(), Some(vec![1]));
         let mut session = Session::new();
         let err = session
             .hello(&hello(&[]), SUPPORTED_VERSIONS, &[])
@@ -798,20 +877,20 @@ mod tests {
         assert_eq!(session.phase(), Phase::AwaitingHello);
     }
 
-    /// ADR-0009 R3: a request other than hello before hello gets an error and has no effect.
+    /// ADR-0009 R3 and ADR-0019 R5: a request other than hello before hello gets
+    /// `hello-required` (never `not-ready`) and has no effect.
     #[test]
     fn requests_before_hello_are_refused_without_effect() {
         let mut session = Session::new();
         let calls = [
             MethodCall::DaemonStatus,
-            MethodCall::ItemPin(ItemPathsParams {
-                paths: vec![p("/a")],
-            }),
+            MethodCall::ItemPin(paths(&["/a"])),
             MethodCall::StatusSubscribe(StatusSubscribeParams::default()),
         ];
         for call in &calls {
             let err = session.admit(call).unwrap_err();
-            assert_eq!(err.kind(), Some(ErrorCode::NotReady));
+            assert_eq!(err.kind(), Some(ErrorCode::HelloRequired));
+            assert_eq!(err.code, 1010);
             assert_eq!(session.phase(), Phase::AwaitingHello);
         }
         // A subscribe recorded before hello is ignored too.
@@ -873,22 +952,26 @@ mod tests {
                         assert_eq!(info.status, display_status(&state, effective));
                         assert_eq!(info.effective_pin, effective);
                         assert_eq!(info.state(), state);
-                        let v = serde_json::to_value(info).unwrap();
+                        let v = serde_json::to_value(&info).unwrap();
                         assert_eq!(v["status"], info.status.as_str());
                         assert_eq!(v["hydration"], hydration.as_str());
                         assert_eq!(v["pin"], pin.as_str());
                         assert_eq!(v["effective_pin"], effective.as_str());
                         assert_eq!(v["sync"], sync.as_str());
-                        assert_eq!(
-                            v["modifiers"],
-                            json!({"read_only": true, "shortcut": false})
-                        );
+                        assert_eq!(v["modifiers"], json!(["read-only"]));
                         let back: ItemInfo = serde_json::from_value(v).unwrap();
                         assert_eq!(back, info);
                     }
                 }
             }
         }
+    }
+
+    fn info_json() -> Value {
+        json!({
+            "status": "local", "modifiers": [], "hydration": "full", "pin": "inherit",
+            "effective_pin": "unpinned", "sync": "in-sync"
+        })
     }
 
     /// ADR-0009 R5: clients ignore unknown result fields and capabilities.
@@ -899,51 +982,109 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(hello.capabilities, ["future-thing"]);
+        let mut item = info_json();
+        item["size_on_disk"] = json!(12);
         let status: ItemStatusResult = serde_json::from_value(json!({
-            "entries": [{
-                "path": "/home/u/OneDrive/a.txt",
-                "item": {
-                    "status": "local", "modifiers": {"read_only": false, "shortcut": false, "new": 1},
-                    "hydration": "full", "pin": "inherit", "effective_pin": "unpinned",
-                    "sync": "in-sync", "size_on_disk": 12
-                },
-                "etag": "x"
-            }],
-            "cursor": null
+            "entries": [{"path": "/home/u/OneDrive/a.txt", "item": item, "etag": "x"}],
+            "extra": null
         }))
         .unwrap();
         assert_eq!(status.entries.len(), 1);
     }
 
-    /// ADR-0009 R7: one directory request yields one entry per child in a single result.
+    /// ADR-0019 R4: open sets inside a response accept unknown values without failing it;
+    /// closed sets reject them.
     #[test]
-    fn directory_status_is_one_result_with_every_child() {
-        let info = ItemInfo::new(
-            ItemState {
-                hydration: Hydration::Placeholder,
-                pin: Pin::Inherit,
-                sync: SyncState::InSync,
-            },
-            EffectivePin::Unpinned,
-            Modifiers::default(),
+    fn open_values_in_responses_do_not_fail_them() {
+        let mounts: MountListResult = serde_json::from_value(json!({"mounts": [{
+            "mount_id": "m1", "account_id": "a", "drive_id": "d",
+            "mount_point": "/home/u/OneDrive", "state": "hibernating",
+            "blocked_reason": "solar-flare", "read_only": false
+        }]}))
+        .unwrap();
+        assert_eq!(
+            mounts.mounts[0].state,
+            MountState::Other("hibernating".into())
         );
-        let children: Vec<_> = (0..200)
-            .map(|i| ItemStatusEntry::known(p(&format!("/m/dir/f{i}")), info))
-            .collect();
-        let result = ItemStatusResult {
-            directory: Some(ItemStatusEntry::known(p("/m/dir"), info)),
-            entries: children,
-        };
-        let back: ItemStatusResult =
-            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
-        assert_eq!(back.entries.len(), 200);
-        assert_eq!(back, result);
+        assert_eq!(
+            mounts.mounts[0].blocked_reason,
+            Some(BlockedReason::Other("solar-flare".into()))
+        );
+        let accounts: AccountListResult = serde_json::from_value(json!({"accounts": [{
+            "account_id": "a", "kind": "guest", "state": "locked"
+        }]}))
+        .unwrap();
+        assert_eq!(
+            accounts.accounts[0].kind,
+            AccountKind::Other("guest".into())
+        );
+        let mut item = info_json();
+        item["modifiers"] = json!(["shortcut", "encrypted"]);
+        item["reason"] = json!("cosmic-ray");
+        let info: ItemInfo = serde_json::from_value(item.clone()).unwrap();
+        assert_eq!(
+            info.modifiers.0,
+            [Modifier::Shortcut, Modifier::Other("encrypted".into())]
+        );
+        assert_eq!(serde_json::to_value(&info).unwrap(), item);
+
+        for (field, value) in [
+            ("status", "sparkly"),
+            ("hydration", "half"),
+            ("pin", "maybe"),
+            ("effective_pin", "inherit"),
+            ("sync", "melting"),
+        ] {
+            let mut item = info_json();
+            item[field] = json!(value);
+            assert!(
+                serde_json::from_value::<ItemInfo>(item).is_err(),
+                "closed set {field} accepted {value}"
+            );
+        }
+    }
+
+    /// Exactly one of `item` and `error` per status entry.
+    #[test]
+    fn status_entry_needs_exactly_one_outcome() {
+        let path = "/home/u/OneDrive/a";
+        let error = json!({"code": 1002, "message": "gone"});
+        let ok = json!({"path": path, "item": info_json()});
+        assert!(serde_json::from_value::<ItemStatusEntry>(ok).is_ok());
+        let ok = json!({"path": path, "error": error});
+        assert!(serde_json::from_value::<ItemStatusEntry>(ok).is_ok());
+        for bad in [
+            json!({"path": path}),
+            json!({"path": path, "item": info_json(), "error": error}),
+        ] {
+            let err = serde_json::from_value::<ItemStatusEntry>(bad).unwrap_err();
+            assert!(err.to_string().contains("exactly one"), "{err}");
+        }
     }
 
     #[test]
-    fn account_kind_converts_with_core() {
-        for kind in [AccountKind::Personal, AccountKind::Work] {
-            assert_eq!(AccountKind::from(names::AccountKind::from(kind)), kind);
-        }
+    fn item_reason_is_a_code_with_a_message() {
+        let state = ItemState {
+            hydration: Hydration::Full,
+            pin: Pin::Inherit,
+            sync: SyncState::Error,
+        };
+        let info = ItemInfo::new(state, EffectivePin::Unpinned, Modifiers::default())
+            .with_reason(ItemReason::StorageFull, "OneDrive is full");
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["reason"], "storage-full");
+        assert_eq!(v["message"], "OneDrive is full");
+    }
+
+    #[test]
+    fn action_entry_optional_fields_are_omitted_when_empty() {
+        let entry = ItemActionEntry {
+            path: p("/a"),
+            error: None,
+            skipped: Vec::new(),
+            bytes_freed: None,
+        };
+        assert_eq!(serde_json::to_value(&entry).unwrap(), json!({"path": "/a"}));
     }
 }
