@@ -1,0 +1,69 @@
+# Open questions
+
+Things that are undecided, unverified, or where a decision goes against the research. Raised
+while writing the ADRs, flows and journeys. Each has an owner and the point by which it must
+be settled. Settled items move into an ADR or the overview and are deleted from here.
+
+## Decisions that depart from the research
+
+The owner should know these were choices, not findings.
+
+| # | Decision | What the research suggested | Why it was decided this way |
+|---|---|---|---|
+| D1 | Mount point and backing directory are separate paths (ADR-0005) | FUSE stacked over the sync directory itself, as OpenCloud's openvfs does | When the daemon is down the user sees an empty or erroring directory, never placeholders that read as zeros |
+| D2 | One FUSE filesystem per mount (ADR-0005, ADR-0007) | As few FUSE mounts as possible | Isolation: one library failing or resyncing cannot affect another. Costs one mount per library |
+| D3 | No token file fallback; sign-in is refused without a Secret Service (ADR-0010) | An encrypted-file fallback for headless sessions | No plaintext-equivalent secrets on disk. Headless users must run a keyring; revisit if this blocks real use |
+| D4 | Rust (ADR-0003) | Nothing: languages were not compared | Lead's judgement; Go is the serious alternative |
+| D5 | Session upload above 4 MiB (ADR-0012) | Microsoft's guidance is reported as 10 MiB; no source for 4 MiB | Conservative default, configurable. Affects cost only, not correctness |
+
+## To settle before the milestone shown
+
+| # | Question | Owner | By |
+|---|---|---|---|
+| Q1 | Does `Range` work on authenticated `/content` (gate G1)? | WP-011, owner signs in | M1 |
+| Q2 | Does device-code sign-in work for personal accounts (gate G5)? | WP-011 | M1 |
+| Q3 | Can FUSE mounts be tested on GitHub-hosted runners? | WP-010 | M0 |
+| Q4 | What did abraunegg's FUSE design conclude and why is it on hold (gate G3)? | Lead | M2 |
+| Q5 | Do FUSE mmap page faults reach the daemon as reads in every case we rely on? | M2 VFS work | M2 |
+| Q6 | What counts as "one operation" for the mass-delete guard (`rm -rf` is many unlinks)? | Lead, in the M2 write-path WP | M2 |
+| Q7 | Conflict copies: what if `<name>-<hostname>.<ext>` already exists or is an invalid name? When exactly is sync `Conflict` set and cleared? | Lead, in the M1 conflict WP | M1 |
+| Q8 | Save-via-rename when the temporary file's quiet period expired and it was already uploaded | Lead, in the M2 write-path WP | M2 |
+| Q9 | Fairness between mounts sharing one tenant request budget | Lead, in the M1 scheduler WP | M1 |
+| Q10 | A mount of a folder inside a business drive may need a whole-drive delta filtered locally | Lead, in the M1 delta WP | M1 |
+| Q11 | Which scope does browsing Teams and channels need beyond the baseline? | Experiment with a work account | M1 |
+| Q12 | How are read-only libraries detected through Graph? | Experiment with a work tenant (with G2) | M1 |
+| Q13 | Graph errors under unmanaged-device policy; shape of shortcut stubs in delta (gate G2) | Experiment with a work tenant | M1 / M5 |
+| Q14 | Layout when two accounts are in the same tenant (both want `~/<Org>`); the `<Site> - <Library>` folder naming is unverified against Windows | Lead | M1 |
+| Q15 | How apps' own `user.*` xattrs on files are handled | Lead, in the M2 VFS WP | M2 |
+| Q16 | Files plugin: actions are limited to fixed folders but mount points change. Likely answer: the daemon regenerates the plugin manifest when mounts change | Lead, in the M3 plugin WP | M3 |
+| Q17 | Will Files accept a per-file status hook and a thumbnail hook (gate G4)? | Owner approves the upstream issue | M3 |
+| Q18 | Is borrowed code from abraunegg and onedriver GPL-3.0-only or -or-later? (Affects per-file licence headers) | Checked per file when borrowing (ADR-0002) | When borrowing |
+| Q19 | Freedesktop thumbnail-cache layout and Graph thumbnail endpoint details for seeding placeholder thumbnails | M2 hydration-policy WP | M2 |
+| Q20 | Is the crawler deny list workable in practice (pid races, sandboxed apps)? ADR-0013 is an unproven design | Experiment in M2 | M2 |
+| Q21 | Product name | Owner | Before M3 packaging |
+| Q22 | App registration and publisher verification | Owner | Before WP-011 |
+
+## Detail questions in the flows and journeys
+
+Every file in `docs/flows/` and `docs/journeys/` ends with its own "Open questions". There
+are about 150 between them, mostly product details (what happens when `~/OneDrive` already
+exists, exit codes, retry intervals, how a held mass-delete is confirmed). They are not
+copied here. The rule: **a work package is not `ready` until the open questions in the flows
+and journeys it names are answered**, by the lead in the WP, or by the owner where the
+answer is a product choice. Default values the flows propose (timeouts, chunk sizes,
+polling intervals, concurrency limits) are collected in `docs/flows/README.md` and are
+provisional until an ADR or WP confirms them.
+
+Where a flow had to choose in order to be drawn, it chose the reading closest to principle 1
+and recorded the choice in its own open questions. Those choices are proposals, not
+decisions.
+
+## Not yet enforced
+
+Rules the ADRs state that CI does not check yet.
+
+| Rule | Status |
+|---|---|
+| ADR-0004 R3: crate dependencies match the overview's diagram | WP-012 |
+| ADR-0017 R3: every ADR rule is named by a test | WP-012 (report only until M1 has code) |
+| ADR-0017 R4: every journey acceptance ID has exactly one journey test | From M2, when journey tests exist |

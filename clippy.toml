@@ -1,0 +1,3 @@
+# unwrap/expect are denied in the workspace lints (ADR-0003) but allowed in tests.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
