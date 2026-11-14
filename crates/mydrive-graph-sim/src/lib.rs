@@ -51,7 +51,10 @@ pub use axum::http::{Method, StatusCode};
 pub use error::SimError;
 pub use fault::{Fault, FaultAction};
 pub use log::{LOGGED_HEADERS, LoggedRequest, Origin};
-pub use model::{DeltaRepeats, DownloadMode, DriveOptions, DriveType, FolderDeletes, RangeMode};
+pub use model::{
+    DeltaRepeats, DownloadMode, DriveOptions, DriveType, FolderDeletes, MAX_LOGGED_REQUESTS,
+    RangeMode,
+};
 
 use conn::{ConnTap, TapListener};
 use model::State;
@@ -323,10 +326,13 @@ impl GraphSim {
         self.shared.lock().faults.clear();
     }
 
-    /// Every request received so far, in the order the responses were completed.
+    /// The requests received so far, in the order the responses were completed. Only the
+    /// newest [`MAX_LOGGED_REQUESTS`] are kept; older ones are dropped first. A long test
+    /// that asserts on the log should call [`GraphSim::clear_requests`] before the part
+    /// it checks.
     #[must_use]
     pub fn requests(&self) -> Vec<LoggedRequest> {
-        self.shared.lock().log.clone()
+        self.shared.lock().log.iter().cloned().collect()
     }
 
     /// Empties the request log.

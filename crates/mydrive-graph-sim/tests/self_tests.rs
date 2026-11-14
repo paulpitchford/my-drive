@@ -407,52 +407,143 @@ mod self_tests {
         assert_eq!(changed[0]["name"], "Renamed");
     }
 
-    /// Deleting a folder reports only the folder by default (`FolderOnly`, the harder
-    /// case); with `EveryDescendant` the folder comes first and then each descendant, so a
-    /// client must apply the whole feed before deciding the folder is empty.
+    /// After a token: create `Dir/new.txt`, modify `Dir/old.txt`, delete `Dir`.
+    ///
+    /// Under `FolderOnly` (the default, the harder case) the feed holds only `Dir`, deleted:
+    /// its descendants never appear after the delete, even though they changed since the
+    /// token. Under `EveryDescendant` the descendants appear deleted too, after their
+    /// earlier changes when repeats are on. Checked in both repeat modes.
     #[tokio::test]
     async fn folder_delete_reporting_follows_the_switch() {
-        for (mode, expect_file) in [
-            (FolderDeletes::FolderOnly, false),
-            (FolderDeletes::EveryDescendant, true),
-        ] {
-            let sim = GraphSim::start().await.unwrap();
-            let drive = sim
-                .add_drive_with(
-                    DriveType::Personal,
-                    DriveOptions {
-                        folder_deletes: mode,
-                        ..DriveOptions::default()
-                    },
-                )
-                .unwrap();
-            let root = sim.root_id(&drive).unwrap();
-            let folder = sim.create_folder(&drive, &root, "F").unwrap();
-            let file = sim
-                .create_file(&drive, &folder, "f", b"x".to_vec())
-                .unwrap();
-            let (_, link) = full_delta(&sim, &delta_url(&sim, &drive)).await;
+        for folder_deletes in [FolderDeletes::FolderOnly, FolderDeletes::EveryDescendant] {
+            for delta_repeats in [DeltaRepeats::EveryChange, DeltaRepeats::LatestStateOnce] {
+                let sim = GraphSim::start().await.unwrap();
+                let drive = sim
+                    .add_drive_with(
+                        DriveType::Personal,
+                        DriveOptions {
+                            folder_deletes,
+                            delta_repeats,
+                            ..DriveOptions::default()
+                        },
+                    )
+                    .unwrap();
+                let root = sim.root_id(&drive).unwrap();
+                let dir = sim.create_folder(&drive, &root, "Dir").unwrap();
+                let old = sim
+                    .create_file(&drive, &dir, "old.txt", b"x".to_vec())
+                    .unwrap();
+                let (_, link) = full_delta(&sim, &delta_url(&sim, &drive)).await;
 
-            sim.delete(&drive, &folder).unwrap();
-            let (pages, _) = full_delta(&sim, &link).await;
-            let changed = items(&pages);
-            let mut expected = vec![folder.to_string()];
-            if expect_file {
-                expected.push(file.to_string());
+                let new = sim
+                    .create_file(&drive, &dir, "new.txt", b"n".to_vec())
+                    .unwrap();
+                sim.modify_file(&drive, &old, b"xx".to_vec()).unwrap();
+                sim.delete(&drive, &dir).unwrap();
+                let (pages, _) = full_delta(&sim, &link).await;
+                let changed = items(&pages);
+                let (dir, new, old) = (dir.to_string(), new.to_string(), old.to_string());
+                let expected = match (folder_deletes, delta_repeats) {
+                    (FolderDeletes::FolderOnly, _) => vec![dir],
+                    (FolderDeletes::EveryDescendant, DeltaRepeats::EveryChange) => {
+                        vec![new.clone(), old.clone(), dir, new, old]
+                    }
+                    (FolderDeletes::EveryDescendant, DeltaRepeats::LatestStateOnce) => {
+                        vec![dir, new, old]
+                    }
+                };
+                assert_eq!(
+                    ids(&changed),
+                    expected,
+                    "{folder_deletes:?}, {delta_repeats:?}"
+                );
+                assert!(changed.iter().all(|item| item["deleted"].is_object()));
+
+                let response = client()
+                    .get(format!(
+                        "{}/drives/{drive}/items/{}",
+                        sim.base_url(),
+                        expected_last(&changed)
+                    ))
+                    .bearer_auth(sim.token())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+                assert_eq!(body["error"]["code"], "itemNotFound");
             }
-            assert_eq!(ids(&changed), expected, "{mode:?}");
-            assert!(changed.iter().all(|item| item["deleted"].is_object()));
-
-            let response = client()
-                .get(format!("{}/drives/{drive}/items/{file}", sim.base_url()))
-                .bearer_auth(sim.token())
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
-            assert_eq!(body["error"]["code"], "itemNotFound");
         }
+    }
+
+    fn expected_last(items: &[Value]) -> String {
+        items.last().unwrap()["id"].as_str().unwrap().to_owned()
+    }
+
+    /// Every `DriveOptions` default, as a literal table. The destructuring has no `..`, so
+    /// adding a field without a row here fails to compile. The README's switch table must
+    /// list exactly these switches with exactly these defaults.
+    #[test]
+    fn drive_option_defaults_match_the_table_and_the_readme() {
+        let DriveOptions {
+            download,
+            range,
+            delta_page_size,
+            children_page_size,
+            delta_repeats,
+            folder_deletes,
+            parent_path_outside_delta,
+            personal_folder_ctag,
+            content_etag_header,
+            hash_empty_files,
+        } = DriveOptions::default();
+        assert_eq!(download, DownloadMode::Redirect);
+        assert_eq!(range, RangeMode::Honoured);
+        assert_eq!(delta_page_size, 200);
+        assert_eq!(children_page_size, 200);
+        assert_eq!(delta_repeats, DeltaRepeats::EveryChange);
+        assert_eq!(folder_deletes, FolderDeletes::FolderOnly);
+        assert!(parent_path_outside_delta);
+        assert!(!personal_folder_ctag);
+        assert!(!content_etag_header);
+        assert!(!hash_empty_files);
+
+        let actual: std::collections::BTreeMap<String, String> = [
+            ("download", format!("`{download:?}`")),
+            ("range", format!("`{range:?}`")),
+            ("delta_page_size", format!("`{delta_page_size}`")),
+            ("children_page_size", format!("`{children_page_size}`")),
+            ("delta_repeats", format!("`{delta_repeats:?}`")),
+            ("folder_deletes", format!("`{folder_deletes:?}`")),
+            (
+                "parent_path_outside_delta",
+                format!("`{parent_path_outside_delta}`"),
+            ),
+            ("personal_folder_ctag", format!("`{personal_folder_ctag}`")),
+            ("content_etag_header", format!("`{content_etag_header}`")),
+            ("hash_empty_files", format!("`{hash_empty_files}`")),
+        ]
+        .into_iter()
+        .map(|(name, default)| (name.to_owned(), default))
+        .collect();
+
+        let readme = include_str!("../README.md");
+        let section = readme
+            .split("\n## Switches\n")
+            .nth(1)
+            .expect("README has a `## Switches` section");
+        let section = section.split("\n## ").next().unwrap();
+        let mut documented = std::collections::BTreeMap::new();
+        for line in section.lines().filter(|l| l.starts_with("| `")) {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let name = cells[1].trim_matches('`').to_owned();
+            let previous = documented.insert(name.clone(), cells[2].to_owned());
+            assert!(previous.is_none(), "README lists switch {name} twice");
+        }
+        assert_eq!(
+            documented, actual,
+            "README switch table disagrees with DriveOptions::default()"
+        );
     }
 
     /// Zero-byte files have no quickXorHash by default (unverified, so the harder case);
@@ -980,6 +1071,8 @@ mod self_tests {
     }
 
     /// AC8: the README lists what is simulated with its source, and what is not simulated.
+    /// The switch table is checked row by row in
+    /// `drive_option_defaults_match_the_table_and_the_readme`.
     #[test]
     fn ac8_readme_lists_simulated_and_not_simulated_behaviour() {
         let readme = include_str!("../README.md");

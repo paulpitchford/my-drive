@@ -1,6 +1,7 @@
 //! The simulated drives and items, and the change log delta is served from.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ops::Bound::{Excluded, Unbounded};
 
 use axum::body::Bytes;
 use mydrive_core::hash::QuickXorHasher;
@@ -166,6 +167,9 @@ pub(crate) struct Item {
     /// The GUID-shaped part shared by eTag and cTag.
     pub(crate) guid: String,
     pub(crate) deleted: bool,
+    /// Deleted as a descendant of a folder deleted under [`FolderDeletes::FolderOnly`]:
+    /// the item never appears in delta again, not even for earlier changes.
+    hidden: bool,
     /// Sequence number of the item's latest change.
     pub(crate) last_seq: u64,
 }
@@ -214,12 +218,30 @@ pub(crate) struct Drive {
     pub(crate) options: DriveOptions,
     pub(crate) root: ItemId,
     pub(crate) items: HashMap<ItemId, Item>,
-    /// Live children of each live folder.
-    children: HashMap<ItemId, HashSet<ItemId>>,
+    /// Live children of each live folder, keyed and ordered by case-folded name. Names
+    /// are unique among siblings without regard to case, so the key is unique too.
+    children: HashMap<ItemId, BTreeMap<String, ItemId>>,
     /// Every change, in order: (sequence number, item).
     changes: Vec<(u64, ItemId)>,
     seq: u64,
     next_item: u64,
+    /// Sibling entries looked at by name checks and children pages, for tests that bound
+    /// the cost of large folders without timing anything.
+    #[cfg(test)]
+    visits: std::cell::Cell<u64>,
+}
+
+/// A page of a folder's children.
+#[derive(Debug)]
+pub(crate) struct ChildrenPage {
+    pub(crate) items: Vec<ItemId>,
+    /// The case-folded name of the last child on the page, if more follow.
+    pub(crate) next_after: Option<String>,
+}
+
+/// The key children are ordered and compared by: the name without regard to case.
+fn fold(name: &str) -> String {
+    name.to_lowercase()
 }
 
 impl Drive {
@@ -251,6 +273,8 @@ impl Drive {
             changes: Vec::new(),
             seq: 0,
             next_item: 0,
+            #[cfg(test)]
+            visits: std::cell::Cell::new(0),
         };
         drive.root = drive.insert(None, "root".to_owned(), ItemKind::Folder, now)?;
         Ok(drive)
@@ -296,17 +320,19 @@ impl Drive {
             ctag_version: 1,
             guid,
             deleted: false,
+            hidden: false,
             last_seq: 0,
         };
         if item.is_folder() {
-            self.children.insert(id.clone(), HashSet::new());
+            self.children.insert(id.clone(), BTreeMap::new());
         }
+        let key = fold(&item.name);
         self.items.insert(id.clone(), item);
         if let Some(parent) = &parent {
             self.children
                 .entry(parent.clone())
                 .or_default()
-                .insert(id.clone());
+                .insert(key, id.clone());
             self.adjust_sizes(parent, size, true);
         }
         self.record(&id);
@@ -365,20 +391,48 @@ impl Drive {
 
     /// How many live children `folder` has.
     pub(crate) fn child_count(&self, folder: &ItemId) -> usize {
-        self.children.get(folder).map_or(0, HashSet::len)
+        self.children.get(folder).map_or(0, BTreeMap::len)
     }
 
-    /// Live children of `folder`, sorted by name without regard to case, then by ID.
-    pub(crate) fn children(&self, folder: &ItemId) -> Vec<&Item> {
-        let mut children: Vec<&Item> = self
-            .children
-            .get(folder)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| self.items.get(id))
-            .collect();
-        children.sort_by_cached_key(|item| (item.name.to_lowercase(), item.id.clone()));
-        children
+    /// Counts sibling entries looked at (tests only).
+    fn visit(&self, count: usize) {
+        #[cfg(test)]
+        self.visits.set(self.visits.get() + count as u64);
+        #[cfg(not(test))]
+        let _ = count;
+    }
+
+    /// Up to `limit` live children of `folder` in name order without regard to case,
+    /// starting after the child whose case-folded name is `after`. Costs the page, not
+    /// the folder.
+    pub(crate) fn children_page(
+        &self,
+        folder: &ItemId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> ChildrenPage {
+        let Some(children) = self.children.get(folder) else {
+            return ChildrenPage {
+                items: Vec::new(),
+                next_after: None,
+            };
+        };
+        let mut range = match after {
+            Some(after) => children.range::<str, _>((Excluded(after), Unbounded)),
+            None => children.range::<str, _>((Unbounded, Unbounded)),
+        };
+        let mut items = Vec::new();
+        let mut last_key = None;
+        for (key, id) in range.by_ref().take(limit) {
+            items.push(id.clone());
+            last_key = Some(key.clone());
+        }
+        let more = range.next().is_some();
+        self.visit(items.len() + 1);
+        ChildrenPage {
+            items,
+            next_after: if more { last_key } else { None },
+        }
     }
 
     /// Names of the ancestors of `item` below the root, outermost first.
@@ -410,15 +464,12 @@ impl Drive {
             });
         }
         // OneDrive's namespace is case-insensitive (rclone docs, research section 4).
-        let lower = name.to_lowercase();
+        self.visit(1);
         let clash = self
             .children
             .get(parent)
-            .into_iter()
-            .flatten()
-            .filter(|id| Some(*id) != except)
-            .filter_map(|id| self.items.get(id))
-            .any(|child| child.name.to_lowercase() == lower);
+            .and_then(|children| children.get(&fold(name)))
+            .is_some_and(|holder| Some(holder) != except);
         if clash {
             return Err(SimError::NameConflict {
                 drive: self.id.clone(),
@@ -489,8 +540,13 @@ impl Drive {
     fn rename(&mut self, id: &ItemId, name: &str) -> Result<(), SimError> {
         self.not_root(id)?;
         let parent = self.live(id)?.parent.clone();
+        let old_key = fold(&self.live(id)?.name);
         if let Some(parent) = &parent {
             self.check_name(parent, name, Some(id))?;
+            if let Some(siblings) = self.children.get_mut(parent) {
+                siblings.remove(&old_key);
+                siblings.insert(fold(name), id.clone());
+            }
         }
         if let Some(item) = self.items.get_mut(id) {
             item.name = name.to_owned();
@@ -520,16 +576,17 @@ impl Drive {
                 .and_then(|item| item.parent.clone());
         }
         self.check_name(new_parent, &name, Some(id))?;
+        let key = fold(&name);
         if let Some(old) = &old_parent {
             if let Some(siblings) = self.children.get_mut(old) {
-                siblings.remove(id);
+                siblings.remove(&key);
             }
             self.adjust_sizes(old, size, false);
         }
         self.children
             .entry(new_parent.clone())
             .or_default()
-            .insert(id.clone());
+            .insert(key, id.clone());
         self.adjust_sizes(new_parent, size, true);
         if let Some(item) = self.items.get_mut(id) {
             item.parent = Some(new_parent.clone());
@@ -544,26 +601,26 @@ impl Drive {
     fn delete(&mut self, id: &ItemId) -> Result<(), SimError> {
         self.not_root(id)?;
         let item = self.live(id)?;
-        let (size, parent) = (item.size, item.parent.clone());
+        let (size, parent, key) = (item.size, item.parent.clone(), fold(&item.name));
         let mut order = Vec::new();
         let mut queue = VecDeque::from([id.clone()]);
         while let Some(current) = queue.pop_front() {
             if let Some(children) = self.children.remove(&current) {
-                let mut children: Vec<ItemId> = children.into_iter().collect();
-                children.sort();
-                queue.extend(children);
+                queue.extend(children.into_values());
             }
             order.push(current);
         }
+        let hide_descendants = self.options.folder_deletes == FolderDeletes::FolderOnly;
         for current in &order {
             if let Some(item) = self.items.get_mut(current) {
                 item.deleted = true;
+                item.hidden = hide_descendants && current != id;
                 item.etag_version += 1;
             }
         }
         if let Some(parent) = &parent {
             if let Some(siblings) = self.children.get_mut(parent) {
-                siblings.remove(id);
+                siblings.remove(&key);
             }
             self.adjust_sizes(parent, size, false);
         }
@@ -611,7 +668,7 @@ impl Drive {
                 };
             }
             after = *seq;
-            let Some(item) = self.items.get(id) else {
+            let Some(item) = self.items.get(id).filter(|item| !item.hidden) else {
                 continue;
             };
             let latest = item.last_seq == *seq;
@@ -641,6 +698,9 @@ impl Drive {
     }
 }
 
+/// How many requests the request log keeps; older ones are dropped first.
+pub const MAX_LOGGED_REQUESTS: usize = 10_000;
+
 /// How many pre-authenticated download keys stay valid at once.
 pub(crate) const MAX_DOWNLOAD_KEYS: usize = 1024;
 
@@ -652,7 +712,8 @@ pub(crate) struct State {
     pub(crate) drives: BTreeMap<DriveId, Drive>,
     pub(crate) tokens: HashSet<String>,
     pub(crate) faults: VecDeque<Fault>,
-    pub(crate) log: Vec<LoggedRequest>,
+    /// The newest [`MAX_LOGGED_REQUESTS`] requests, oldest first.
+    pub(crate) log: VecDeque<LoggedRequest>,
     download_keys: HashMap<String, (DriveId, ItemId)>,
     /// Issue order of `download_keys`, oldest first, so the oldest can expire.
     key_order: VecDeque<String>,
@@ -669,7 +730,7 @@ impl State {
             drives: BTreeMap::new(),
             tokens: HashSet::new(),
             faults: VecDeque::new(),
-            log: Vec::new(),
+            log: VecDeque::new(),
             download_keys: HashMap::new(),
             key_order: VecDeque::new(),
             next_key: 0,
@@ -776,6 +837,15 @@ impl State {
         self.download_keys.get(key)
     }
 
+    /// Appends to the request log, dropping the oldest entry once it holds
+    /// [`MAX_LOGGED_REQUESTS`].
+    pub(crate) fn push_log(&mut self, request: LoggedRequest) {
+        if self.log.len() >= MAX_LOGGED_REQUESTS {
+            self.log.pop_front();
+        }
+        self.log.push_back(request);
+    }
+
     /// Removes and returns the first queued fault that matches.
     pub(crate) fn take_fault(&mut self, method: &axum::http::Method, path: &str) -> Option<Fault> {
         let index = self.faults.iter().position(|f| f.matches(method, path))?;
@@ -861,6 +931,73 @@ mod tests {
         d.delete(&b).unwrap();
         assert_eq!((size(&d, &root), d.child_count(&root)), (0, 1));
         assert!(d.live(&f).is_err());
+    }
+
+    /// Building a 20,000-file folder and paging all of it looks at a linear number of
+    /// sibling entries: one per create, and at most page size plus one per page. Counted,
+    /// not timed.
+    #[test]
+    fn large_folder_costs_are_linear() {
+        const FILES: usize = 20_000;
+        const PAGE: usize = 200;
+        let mut d = drive(DriveOptions::default());
+        let root = d.root.clone();
+        d.visits.set(0);
+        for n in 0..FILES {
+            d.create(
+                &root,
+                &format!("File {n:05}.txt"),
+                Drive::file_kind(Bytes::new()),
+                START_SECS,
+            )
+            .unwrap();
+        }
+        assert_eq!(d.visits.get(), FILES as u64, "one name lookup per create");
+        assert!(matches!(
+            d.create(&root, "FILE 00042.TXT", ItemKind::Folder, START_SECS),
+            Err(SimError::NameConflict { .. })
+        ));
+
+        d.visits.set(0);
+        let mut after: Option<String> = None;
+        let mut seen = 0;
+        let mut pages = 0;
+        loop {
+            let before = d.visits.get();
+            let page = d.children_page(&root, after.as_deref(), PAGE);
+            assert!(d.visits.get() - before <= (PAGE + 1) as u64);
+            seen += page.items.len();
+            pages += 1;
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+            assert!(pages <= FILES, "children paging did not end");
+        }
+        assert_eq!(seen, FILES);
+        assert_eq!(pages, FILES / PAGE);
+        assert!(d.visits.get() <= (FILES + pages) as u64);
+    }
+
+    #[test]
+    fn request_log_keeps_the_newest_entries() {
+        let mut state = State::new("k".to_owned());
+        for n in 0..MAX_LOGGED_REQUESTS + 5 {
+            state.push_log(LoggedRequest {
+                origin: crate::log::Origin::Graph,
+                method: "GET".to_owned(),
+                path: format!("/{n}"),
+                query: None,
+                headers: Vec::new(),
+                status: 200,
+            });
+        }
+        assert_eq!(state.log.len(), MAX_LOGGED_REQUESTS);
+        assert_eq!(state.log.front().unwrap().path, "/5");
+        assert_eq!(
+            state.log.back().unwrap().path,
+            format!("/{}", MAX_LOGGED_REQUESTS + 4)
+        );
     }
 
     #[test]

@@ -105,7 +105,7 @@ async fn log_request(
         })
         .collect();
     let response = next.run(req).await;
-    shared.lock().log.push(LoggedRequest {
+    shared.lock().push_log(LoggedRequest {
         origin,
         method,
         path,
@@ -328,7 +328,7 @@ async fn list_children(
 }
 
 /// One page of a folder's children. `$top` sets the page size; the nextLink carries
-/// `$skiptoken`, the offset of the next page.
+/// `$skiptoken`, the case-folded name of the last child served.
 fn children_page(
     shared: &Shared,
     state: &mut State,
@@ -351,33 +351,22 @@ fn children_page(
         },
         None => d.options.children_page_size.max(1),
     };
-    let offset = match query.get("$skiptoken") {
-        Some(skip) => match skip.parse::<usize>() {
-            Ok(n) => n,
-            Err(_) => return bad_request("Invalid $skiptoken value."),
-        },
-        None => 0,
-    };
-    let ids: Vec<ItemId> = d
-        .children(folder)
-        .into_iter()
-        .map(|i| i.id.clone())
-        .collect();
-    let page: Vec<ItemId> = ids.iter().skip(offset).take(page_size).cloned().collect();
-    let next = offset + page.len();
-    let mut value = Vec::with_capacity(page.len());
-    for id in &page {
+    let after = query.get("$skiptoken").map(String::as_str);
+    let page = d.children_page(folder, after, page_size);
+    let mut value = Vec::with_capacity(page.items.len());
+    for id in &page.items {
         if let Some(json) = render_item(shared, state, drive, id) {
             value.push(json);
         }
     }
     let mut body = json!({ "value": value });
-    if next < ids.len() {
+    if let Some(next) = page.next_after {
         body["@odata.nextLink"] = json!(format!(
-            "{}/drives/{}/items/{}/children?$top={page_size}&$skiptoken={next}",
+            "{}/drives/{}/items/{}/children?$top={page_size}&$skiptoken={}",
             shared.graph_base,
             percent_encode(drive.as_str()),
-            percent_encode(folder.as_str())
+            percent_encode(folder.as_str()),
+            percent_encode(&next)
         ));
     }
     ok_json(body)

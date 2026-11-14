@@ -39,10 +39,10 @@ Per drive, in `DriveOptions` (`add_drive_with`, `set_options`).
 |---|---|---|
 | `download` | `Redirect` | Documented today: `/content` returns 302 to a pre-authenticated URL. `Direct` models the announced post-April-2027 behaviour (MC1492958). |
 | `range` | `Honoured` | Documented normal case (206). `Ignored` is the documented "may be ignored ... HTTP 200" case. |
-| `delta_page_size` | 200 | Not documented for delta; the documented children page size. |
-| `children_page_size` | 200 | Documented default page size for list children. |
+| `delta_page_size` | `200` | Not documented for delta; the documented children page size. |
+| `children_page_size` | `200` | Documented default page size for list children. |
 | `delta_repeats` | `EveryChange` | Graph documents both "latest state for each item, not each change" and "the same item may appear more than once". How often repeats happen is not documented, so the default is the harder case (see below). `LatestStateOnce` is the one-occurrence model. |
-| `folder_deletes` | `FolderOnly` | Whether Graph reports each descendant of a deleted folder is unverified. Reporting only the folder is harder: the client must work out that everything below is gone. `EveryDescendant` reports the folder, then each descendant. |
+| `folder_deletes` | `FolderOnly` | Whether Graph reports each descendant of a deleted folder is unverified. Under `FolderOnly` only the folder is reported: its descendants never appear in the feed after the delete, even if they changed since the token, so the client must work out that everything below is gone (harder). `EveryDescendant` reports the folder, then each descendant. |
 | `parent_path_outside_delta` | `true` | Graph includes `parentReference.path` in get-item and list-children; only delta omits it. `false` removes it everywhere. |
 | `personal_folder_ctag` | `false` | The driveItem resource says cTag "isn't returned if the item is a folder". The get-item example shows a cTag on a folder, so `true` exists for the other case. |
 | `content_etag_header` | `false` | Whether content responses carry an `ETag` header is unverified (F03 open question 3, gate G1); absent is harder. |
@@ -77,13 +77,13 @@ Per drive, in `DriveOptions` (`add_drive_with`, `set_options`).
 | Behaviour | Source |
 |---|---|
 | `GET /drives/{d}/root`, `GET /drives/{d}/items/{id}`. A deleted or unknown item is `404 itemNotFound`. | Get item |
-| `GET /drives/{d}/root/children`, `GET /drives/{d}/items/{id}/children`, sorted by name, default page size 200, `$top` sets the page size, `@odata.nextLink` carries `$skiptoken`. Children are indexed by parent, so listing does not scan the drive. | [List children](https://learn.microsoft.com/en-us/graph/api/driveitem-list-children?view=graph-rest-1.0) ("default page size (200 items)") |
+| `GET /drives/{d}/root/children`, `GET /drives/{d}/items/{id}/children`, sorted by name, default page size 200, `$top` sets the page size, `@odata.nextLink` carries `$skiptoken` (the case-folded name of the last child served). Children are kept per folder in name order with a case-folded name index, so a create is logarithmic and a page costs the page, not the folder. | [List children](https://learn.microsoft.com/en-us/graph/api/driveitem-list-children?view=graph-rest-1.0) ("default page size (200 items)") |
 | `GET /drives/{d}/root/delta` without a token "enumerates the hierarchy's current state": each live item once (root included), no deleted items, at the position of its latest change, so a parent can come after its child. Follow `@odata.nextLink` until a page carries `@odata.deltaLink`. | [delta](https://learn.microsoft.com/en-us/graph/api/driveitem-delta?view=graph-rest-1.0) (parameter `token`); research section 2 |
 | Changes made while a client pages through an enumeration appear later in the same feed, so an item already served can appear again with its new state. | delta ("may appear more than once") |
 | With a token (a deltaLink), the feed returns only what changed since. Under the default `EveryChange` an item appears once per change since the token, each time showing its state when its page is served. This is **deliberately harsher** than "the latest state for each item, not each change": it exists to exercise the client's last-occurrence rule (ADR-0011 R2). A change that lands between two pages makes the first and last occurrence differ. `LatestStateOnce` gives each changed item once. | delta remarks ("latest state for each item, not each change"; "the same item may appear more than once ... use the last occurrence") |
 | No `path` in `parentReference` in delta, ever. Get-item and list-children include it by default (`/drive/root:/A%20B` personal, `/drives/{id}/root:/...` business; the root has none). | delta remarks; itemReference (`path` percent-encoded). The business path form is from memory: **unverified** |
 | Renaming or moving an item puts only that item in delta, never its descendants. | delta remarks ("renaming a folder does not return its descendants") |
-| Deletes appear with the `deleted` facet, as `{}`. Business omits `cTag` and `name`; personal omits `cTag` and `size`. A folder delete reports the folder only, or the folder and then every descendant (switch `folder_deletes`). | delta, deleted resource, "properties omitted" tables; descendant reporting **unverified** |
+| Deletes appear with the `deleted` facet, as `{}`. Business omits `cTag` and `name`; personal omits `cTag` and `size`. A folder delete reports the folder only (its descendants then never appear in the feed, not even for changes made since the token), or the folder and then every descendant (switch `folder_deletes`). | delta, deleted resource, "properties omitted" tables; descendant reporting **unverified** |
 
 ### Content download
 
@@ -101,7 +101,7 @@ Per drive, in `DriveOptions` (`add_drive_with`, `set_options`).
 | Behaviour | Source |
 |---|---|
 | A FIFO queue of scripted faults. Each fault has an optional method and path-fragment matcher and applies to exactly the first later request that matches, then is removed. Actions: a status with a Graph error body and optional `Retry-After`; a delay before handling; a truncated body (announces the full `Content-Length`, sends the head and the first N body bytes, then closes the connection). Faults apply before the token check, on both origins. | ADR-0017 decision 2 and R5; `Retry-After` on 429/503 from the throttling guidance (research section 3) |
-| A log of every request: origin, method, path, query, the headers `authorization`, `range`, `if-match`, `if-none-match`, `user-agent`, `prefer`, `deltaexcludeparent`, and the response status. | WP-007 |
+| A log of every request: origin, method, path, query, the headers `authorization`, `range`, `if-match`, `if-none-match`, `user-agent`, `prefer`, `deltaexcludeparent`, and the response status. It keeps the newest 10,000 requests (`MAX_LOGGED_REQUESTS`), dropping the oldest first; a long test that asserts on the log calls `clear_requests` before the part it checks. | WP-007 |
 
 ## Departures from Graph
 
