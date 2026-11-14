@@ -28,6 +28,37 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  fuse:
+    # WP-010: can a GitHub-hosted runner mount FUSE unprivileged? See docs/process/ci-fuse.md.
+    name: FUSE smoke test
+    runs-on: ubuntu-latest
+    env:
+      # A skipped mount test is a failure here, so a runner that cannot mount cannot pass.
+      MYDRIVE_REQUIRE_FUSE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fuse3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3
+      - name: Show FUSE environment
+        run: |
+          uname -r
+          id
+          ls -l /dev/fuse || true
+          ls -l "$(command -v fusermount3)" || true
+          fusermount3 --version || true
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p mydrive-vfs --test fuse_smoke --locked -- --nocapture
+      - name: Check no mount is left behind
+        if: always()
+        run: |
+          if findmnt -t fuse.mydrive-smoke; then
+            echo "::error::FUSE smoke test left a mount behind"
+            exit 1
+          fi
+
   deny:
     name: Dependency audit
     runs-on: ubuntu-latest

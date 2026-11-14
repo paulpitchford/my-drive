@@ -10,3 +10,8 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Pure-Rust mount through fusermount3; no libfuse is linked (WP-010).
+fuser = { workspace = true, default-features = false }
+tempfile.workspace = true
