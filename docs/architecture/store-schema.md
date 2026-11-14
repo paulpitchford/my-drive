@@ -89,6 +89,10 @@ Table CHECKs, so these hold whatever writes the row:
 - `local_dirty = 0 OR sync NOT IN ('in-sync', 'pending-download')`: a dirty item is never
   reported in sync, and no download is scheduled over it.
 - `local_dirty = 1 OR remote_size IS NULL`: a clean item has no recorded remote identity.
+- `local_dirty = 0 OR kind = 'folder' OR hydration = 'full'`: a dirty file is fully local.
+  The store also keeps its ranges exactly `[0, size)` (invariant 5).
+- `remote_changed = 0 OR sync <> 'in-sync'`: an item the server has moved past is never
+  reported in sync until fresh metadata is applied.
 
 The three state columns hold the wire forms of `mydrive-core`'s `Hydration`, `Pin` and
 `Sync`, each in its own column (ADR-0006 R5, ADR-0008 R1). A `CHECK` lists the allowed
@@ -122,17 +126,18 @@ the caller happened to hold.
 
 | Operation | Writes | Refused when |
 |---|---|---|
-| `insert_item` | Every column of a new item. Either a clean server item, or a provisional one, which must be dirty and `pending-upload`. | The key exists; a provisional item not dirty and `pending-upload`; a dirty item that is not provisional; any `remote_changed` or recorded remote identity. |
+| `insert_item` | Every column of a new item. Either a clean server item, or a provisional one, which must be dirty, `pending-upload` and (for a file) `full`; its range `[0, size)` is recorded. | The key exists; a provisional item not dirty and `pending-upload`; a dirty item that is not provisional; a dirty file that is not `full`; any `remote_changed` or recorded remote identity. |
 | `apply_remote_metadata` | Server-owned columns, as below. | Unknown item; a folder with children would become a file. |
-| `mark_local_change` | Sets `local_dirty`, bumps `local_generation`, moves `in-sync` or `pending-download` to `pending-upload`, and on the clean-to-dirty transition records the base identity. Commit it before the change touches the backing file (ADR-0012 R3). | Unknown item. |
-| `set_local_size` | Marks a local change and sets `size` (a write that grows or keeps the size). | Recorded ranges reach past the new size; folders. |
-| `truncate_local` | Marks a local change, sets `size` and trims the ranges to it. | Folders. |
+| `mark_local_change` | Sets `local_dirty`, bumps `local_generation`, moves `in-sync` or `pending-download` to `pending-upload`, and on the clean-to-dirty transition records the base identity. Commit it before the change touches the backing file (ADR-0012 R3). | Unknown item; a file that is not fully local (`full` with ranges covering `[0, size)`): the engine hydrates first (ADR-0012 R1). |
+| `set_local_size` | Marks a local change, sets `size` and makes the ranges exactly `[0, size)`: growing extends the range (the grown bytes are local by definition), shrinking trims it. | Folders; a file that is not fully local. |
+| `truncate_local` | To 0 (`O_TRUNC`, ADR-0012 R2), on any file: clears the ranges, sets hydration `full` and size 0, marks the change. To any other size: as `set_local_size`. | Folders; a non-zero size on a file that is not fully local. |
+| `record_hydrated_range` | Merges a downloaded range into a clean file's map. | Dirty files: their ranges are already `[0, size)`, and a record could only describe a download over unsynced bytes. |
 | `complete_upload` | See "Uploads". | The item is not dirty (a replayed completion); no server ID for a provisional item; a response for another item; the server ID already stored. |
-| `discard_local_changes(key, current)` | Takes the server's current metadata and makes the item a clean placeholder of that version, in one savepoint: all server columns (size included), ranges cleared, hydration `placeholder`, sync `in-sync`, `local_dirty`, `remote_changed` and the recorded identity cleared. The only other way to clear `local_dirty`. | Provisional items (delete them with `DiscardNeverUploaded`); metadata for another item. |
+| `discard_local_changes(key, current)` | Takes the server's current metadata and makes the item a clean placeholder of that version, in one savepoint: all server columns (size included), ranges cleared, hydration `placeholder`, sync `in-sync`, `local_dirty`, `remote_changed` and the recorded identity cleared. The only other way to clear `local_dirty`. | Provisional items (delete them with `DiscardNeverUploaded`); metadata for another item; stale metadata: `remote_changed` is set and `current` is still the version the stored server columns describe. |
 | `dehydrate` | Clears the ranges and sets hydration `placeholder`, together. | The item is dirty, not `in-sync`, or a folder. Effective pin is the engine's check (ADR-0008 R5). |
 | `clear_hydrated_ranges` | Clears the ranges. | The item is dirty. |
 | `set_hydration` | `hydration`. | Lowering a dirty item to `placeholder` or `partial`. |
-| `set_sync` | `sync`, as a compare-and-set against the value the caller expects. | The stored value differs; setting a dirty item `in-sync` or `pending-download`. |
+| `set_sync` | `sync`, as a compare-and-set against the value the caller expects. | The stored value differs; setting a dirty item `in-sync` or `pending-download`; setting an item with `remote_changed` `in-sync` (only applying fresh metadata clears the flag). |
 | `set_pin`, `set_last_error` | That one column. | Unknown item. |
 | `move_item_local` | `parent_item_id` and `name` for a local rename or move; works on provisional items. See the rename gap under "Not in version 1". | Invalid name. |
 | `rekey_item` | A provisional item's `item_id`, its children's `parent_item_id` and its ranges' `item_id` (by `ON UPDATE CASCADE`), together, and clears `is_provisional`. | Not provisional; the new key exists. |
@@ -184,7 +189,9 @@ runs in one savepoint:
    from `response`. The next upload's `If-Match` is therefore the uploaded version's eTag.
 4. The server has moved on if `remote_changed` is set and the recorded remote identity
    names different content from `response`. If it names the same content, the delta
-   was our own upload echoing back.
+   was our own upload echoing back, possibly with newer metadata (renamed, a later eTag):
+   then the row keeps its current parent and name and takes eTag and cTag from the
+   recorded identity, instead of the older response.
 5. If `local_generation == expected_generation`, our current bytes are on the server, so
    the item becomes clean: size and timestamps come from `response`, ranges are trimmed to
    the server size, the recorded identity is cleared. If the server has not moved on, sync
@@ -219,17 +226,62 @@ it with `delete_item(.., ItemOnly, Refuse)` (the guard confirms it is clean), th
 `complete_upload` again with the response, or re-uploads if the response was lost. Because
 the provisional row stays dirty throughout, no step can lose its content.
 
-### What the engine must do
-
-- **Hydrate before extending a placeholder.** The store records sizes and ranges; it never
-  sees bytes. A write or `set_local_size` that extends a `placeholder` or `partial` file
-  must be preceded by hydrating the missing ranges (ADR-0012 R1), or the backing file
-  would hold holes the store does not know are unfetched server content.
-- **Do not use `ServerConfirmedLocalDelete` or `discard_local_changes` as substitutes** for
-  the operations listed under "Not in version 1". A confirmed delete is only for a delete
-  the user made locally and the server confirmed; discarding throws away the user's bytes.
-
 A folder that has children is never turned into a file.
+
+## What the engine must do
+
+The store enforces everything it can see. It never sees the bytes in a backing file, the
+network, or the order in which the engine fetched things, so these rules are the engine's.
+
+- **Mark before every write.** Commit `mark_local_change` (or `set_local_size` /
+  `truncate_local`, which mark too) before each write, truncate or other modification
+  reaches the backing file (ADR-0012 R3). A write landing while an upload may be reading
+  the file must bump the generation again, with its own committed mark, so that upload's
+  completion is `LocalChangedSince` rather than `Synced`.
+- **Hydrate before a local change.** The store refuses to mark a file that is not fully
+  local, so before a partial write (or any write) to a `placeholder` or `partial` file the
+  engine fetches the missing ranges and records them (ADR-0012 R1). Only `O_TRUNC` needs no
+  download: use `truncate_local(key, 0)`.
+- **Read the generation before the bytes.** Before reading the file to upload it, read
+  `local_generation`, then read the bytes, then pass that generation to
+  `complete_upload`. Reading it afterwards could attribute newer bytes to the upload.
+- **Send `If-Match` with the stored eTag** on every content upload of an existing item
+  (ADR-0012 R6). On a dirty item the stored eTag is the base version's, which is what
+  makes a remote change surface as 412.
+- **Use fresh server metadata.** Pass freshly fetched metadata to `discard_local_changes`
+  (stale metadata is refused when the store can tell, but not always), and refetch the
+  item's metadata after `UploadedButRemoteMovedOn` and apply it. Never apply a delta page
+  fetched before a `complete_upload` after that `complete_upload` has committed: it can
+  describe an older version as current.
+- **On restart, process both `dirty_items()`** (resume or retry every upload, ADR-0012 R11)
+  **and the items in `pending-download`** (including those left by
+  `UploadedButRemoteMovedOn`, whose current metadata must be refetched).
+- **Conflict copies in this order:** make the copy's bytes durable in the backing
+  directory, insert the copy as a provisional item (dirty, so it is uploaded), and only
+  then `discard_local_changes` on the original with the server's current metadata. A crash
+  between any two steps leaves the user's bytes in at least one dirty item.
+- **Effective pin.** `dehydrate` checks only that the item is clean and `in-sync`; the
+  engine refuses it when the effective pin is `Pinned` (ADR-0008 R5), and re-hydrates a
+  pinned item whose content was replaced (ADR-0008 R6).
+- **Respect the gaps** listed under "Not in version 1". In particular, do not use
+  `ServerConfirmedLocalDelete` or `discard_local_changes` in place of the missing
+  "remote deleted while locally modified" and "adopt server item" operations: a confirmed
+  delete is only for a delete the user made locally and the server confirmed, and
+  discarding throws away the user's bytes.
+
+### Known costs
+
+Accepted for version 1; neither loses data.
+
+- **A response without a hash after an echo with one.** If the delta echo of our upload
+  carried a hash and the upload response does not, the two identities do not match, so the
+  completion reports `UploadedButRemoteMovedOn` and the engine refetches and re-downloads
+  content it already has.
+- **`DiscardNeverUploaded` on a provisional folder** with `Recursive` also removes the rows
+  of clean server items the user moved into it locally, because local moves are not
+  recorded until M1's pending-operations records. Their content is clean (on the server),
+  so nothing unsynced is lost, but the items disappear locally until the next full
+  enumeration.
 
 ## Invariants
 
@@ -260,17 +312,23 @@ The store maintains these; nothing else writes the tables.
    timestamps or content identity; and it cannot be deleted except as the named item of an
    explicit mode. A provisional item is always dirty (a table CHECK). Every guard keys on
    `local_dirty`, never on `sync`.
+   **A dirty file is always fully local:** its hydration is `full` (a table CHECK) and its
+   ranges are exactly `[0, size)`. A file becomes dirty only when it is already fully local
+   (or by truncation to 0), every local-write operation keeps the ranges `[0, size)`, and
+   no separate range can be recorded on it. So no "hydrate the missing range" can ever
+   download over the user's bytes.
 6. **A remote change seen while dirty is never forgotten.** It sets `remote_changed`
    durably; `complete_upload` clears it only when the change was our own upload echoing
    back, and otherwise leaves the item `pending-download` (or still dirty) with the flag
-   set.
+   set. An item with `remote_changed` is never `in-sync` (a table CHECK); only applying
+   fresh metadata clears the flag.
 7. **Ranges are stored merged.** For one item no two ranges overlap or touch. Recording a
    range replaces every stored range it overlaps or touches with their union, in one
    savepoint. A zero-length range records nothing. "Is this range present" is true only if
    one stored range covers every byte of it; a zero-length query is trivially present.
 8. **Ranges fit the item.** Every range ends at or before the item's `size`; a range past
    the end is refused, and so is a query past the end. Folders have no ranges.
-   `set_local_size` refuses to strand ranges; `truncate_local` trims them; a remote size
+   `set_local_size` and `truncate_local` set them to exactly `[0, size)`; a remote size
    change on a clean item clears them (invariant 4) and is not applied to a dirty one.
 9. **Deletes.** Deleting an item deletes its ranges. Deleting an item with children is
    refused unless the caller asks for a recursive delete, which removes the whole subtree

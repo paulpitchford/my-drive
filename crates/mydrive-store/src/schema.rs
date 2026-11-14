@@ -95,7 +95,9 @@ CREATE TABLE items (
     PRIMARY KEY (drive_id, item_id),
     CHECK (is_provisional = 0 OR local_dirty = 1),
     CHECK (local_dirty = 0 OR sync NOT IN ('in-sync', 'pending-download')),
-    CHECK (local_dirty = 1 OR remote_size IS NULL)
+    CHECK (local_dirty = 1 OR remote_size IS NULL),
+    CHECK (local_dirty = 0 OR kind = 'folder' OR hydration = 'full'),
+    CHECK (remote_changed = 0 OR sync <> 'in-sync')
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX items_by_parent ON items (drive_id, parent_item_id);

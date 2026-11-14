@@ -5,8 +5,8 @@
 mod common;
 
 use common::{
-    DIRTY_SYNC_STATES, Fixture, ROOT, file, folder, key, make_dirty, mount_id, provisional, raw,
-    remote,
+    DIRTY_SYNC_STATES, Fixture, ROOT, file, folder, key, make_dirty, make_full, mount_id,
+    provisional, raw, remote,
 };
 use mydrive_core::hash::QuickXorHash;
 use mydrive_core::ids::{DriveId, ItemId, ItemKey, MountId};
@@ -88,7 +88,9 @@ fn setters_change_only_their_column() {
     item.name = "moved".to_owned();
     assert_eq!(store.item(&item.key).unwrap(), Some(item.clone()));
 
-    // Local content changes mark the item dirty and bump the generation.
+    // Local content changes mark the item dirty and bump the generation; the file is
+    // hydrated first, as the engine must.
+    store.record_hydrated_range(&item.key, r(0, 10)).unwrap();
     assert_eq!(store.mark_local_change(&item.key).unwrap(), 1);
     assert_eq!(store.set_local_size(&item.key, 20).unwrap(), 2);
     // The base version's identity (size still 10) was recorded when it became dirty.
@@ -417,7 +419,7 @@ fn hydrated(store: &Store, sync: SyncState, dirty: bool) -> Item {
     item.server_hash = hash(1);
     item.local_hash = hash(1);
     item.state = ItemState {
-        hydration: Hydration::Partial,
+        hydration: Hydration::Full,
         pin: Pin::Pinned,
         sync,
     };
@@ -426,7 +428,7 @@ fn hydrated(store: &Store, sync: SyncState, dirty: bool) -> Item {
         item.state.sync = SyncState::InSync;
     }
     store.insert_item(&item).unwrap();
-    store.record_hydrated_range(&item.key, r(0, 80)).unwrap();
+    store.record_hydrated_range(&item.key, r(0, 100)).unwrap();
     if dirty {
         make_dirty(store, &item.key, sync);
     }
@@ -449,9 +451,6 @@ fn review_b1_remote_rename_does_not_shrink_a_locally_grown_file() {
     // The user appends 1000 bytes.
     store.mark_local_change(&item.key).unwrap();
     store.set_local_size(&item.key, 2000).unwrap();
-    store
-        .record_hydrated_range(&item.key, r(1000, 2000))
-        .unwrap();
 
     // A remote rename: same content (same hash), old size, new eTag.
     let mut rename = remote(&item);
@@ -496,7 +495,7 @@ fn remote_metadata_without_content_change_writes_server_columns_only() {
     assert_eq!(stored.state, item.state, "local state untouched");
     assert_eq!(stored.local_hash, item.local_hash);
     assert_eq!(stored.last_error, item.last_error);
-    assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 80)]);
+    assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 100)]);
 }
 
 /// Lead rulings 3 and 4: a content change on a clean item, whatever its sync state, clears
@@ -560,7 +559,7 @@ fn remote_content_change_on_a_dirty_item_keeps_everything_and_reports() {
             ..item.clone()
         };
         assert_eq!(stored, expected, "{sync}");
-        assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 80)]);
+        assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 100)]);
         drop(store);
         assert!(fx.open().item(&item.key).unwrap().unwrap().remote_changed);
     }
@@ -654,58 +653,129 @@ fn remote_metadata_for_an_unknown_item_is_refused() {
     assert!(matches!(err, StoreError::ItemNotFound { .. }), "{err}");
 }
 
-/// Second review B3: `truncate_local` marks the change, sets the size and trims the
-/// ranges itself, leaving them merged and in bounds.
+/// Second review B3 with the fourth-review ruling: `truncate_local` marks the change, sets
+/// the size and leaves the ranges exactly `[0, size)`.
 #[test]
-fn truncate_local_trims_ranges_and_marks_dirty() {
+fn truncate_local_keeps_the_whole_file_range() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
-    store.insert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
-    store.record_hydrated_range(&key("f"), r(0, 30)).unwrap();
-    store.record_hydrated_range(&key("f"), r(40, 80)).unwrap();
-    store.record_hydrated_range(&key("f"), r(90, 100)).unwrap();
+    full_file(&store, "f", 100);
 
     assert_eq!(store.truncate_local(&key("f"), 50).unwrap(), 1);
     let stored = store.item(&key("f")).unwrap().unwrap();
     assert_eq!((stored.size, stored.local_dirty), (50, true));
-    assert_eq!(
-        store.hydrated_ranges(&key("f")).unwrap(),
-        [r(0, 30), r(40, 50)]
-    );
-    assert_eq!(store.truncate_local(&key("f"), 0).unwrap(), 2);
+    assert_eq!(store.hydrated_ranges(&key("f")).unwrap(), [r(0, 50)]);
+    assert_eq!(store.truncate_local(&key("f"), 80).unwrap(), 2);
+    assert_eq!(store.hydrated_ranges(&key("f")).unwrap(), [r(0, 80)]);
+    assert_eq!(store.truncate_local(&key("f"), 0).unwrap(), 3);
     assert!(store.hydrated_ranges(&key("f")).unwrap().is_empty());
     let err = store.truncate_local(&key(ROOT), 0).unwrap_err();
     assert!(matches!(err, StoreError::NotAFile { .. }), "{err}");
 }
 
-/// Lead ruling 3: on the local-write path, a size shrink that would strand ranges is
-/// refused and changes nothing.
+/// A clean, fully local 100-byte file: hydration `full`, ranges `[0, 100)`.
+fn full_file(store: &Store, id: &str, size: u64) -> Item {
+    let mut item = file(id, Some(ROOT), id, size);
+    item.state.hydration = Hydration::Full;
+    store.insert_item(&item).unwrap();
+    if size > 0 {
+        store.record_hydrated_range(&item.key, r(0, size)).unwrap();
+    }
+    item
+}
+
+/// Fourth review, blocking (a), the reviewer's sequence: a clean placeholder of size 100
+/// is truncated to 0 (`O_TRUNC`, no download), then grown to 50 by a write. The file must
+/// be fully local, with `[0, 50)` present, so no "hydrate the missing range" can
+/// download the old version over the 50 new bytes.
 #[test]
-fn local_size_shrink_refuses_to_strand_ranges() {
+fn review_blocking_a_truncate_then_grow_stays_fully_local() {
     let fx = Fixture::new();
-    let mut store = fx.open_with_mount();
+    let store = fx.open_with_mount();
     store.insert_item(&file("f", Some(ROOT), "f", 100)).unwrap();
-    store.record_hydrated_range(&key("f"), r(40, 80)).unwrap();
-
-    let err = store.set_local_size(&key("f"), 60).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            StoreError::RangesWouldExceedItem {
-                covered_end: 80,
-                ..
-            }
-        ),
-        "{err}"
+    assert_eq!(
+        store.item(&key("f")).unwrap().unwrap().state.hydration,
+        Hydration::Placeholder
     );
-    let stored = store.item(&key("f")).unwrap().unwrap();
-    assert_eq!((stored.size, stored.local_dirty), (100, false));
-    store.set_local_size(&key("f"), 80).unwrap();
 
-    let tx = store.transaction().unwrap();
-    tx.truncate_local(&key("f"), 60).unwrap();
-    tx.commit().unwrap();
-    assert_eq!(store.item(&key("f")).unwrap().unwrap().size, 60);
+    store.truncate_local(&key("f"), 0).unwrap();
+    let stored = store.item(&key("f")).unwrap().unwrap();
+    assert_eq!(
+        (stored.size, stored.state.hydration, stored.local_dirty),
+        (0, Hydration::Full, true)
+    );
+    store.set_local_size(&key("f"), 50).unwrap();
+    let stored = store.item(&key("f")).unwrap().unwrap();
+    assert_eq!((stored.size, stored.state.hydration), (50, Hydration::Full));
+    assert!(store.is_range_hydrated(&key("f"), r(0, 50)).unwrap());
+    assert_eq!(store.hydrated_ranges(&key("f")).unwrap(), [r(0, 50)]);
+}
+
+/// Fourth review, blocking (b), the reviewer's sequence: a full 100-byte file grown to
+/// 200 bytes has all 200 bytes recorded as present.
+#[test]
+fn review_blocking_b_growing_a_full_file_records_the_new_bytes() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    full_file(&store, "f", 100);
+    store.set_local_size(&key("f"), 200).unwrap();
+    let stored = store.item(&key("f")).unwrap().unwrap();
+    assert_eq!(
+        (stored.size, stored.state.hydration),
+        (200, Hydration::Full)
+    );
+    assert!(store.is_range_hydrated(&key("f"), r(100, 200)).unwrap());
+    assert_eq!(store.hydrated_ranges(&key("f")).unwrap(), [r(0, 200)]);
+}
+
+/// Fourth review, blocking: a local change to a file that is not fully local is refused
+/// (the engine hydrates first, ADR-0012 R1), and changes nothing; only a truncate to 0
+/// works on any file. A dirty file cannot take a separate range record.
+#[test]
+fn local_changes_need_a_fully_local_file() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    // A placeholder, a partial file, and a "full" file whose ranges do not cover it.
+    store.insert_item(&file("p", Some(ROOT), "p", 100)).unwrap();
+    let mut partial = file("q", Some(ROOT), "q", 100);
+    partial.state.hydration = Hydration::Partial;
+    store.insert_item(&partial).unwrap();
+    store.record_hydrated_range(&partial.key, r(0, 40)).unwrap();
+    let mut lying = file("l", Some(ROOT), "l", 100);
+    lying.state.hydration = Hydration::Full;
+    store.insert_item(&lying).unwrap();
+
+    for id in ["p", "q", "l"] {
+        let before = store.item(&key(id)).unwrap();
+        let ranges = store.hydrated_ranges(&key(id)).unwrap();
+        let errs = [
+            store.mark_local_change(&key(id)).unwrap_err(),
+            store.set_local_size(&key(id), 100).unwrap_err(),
+            store.set_local_size(&key(id), 150).unwrap_err(),
+            store.truncate_local(&key(id), 10).unwrap_err(),
+        ];
+        for err in errs {
+            assert!(
+                matches!(err, StoreError::NotFullyLocal { .. }),
+                "{id}: {err}"
+            );
+        }
+        assert_eq!(store.item(&key(id)).unwrap(), before, "{id}");
+        assert_eq!(store.hydrated_ranges(&key(id)).unwrap(), ranges, "{id}");
+    }
+
+    let item = full_file(&store, "f", 100);
+    store.mark_local_change(&item.key).unwrap();
+    let err = store
+        .record_hydrated_range(&item.key, r(0, 10))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::LocalChanges { .. }), "{err}");
+    drop(store);
+    let refused = raw(&fx.path()).execute(
+        "UPDATE items SET hydration = 'partial' WHERE item_id = 'f'",
+        [],
+    );
+    assert!(refused.is_err(), "the schema CHECK keeps a dirty file full");
 }
 
 // ---------------------------------------------------- dehydration and discard
@@ -739,7 +809,7 @@ fn dehydrate_is_atomic_and_refused_for_dirty_or_unsynced_items() {
                 assert!(matches!(err, StoreError::NotInSync { .. }), "{err}");
             }
             assert_eq!(store.item(&item.key).unwrap(), Some(item.clone()));
-            assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 80)]);
+            assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 100)]);
         }
     }
 }
@@ -758,7 +828,7 @@ fn dirty_items_refuse_clearing_ranges_and_lowering_hydration() {
         assert!(matches!(err, StoreError::LocalChanges { .. }), "{err}");
     }
     store.set_hydration(&item.key, Hydration::Full).unwrap();
-    assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 80)]);
+    assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 100)]);
 }
 
 /// Third review F2, the reviewer's sequence: a 100-byte file is truncated to 0 locally
@@ -844,7 +914,7 @@ fn complete_upload_of_the_current_generation_syncs_the_item() {
     assert_eq!(stored.state.sync, SyncState::InSync);
     assert_eq!(stored.etag.as_deref(), Some("etag-up"));
     assert_eq!((stored.local_hash, stored.server_hash), (hash(4), hash(5)));
-    assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 80)]);
+    assert_eq!(store.hydrated_ranges(&item.key).unwrap(), [r(0, 100)]);
 }
 
 /// N1, the ABA case: upload 1 (generation 1) is in flight when the user writes again
@@ -861,7 +931,6 @@ fn complete_upload_of_an_older_generation_keeps_the_item_dirty() {
         .unwrap();
     // The user appends while upload 1 is in flight.
     let second = store.set_local_size(&item.key, 150).unwrap();
-    store.record_hydrated_range(&item.key, r(80, 150)).unwrap();
     assert!(second > first);
 
     let response_1 = upload_response(&item, "etag-v1", 6, 100);
@@ -909,7 +978,6 @@ fn complete_upload_rekeys_a_provisional_item() {
     let store = fx.open_with_mount();
     let tmp = provisional("tmp-1", Some(ROOT), "new.txt", 10);
     store.insert_item(&tmp).unwrap();
-    store.record_hydrated_range(&tmp.key, r(0, 10)).unwrap();
     store
         .set_sync(&tmp.key, SyncState::PendingUpload, SyncState::Uploading)
         .unwrap();
@@ -1020,6 +1088,98 @@ fn review_f1_remote_change_during_an_upload_is_not_forgotten() {
     assert_eq!((stored.size, stored.server_hash), (120, hash(3)));
 }
 
+/// Fourth review, finding 2, the reviewer's sequence: the delta reports our V2 already
+/// renamed on the server (new name, eTag e2b); then `complete_upload` arrives with the
+/// older response (old name, eTag e2). The newer name and eTag the store recorded win.
+#[test]
+fn review_4_2_an_echo_keeps_the_newer_recorded_metadata() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let v1 = hydrated(&store, SyncState::InSync, false);
+    let generation = store.mark_local_change(&v1.key).unwrap();
+    let response = upload_response(&v1, "e2", 2, 100);
+    let renamed_echo = RemoteMetadata {
+        name: "renamed.txt".to_owned(),
+        etag: Some("e2b".to_owned()),
+        ..response.clone()
+    };
+    store.apply_remote_metadata(&renamed_echo).unwrap();
+
+    assert_eq!(
+        store
+            .complete_upload(&v1.key, generation, hash(2).unwrap(), &response, None)
+            .unwrap(),
+        UploadCompleted::Synced
+    );
+    let stored = store.item(&v1.key).unwrap().unwrap();
+    assert_eq!(stored.name, "renamed.txt");
+    assert_eq!(stored.etag.as_deref(), Some("e2b"));
+    assert!(!stored.local_dirty && !stored.remote_changed);
+}
+
+/// Fourth review, finding 3: after `UploadedButRemoteMovedOn`, the item cannot be set
+/// in-sync (and so cannot be dehydrated as a stale V2 placeholder) until fresh metadata is
+/// applied; applying it clears the flag.
+#[test]
+fn review_4_3_remote_changed_blocks_in_sync_until_fresh_metadata() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let v1 = hydrated(&store, SyncState::InSync, false);
+    let generation = store.mark_local_change(&v1.key).unwrap();
+    let v2 = upload_response(&v1, "etag-v2", 2, 100);
+    let v3 = upload_response(&v1, "etag-v3", 3, 100);
+    store.apply_remote_metadata(&v3).unwrap();
+    assert_eq!(
+        store
+            .complete_upload(&v1.key, generation, hash(2).unwrap(), &v2, None)
+            .unwrap(),
+        UploadCompleted::UploadedButRemoteMovedOn
+    );
+
+    let err = store
+        .set_sync(&v1.key, SyncState::PendingDownload, SyncState::InSync)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::RemoteChanged { .. }), "{err}");
+    let err = store.dehydrate(&v1.key).unwrap_err();
+    assert!(matches!(err, StoreError::NotInSync { .. }), "{err}");
+    drop(store);
+    let refused =
+        raw(&fx.path()).execute("UPDATE items SET sync = 'in-sync' WHERE item_id = 'f'", []);
+    assert!(refused.is_err(), "the schema CHECK refuses it too");
+
+    let store = fx.open();
+    store.apply_remote_metadata(&v3).unwrap();
+    assert!(!store.item(&v1.key).unwrap().unwrap().remote_changed);
+    store
+        .set_sync(&v1.key, SyncState::PendingDownload, SyncState::InSync)
+        .unwrap();
+}
+
+/// Fourth review, finding 4: discard is refused when the server has reported a newer
+/// version and the supplied metadata is still the stored base version (stale); fresh
+/// metadata is accepted.
+#[test]
+fn review_4_4_discard_refuses_stale_metadata() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let base = hydrated(&store, SyncState::InSync, false);
+    store.mark_local_change(&base.key).unwrap();
+    let newer = upload_response(&base, "etag-v3", 3, 120);
+    store.apply_remote_metadata(&newer).unwrap();
+    let before = store.item(&base.key).unwrap();
+
+    let err = store
+        .discard_local_changes(&base.key, &remote(&base))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::RemoteChanged { .. }), "{err}");
+    assert_eq!(store.item(&base.key).unwrap(), before);
+
+    store.discard_local_changes(&base.key, &newer).unwrap();
+    let stored = store.item(&base.key).unwrap().unwrap();
+    assert_eq!((stored.size, stored.server_hash), (120, hash(3)));
+    assert!(!stored.local_dirty && !stored.remote_changed);
+}
+
 /// F1: when the delta seen during the upload is our own upload echoing back, completion
 /// is `Synced` as usual.
 #[test]
@@ -1083,6 +1243,7 @@ fn review_f3_a_marked_item_is_found_by_recovery() {
         let mut f = file(id, Some(ROOT), id, 10);
         f.state.sync = sync;
         store.insert_item(&f).unwrap();
+        make_full(&store, &f.key);
         store.mark_local_change(&f.key).unwrap();
     }
     drop(store);
@@ -1239,7 +1400,6 @@ fn rekey_moves_item_children_and_ranges() {
     store.insert_item(&dir).unwrap();
     let child = provisional("tmp-2", Some("tmp-1"), "a.txt", 10);
     store.insert_item(&child).unwrap();
-    store.record_hydrated_range(&child.key, r(0, 10)).unwrap();
 
     store
         .rekey_item(&child.key, &ItemId::new("srv-2").unwrap())
@@ -1556,7 +1716,7 @@ fn delete_refuses_items_with_pending_local_changes() {
             .unwrap();
     }
     assert_eq!(row_snapshot(&fx), before, "refused deletes changed nothing");
-    assert_eq!(store.hydrated_ranges(&key("plan")).unwrap(), [r(0, 10)]);
+    assert_eq!(store.hydrated_ranges(&key("plan")).unwrap(), [r(0, 100)]);
 }
 
 /// The explicit opt-in deletes the named dirty item, with its ranges.
@@ -1565,8 +1725,8 @@ fn server_confirmed_local_delete_removes_the_named_item() {
     let fx = Fixture::new();
     let store = fx.open_with_mount();
     tree(&store);
+    make_full(&store, &key("plan"));
     let generation = store.mark_local_change(&key("plan")).unwrap();
-    store.record_hydrated_range(&key("plan"), r(0, 10)).unwrap();
     assert_eq!(
         store
             .delete_item(
@@ -1599,10 +1759,7 @@ fn review_f5_confirmed_delete_exempts_only_the_named_item() {
     store
         .insert_item(&file("moved-in", Some("work"), "theirs.txt", 10))
         .unwrap();
-    store
-        .record_hydrated_range(&key("moved-in"), r(0, 10))
-        .unwrap();
-    store.mark_local_change(&key("moved-in")).unwrap();
+    make_dirty(&store, &key("moved-in"), SyncState::PendingUpload);
     let before = row_snapshot(&fx);
 
     let confirmed = PendingChanges::ServerConfirmedLocalDelete {

@@ -139,6 +139,7 @@ pub fn provisional(id: &str, parent: Option<&str>, name: &str, size: u64) -> Ite
     item.local_dirty = true;
     item.local_generation = 1;
     item.etag = None;
+    item.state.hydration = Hydration::Full;
     item.state.sync = SyncState::PendingUpload;
     item
 }
@@ -152,8 +153,21 @@ pub const DIRTY_SYNC_STATES: [SyncState; 5] = [
     SyncState::Blocked,
 ];
 
-/// Makes a stored clean item dirty through the API and moves it to `sync`.
+/// Hydrates a stored clean file fully, as the engine does before a local change.
+pub fn make_full(store: &impl Queries, key: &ItemKey) {
+    let item = store.item(key).unwrap().unwrap();
+    if item.kind == ItemKind::File && item.size > 0 {
+        store
+            .record_hydrated_range(key, mydrive_store::ByteRange::new(0, item.size).unwrap())
+            .unwrap();
+    }
+    store.set_hydration(key, Hydration::Full).unwrap();
+}
+
+/// Makes a stored clean item dirty through the API (hydrating it first, as the engine
+/// must) and moves it to `sync`.
 pub fn make_dirty(store: &impl Queries, key: &ItemKey, sync: SyncState) {
+    make_full(store, key);
     store.mark_local_change(key).unwrap();
     if sync != SyncState::PendingUpload {
         store.set_sync(key, SyncState::PendingUpload, sync).unwrap();

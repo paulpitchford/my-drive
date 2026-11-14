@@ -346,9 +346,8 @@ fn upload_crash_child(db: &Path, point: &str) -> ! {
 
     // The write itself goes to the backing file; the store records its effect.
     let tx = store.transaction().unwrap();
+    // Growing a fully local file records the new bytes itself.
     let generation = tx.set_local_size(&k, 150).unwrap();
-    tx.record_hydrated_range(&k, ByteRange::new(100, 150).unwrap())
-        .unwrap();
     tx.commit().unwrap();
     kill_at("after-write");
 

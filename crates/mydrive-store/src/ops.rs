@@ -301,6 +301,14 @@ pub trait Queries: sealed::Connected {
                         key: key.clone(),
                     });
                 }
+                // The server has a version not yet applied; only applying fresh metadata
+                // clears this (fourth review, finding 3).
+                if item.remote_changed && new == SyncState::InSync {
+                    return Err(StoreError::RemoteChanged {
+                        action: "set in sync",
+                        key: key.clone(),
+                    });
+                }
                 let changed = c
                     .execute(
                         "UPDATE items SET sync = ?4 \
@@ -366,61 +374,81 @@ pub trait Queries: sealed::Connected {
     /// that was `in-sync` or `pending-download` becomes `pending-upload` in the same
     /// statement, so a dirty item is never `in-sync` and restart recovery always finds it.
     /// On the clean-to-dirty transition the base version's identity is recorded as the
-    /// last remote identity. The engine must hydrate a placeholder before extending it
-    /// (ADR-0012 R1); the store does not see the bytes.
+    /// last remote identity.
+    ///
+    /// A dirty file is always fully local, so a file must be `full` with ranges covering
+    /// `[0, size)` before it can be marked: the engine hydrates first (ADR-0012 R1). The
+    /// one exception is [`truncate_local`](Self::truncate_local) to 0 (`O_TRUNC`).
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`].
+    /// [`StoreError::ItemNotFound`], [`StoreError::NotFullyLocal`]. A refusal changes
+    /// nothing.
     fn mark_local_change(&self, key: &ItemKey) -> Result<u64, StoreError> {
-        run(self, |c| mark_local_change(c, key))
+        run(self, |c| {
+            atomic(c, |c| {
+                let item = load_item(c, key, "mark a local change")?;
+                require_fully_local(c, &item, "mark a local change of")?;
+                mark_local_change(c, key)
+            })
+        })
     }
 
-    /// Records a local write that changes the size: marks a local change (as
-    /// [`mark_local_change`](Self::mark_local_change)) and sets the size, returning the new
-    /// generation. A shrink that would strand recorded ranges is refused; use
-    /// [`truncate_local`](Self::truncate_local) to shrink.
+    /// Records a local write that changes the size of a fully local file: marks a local
+    /// change (as [`mark_local_change`](Self::mark_local_change)), sets the size and makes
+    /// the ranges exactly `[0, size)`. Growing extends the range, because the grown bytes
+    /// are local by definition; shrinking trims it. Returns the new generation.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`], [`StoreError::SizeTooLarge`],
-    /// [`StoreError::RangesWouldExceedItem`]. A refusal changes nothing.
+    /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`],
+    /// [`StoreError::NotFullyLocal`], [`StoreError::SizeTooLarge`]. A refusal changes
+    /// nothing.
     fn set_local_size(&self, key: &ItemKey, size: u64) -> Result<u64, StoreError> {
         run(self, |c| {
             atomic(c, |c| {
                 let stored = to_i64_checked(size, key)?;
                 file_size(c, key, "set the size")?;
-                if let Some(end) = covered_end(c, key)?
-                    && end > size
-                {
-                    return Err(StoreError::RangesWouldExceedItem {
-                        key: key.clone(),
-                        size,
-                        covered_end: end,
-                    });
-                }
+                let item = load_item(c, key, "set the size")?;
+                require_fully_local(c, &item, "set the local size of")?;
                 let generation = mark_local_change(c, key)?;
                 set_size(c, key, stored)?;
+                set_whole_file_range(c, key, stored)?;
                 Ok(generation)
             })
         })
     }
 
-    /// Records a local truncate (or extension) to `size`: marks a local change, sets the
-    /// size and trims the recorded ranges to it, in one operation. Returns the new
-    /// generation.
+    /// Records a local truncate (or extension) to `size`, returning the new generation.
+    ///
+    /// - `size == 0` (`O_TRUNC`, which needs no download, ADR-0012 R2) works on any file:
+    ///   it clears the ranges, sets hydration `full` and size 0, and marks the change.
+    /// - Any other size needs a fully local file, as
+    ///   [`set_local_size`](Self::set_local_size), and leaves the ranges exactly
+    ///   `[0, size)`.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`], [`StoreError::SizeTooLarge`].
+    /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`],
+    /// [`StoreError::NotFullyLocal`] (non-zero size only), [`StoreError::SizeTooLarge`].
+    /// A refusal changes nothing.
     fn truncate_local(&self, key: &ItemKey, size: u64) -> Result<u64, StoreError> {
         run(self, |c| {
             atomic(c, |c| {
                 let stored = to_i64_checked(size, key)?;
                 file_size(c, key, "truncate")?;
+                let item = load_item(c, key, "truncate")?;
+                if size > 0 {
+                    require_fully_local(c, &item, "truncate")?;
+                } else {
+                    // Nothing of the old content is needed any more: the empty file is
+                    // fully local. Done before the mark so the dirty CHECK holds.
+                    clear_ranges(c, key)?;
+                    update_item(c, key, "hydration", Hydration::Full.as_str(), "truncate")?;
+                }
                 let generation = mark_local_change(c, key)?;
                 set_size(c, key, stored)?;
-                trim_ranges(c, key, stored)?;
+                set_whole_file_range(c, key, stored)?;
                 Ok(generation)
             })
         })
@@ -961,6 +989,11 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
             "a new item has no remote change or remote identity recorded",
         ));
     }
+    if item.local_dirty && item.kind == ItemKind::File && item.state.hydration != Hydration::Full {
+        return Err(invalid(
+            "a file created locally is fully local: its hydration must be full",
+        ));
+    }
     if item_exists(c, key)? {
         return Err(StoreError::ItemExists {
             action: "insert an item",
@@ -997,6 +1030,10 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
         ],
     )
     .ctx(|| describe("insert", key))?;
+    if item.local_dirty && item.kind == ItemKind::File {
+        // Its bytes exist only here: the whole file is local.
+        set_whole_file_range(c, key, size)?;
+    }
     Ok(())
 }
 
@@ -1062,6 +1099,41 @@ fn set_size(c: &Connection, key: &ItemKey, size: i64) -> Result<(), StoreError> 
         params![key.drive_id.as_str(), key.item_id.as_str(), size],
     )
     .ctx(|| describe("set the size of", key))?;
+    Ok(())
+}
+
+/// Refuses a file that is not fully local: hydration `full` and ranges covering every
+/// byte. Folders pass.
+fn require_fully_local(
+    c: &Connection,
+    item: &Item,
+    action: &'static str,
+) -> Result<(), StoreError> {
+    if item.kind == ItemKind::Folder {
+        return Ok(());
+    }
+    let whole = ByteRange::new(0, item.size)?;
+    if item.state.hydration != Hydration::Full || !is_range_hydrated(c, &item.key, whole)? {
+        return Err(StoreError::NotFullyLocal {
+            action,
+            key: item.key.clone(),
+            hydration: item.state.hydration,
+        });
+    }
+    Ok(())
+}
+
+/// Makes a file's ranges exactly `[0, size)`: a dirty file is fully local.
+fn set_whole_file_range(c: &Connection, key: &ItemKey, size: i64) -> Result<(), StoreError> {
+    clear_ranges(c, key)?;
+    if size > 0 {
+        c.execute(
+            "INSERT INTO hydrated_ranges (drive_id, item_id, range_start, range_end) \
+             VALUES (?1, ?2, 0, ?3)",
+            params![key.drive_id.as_str(), key.item_id.as_str(), size],
+        )
+        .ctx(|| describe("record the whole of", key))?;
+    }
     Ok(())
 }
 
@@ -1131,11 +1203,25 @@ fn complete_upload(
             .last_remote
             .as_ref()
             .is_none_or(|seen| !seen.same_content(&uploaded));
+    // An echo: the delta already reported our uploaded content, possibly with newer
+    // metadata (for example renamed, with a later eTag). Keep that newer parent, name, eTag
+    // and cTag rather than the older upload response (fourth review, finding 2).
+    let echo = match (&item.last_remote, item.remote_changed && !moved_on) {
+        (Some(seen), true) => Some(seen),
+        _ => None,
+    };
+    let parent = match echo {
+        Some(_) => item.parent_item_id.as_ref().map(ItemId::as_str),
+        None => response.parent_item_id.as_ref().map(ItemId::as_str),
+    };
+    let name = echo.map_or(response.name.as_str(), |_| item.name.as_str());
+    let etag = echo.map_or(response.etag.as_deref(), |seen| seen.etag.as_deref());
+    let ctag = echo.map_or(response.ctag.as_deref(), |seen| seen.ctag.as_deref());
 
     if item.local_generation != expected_generation {
         // Still dirty: the uploaded version becomes the base (its eTag is the next
         // If-Match), and size, timestamps and ranges keep describing the local content.
-        let last_remote = if moved_on {
+        let last_remote = if moved_on || echo.is_some() {
             item.last_remote.clone()
         } else {
             Some(uploaded)
@@ -1148,10 +1234,10 @@ fn complete_upload(
             params![
                 ids[0],
                 ids[1],
-                response.parent_item_id.as_ref().map(ItemId::as_str),
-                response.name,
-                response.etag.as_deref(),
-                response.ctag.as_deref(),
+                parent,
+                name,
+                etag,
+                ctag,
                 response.server_hash.as_ref().map(QuickXorHash::to_base64),
                 uploaded_local_hash.to_base64(),
                 SyncState::PendingUpload.as_str(),
@@ -1189,10 +1275,10 @@ fn complete_upload(
         params![
             ids[0],
             ids[1],
-            response.parent_item_id.as_ref().map(ItemId::as_str),
-            response.name,
-            response.etag.as_deref(),
-            response.ctag.as_deref(),
+            parent,
+            name,
+            etag,
+            ctag,
             response.server_hash.as_ref().map(QuickXorHash::to_base64),
             uploaded_local_hash.to_base64(),
             size,
@@ -1347,13 +1433,29 @@ fn discard_local_changes(
             reason: "the server metadata describes a different item".to_owned(),
         });
     }
+    // Demonstrably stale metadata: the server has reported a newer version
+    // (`remote_changed`) and `current` is still the version the stored server columns
+    // describe. Their size is not compared, since a dirty item's size is local.
+    if item.remote_changed {
+        let base = RemoteIdentity {
+            size: current.size,
+            ..base_identity(&item)
+        };
+        if base.same_content(&current.identity()) {
+            return Err(StoreError::RemoteChanged {
+                action: "discard, with stale server metadata, the local changes of",
+                key: key.clone(),
+            });
+        }
+    }
     check_name(key, &current.name)?;
     check_folder_to_file(c, &item, current)?;
     // Clean first, in one statement, so the CHECKs hold; then the item takes the
     // server's current version exactly as a clean item would (F2).
     c.execute(
-        "UPDATE items SET local_dirty = 0, sync = ?3, remote_etag = NULL, remote_ctag = NULL, \
-         remote_hash = NULL, remote_size = NULL WHERE drive_id = ?1 AND item_id = ?2",
+        "UPDATE items SET local_dirty = 0, sync = ?3, remote_changed = 0, remote_etag = NULL, \
+         remote_ctag = NULL, remote_hash = NULL, remote_size = NULL \
+         WHERE drive_id = ?1 AND item_id = ?2",
         params![
             key.drive_id.as_str(),
             key.item_id.as_str(),
@@ -1601,6 +1703,15 @@ fn resolve_path(
 
 fn record_range(c: &Connection, key: &ItemKey, range: ByteRange) -> Result<(), StoreError> {
     file_size_checked(c, key, range, "record a hydrated range")?;
+    // A dirty file is already fully local; the local-write operations keep its ranges
+    // exactly [0, size). A separate record here could only describe a download landing
+    // over unsynced bytes.
+    if load_item(c, key, "record a hydrated range")?.local_dirty {
+        return Err(StoreError::LocalChanges {
+            action: "record a hydrated range of",
+            key: key.clone(),
+        });
+    }
     if range.is_empty() {
         return Ok(());
     }
@@ -1692,18 +1803,6 @@ fn clear_ranges(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
         )
         .ctx(|| describe("clear the hydrated ranges of", key))?;
     Ok(u64::try_from(removed).unwrap_or(u64::MAX))
-}
-
-fn covered_end(c: &Connection, key: &ItemKey) -> Result<Option<u64>, StoreError> {
-    let end: Option<i64> = c
-        .query_row(
-            "SELECT MAX(range_end) FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2",
-            [key.drive_id.as_str(), key.item_id.as_str()],
-            |row| row.get(0),
-        )
-        .ctx(|| describe("read the hydrated ranges of", key))?;
-    end.map(|e| to_u64(e, "hydrated_ranges", "range_end", key))
-        .transpose()
 }
 
 fn child_count(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {

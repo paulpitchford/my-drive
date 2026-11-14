@@ -314,20 +314,32 @@ pub enum StoreError {
         size: u64,
     },
 
-    /// A local size change would leave hydrated ranges past the new end of the file.
-    /// Clear or re-record the ranges first, in the same transaction.
+    /// A local change was asked of a file that is not fully local. A dirty file is always
+    /// fully local, so the engine hydrates it first (ADR-0012 R1). Nothing changed.
     #[error(
-        "state store: cannot set the size of item {item_id} in drive {drive_id} to {size}: \
-         its hydrated ranges reach byte {covered_end}; clear them first",
+        "state store: refusing to {action} item {item_id} in drive {drive_id}: it is not \
+         fully local (hydration {hydration}); hydrate it first",
         drive_id = .key.drive_id, item_id = .key.item_id
     )]
-    RangesWouldExceedItem {
+    NotFullyLocal {
+        /// What was refused.
+        action: &'static str,
         /// The item.
         key: ItemKey,
-        /// The size asked for.
-        size: u64,
-        /// One past the last hydrated byte.
-        covered_end: u64,
+        /// Its hydration state.
+        hydration: mydrive_core::state::Hydration,
+    },
+
+    /// The server reported a newer version that has not been applied yet
+    /// (`remote_changed`), so the operation would act on stale state. Nothing changed.
+    #[error("state store: refusing to {action} item {item_id} in drive {drive_id}: the \
+             server has a newer version that has not been applied",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    RemoteChanged {
+        /// What was refused.
+        action: &'static str,
+        /// The item.
+        key: ItemKey,
     },
 
     /// `end` is before `start`.
