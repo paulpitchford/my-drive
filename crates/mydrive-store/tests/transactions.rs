@@ -183,12 +183,190 @@ fn ac2_killed_at_any_point_leaves_exactly_the_committed_state() {
             }),
             "{point}"
         );
+        // Every item with ranges recorded touching pieces holds exactly the merged form.
+        assert_eq!(
+            assert_ranges_merged_and_in_bounds(&store),
+            [vec![
+                ByteRange::new(0, 60).unwrap(),
+                ByteRange::new(80, 100).unwrap()
+            ]],
+            "{point}"
+        );
+    }
+}
+
+/// Set in the child of `killed_during_a_local_change_and_upload_never_loses_the_dirty_mark`.
+const UPLOAD_CHILD_ENV: &str = "MYDRIVE_STORE_UPLOAD_CRASH_CHILD";
+
+const UPLOAD_KILL_POINTS: [&str; 5] = [
+    "mid-mark",
+    "after-mark",
+    "after-write",
+    "mid-complete",
+    "after-complete",
+];
+
+fn hash(b: u8) -> mydrive_core::hash::QuickXorHash {
+    mydrive_core::hash::QuickXorHash::from_bytes([b; 20])
+}
+
+/// Second review: a process killed anywhere in mark_local_change, local writes and
+/// complete_upload never leaves an item that is clean while its local bytes differ from
+/// the server. Only a committed `complete_upload` clears the dirty mark. After each kill
+/// the store passes `PRAGMA integrity_check` and its ranges are merged and in bounds.
+#[test]
+fn killed_during_a_local_change_and_upload_never_loses_the_dirty_mark() {
+    use mydrive_core::state::{Hydration, Sync as SyncState};
+
+    if let Ok(arg) = std::env::var(UPLOAD_CHILD_ENV) {
+        let (db, point) = arg.split_once('|').unwrap();
+        upload_crash_child(Path::new(db), point);
+    }
+
+    for point in UPLOAD_KILL_POINTS {
+        let fx = Fixture::new();
+        {
+            let store = fx.open_with_mount();
+            let mut item = file("f", Some(ROOT), "f", 100);
+            item.server_hash = Some(hash(1));
+            item.state.hydration = Hydration::Full;
+            store.insert_item(&item).unwrap();
+            store
+                .record_hydrated_range(&item.key, ByteRange::new(0, 100).unwrap())
+                .unwrap();
+        }
+        run_child_until_killed(
+            "killed_during_a_local_change_and_upload_never_loses_the_dirty_mark",
+            UPLOAD_CHILD_ENV,
+            &format!("{}|{point}", fx.path().display()),
+        );
+        assert!(
+            fx.dir.path().join(format!("reached-{point}")).exists(),
+            "{point}: the child reached the kill point"
+        );
+        let integrity: String = raw(&fx.path())
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "{point}");
+
+        let store = fx.open();
+        let item = store.item(&key("f")).unwrap().unwrap();
+        let ranges = store.hydrated_ranges(&key("f")).unwrap();
+        let got = (
+            item.local_dirty,
+            item.local_generation,
+            item.state.sync,
+            item.size,
+            item.etag.as_deref(),
+            ranges.clone(),
+        );
+        let r = |s, e| ByteRange::new(s, e).unwrap();
+        let expected = match point {
+            // The mark never committed, so nothing was written to the backing file.
+            "mid-mark" => (
+                false,
+                0,
+                SyncState::InSync,
+                100,
+                Some("etag-f"),
+                vec![r(0, 100)],
+            ),
+            "after-mark" => (
+                true,
+                1,
+                SyncState::PendingUpload,
+                100,
+                Some("etag-f"),
+                vec![r(0, 100)],
+            ),
+            "after-write" => (
+                true,
+                2,
+                SyncState::PendingUpload,
+                150,
+                Some("etag-f"),
+                vec![r(0, 150)],
+            ),
+            "mid-complete" => (
+                true,
+                2,
+                SyncState::Uploading,
+                150,
+                Some("etag-f"),
+                vec![r(0, 150)],
+            ),
+            "after-complete" => (
+                false,
+                2,
+                SyncState::InSync,
+                150,
+                Some("etag-up"),
+                vec![r(0, 150)],
+            ),
+            other => panic!("{other}"),
+        };
+        assert_eq!(got, expected, "{point}");
+        if point == "after-complete" {
+            assert_eq!(item.local_hash, Some(hash(9)));
+        }
         assert_ranges_merged_and_in_bounds(&store);
     }
 }
 
-fn assert_ranges_merged_and_in_bounds(store: &Store) {
-    let mut with_ranges = 0;
+fn upload_crash_child(db: &Path, point: &str) -> ! {
+    use mydrive_core::state::Sync as SyncState;
+
+    let reached = |p: &str| {
+        std::fs::write(db.with_file_name(format!("reached-{p}")), b"").unwrap();
+    };
+    let kill_at = |p: &str| {
+        if p == point {
+            reached(p);
+            kill_self();
+        }
+    };
+    let mut store = Store::open(db).unwrap();
+    let k = key("f");
+
+    let tx = store.transaction().unwrap();
+    tx.mark_local_change(&k).unwrap();
+    tx.set_sync(&k, SyncState::InSync, SyncState::PendingUpload)
+        .unwrap();
+    kill_at("mid-mark");
+    tx.commit().unwrap();
+    kill_at("after-mark");
+
+    // The write itself goes to the backing file; the store records its effect.
+    let tx = store.transaction().unwrap();
+    let generation = tx.set_local_size(&k, 150).unwrap();
+    tx.record_hydrated_range(&k, ByteRange::new(100, 150).unwrap())
+        .unwrap();
+    tx.commit().unwrap();
+    kill_at("after-write");
+
+    store
+        .set_sync(&k, SyncState::PendingUpload, SyncState::Uploading)
+        .unwrap();
+    let item = store.item(&k).unwrap().unwrap();
+    let response = mydrive_store::RemoteMetadata {
+        etag: Some("etag-up".to_owned()),
+        server_hash: Some(hash(9)),
+        size: 150,
+        ..common::remote(&item)
+    };
+    let tx = store.transaction().unwrap();
+    tx.complete_upload(&k, generation, hash(9), &response, None)
+        .unwrap();
+    kill_at("mid-complete");
+    tx.commit().unwrap();
+    reached("after-complete");
+    kill_self();
+}
+
+/// Every file under the root has merged, in-bounds ranges. Returns the distinct range
+/// lists seen, for callers that expect a particular shape.
+fn assert_ranges_merged_and_in_bounds(store: &Store) -> Vec<Vec<ByteRange>> {
+    let mut seen: Vec<Vec<ByteRange>> = Vec::new();
     for item in store.children(&key(ROOT)).unwrap() {
         let ranges = store.hydrated_ranges(&item.key).unwrap();
         for pair in ranges.windows(2) {
@@ -196,17 +374,12 @@ fn assert_ranges_merged_and_in_bounds(store: &Store) {
         }
         if let Some(last) = ranges.last() {
             assert!(last.end() <= item.size, "{:?} out of bounds", item.key);
-            assert_eq!(
-                ranges,
-                [
-                    ByteRange::new(0, 60).unwrap(),
-                    ByteRange::new(80, 100).unwrap()
-                ]
-            );
-            with_ranges += 1;
+        }
+        if !ranges.is_empty() && !seen.contains(&ranges) {
+            seen.push(ranges);
         }
     }
-    assert!(with_ranges > 0);
+    seen
 }
 
 fn crash_child(db: &Path, point: &str) -> ! {

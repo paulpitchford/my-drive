@@ -329,6 +329,9 @@ fn expected_schema() -> BTreeMap<String, Columns> {
                 ("sync", "TEXT", true, 0),
                 ("last_error", "TEXT", false, 0),
                 ("is_provisional", "INTEGER", true, 0),
+                ("local_dirty", "INTEGER", true, 0),
+                ("local_generation", "INTEGER", true, 0),
+                ("remote_changed", "INTEGER", true, 0),
             ]),
         ),
         (

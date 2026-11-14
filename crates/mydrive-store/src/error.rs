@@ -100,6 +100,49 @@ pub enum StoreError {
         children: u64,
     },
 
+    /// The operation would discard or misdescribe local content that has not reached the
+    /// server (the item is dirty). Nothing changed.
+    #[error("state store: refusing to {action} item {item_id} in drive {drive_id}: it holds \
+             local changes that have not reached the server",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    LocalChanges {
+        /// What was refused.
+        action: &'static str,
+        /// The dirty item.
+        key: ItemKey,
+    },
+
+    /// Dehydration needs the item to be in sync with the server. Nothing changed.
+    #[error("state store: refusing to dehydrate item {item_id} in drive {drive_id}: its sync \
+             state is {sync}, not in-sync", drive_id = .key.drive_id, item_id = .key.item_id)]
+    NotInSync {
+        /// The item.
+        key: ItemKey,
+        /// Its sync state.
+        sync: mydrive_core::state::Sync,
+    },
+
+    /// The item is the root of a mount and cannot be deleted while the mount exists.
+    #[error("state store: refusing to delete item {item_id} in drive {drive_id}: it is the \
+             root of mount {mount_id}", drive_id = .key.drive_id, item_id = .key.item_id)]
+    MountRoot {
+        /// The root item, which may be a descendant of the item asked to be deleted.
+        key: ItemKey,
+        /// The mount it is the root of.
+        mount_id: MountId,
+    },
+
+    /// An upload response for a provisional item must carry the server's item ID, and for
+    /// any item must name the item that was uploaded.
+    #[error("state store: cannot complete the upload of item {item_id} in drive {drive_id}: \
+             {reason}", drive_id = .key.drive_id, item_id = .key.item_id)]
+    UploadMismatch {
+        /// The item.
+        key: ItemKey,
+        /// What did not match.
+        reason: String,
+    },
+
     /// A delete would remove local changes that have not reached the server.
     #[error("state store: refusing to delete item {item_id} in drive {drive_id}: {count} \
              item(s) have local changes not on the server: {listed}",
@@ -108,8 +151,7 @@ pub enum StoreError {
     HasPendingLocalChanges {
         /// The item asked to be deleted.
         key: ItemKey,
-        /// Every item in the delete whose sync is `pending-upload`, `uploading` or
-        /// `conflict`.
+        /// Every dirty item the delete would remove.
         pending: Vec<ItemKey>,
     },
 

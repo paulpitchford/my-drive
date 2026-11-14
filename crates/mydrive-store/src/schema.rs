@@ -85,6 +85,9 @@ CREATE TABLE items (
                        'pending-upload', 'uploading', 'conflict', 'error', 'blocked')),
     last_error     TEXT,
     is_provisional INTEGER NOT NULL DEFAULT 0 CHECK (is_provisional IN (0, 1)),
+    local_dirty    INTEGER NOT NULL DEFAULT 0 CHECK (local_dirty IN (0, 1)),
+    local_generation INTEGER NOT NULL DEFAULT 0 CHECK (local_generation >= 0),
+    remote_changed INTEGER NOT NULL DEFAULT 0 CHECK (remote_changed IN (0, 1)),
     PRIMARY KEY (drive_id, item_id)
 ) STRICT, WITHOUT ROWID;
 

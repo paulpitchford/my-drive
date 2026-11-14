@@ -154,8 +154,22 @@ pub struct Item {
     pub last_error: Option<String>,
     /// The item was created locally and the server has not assigned its ID yet: `item_id`
     /// is a provisional value the engine generated. Cleared by
-    /// [`rekey_item`](crate::Queries::rekey_item).
+    /// [`rekey_item`](crate::Queries::rekey_item) and
+    /// [`complete_upload`](crate::Queries::complete_upload).
     pub is_provisional: bool,
+    /// The backing file holds content that has not reached the server. Every guard against
+    /// losing local content keys on this, not on the sync state. Set by
+    /// [`mark_local_change`](crate::Queries::mark_local_change); cleared only by
+    /// [`complete_upload`](crate::Queries::complete_upload) or
+    /// [`discard_local_changes`](crate::Queries::discard_local_changes).
+    pub local_dirty: bool,
+    /// Bumped on every local content change, so an upload of an older version cannot mark
+    /// a newer one as synced.
+    pub local_generation: u64,
+    /// The server reported different content while the item was dirty, and the server
+    /// columns were deliberately not updated: they still describe the version the local
+    /// change was based on. Survives a restart, so conflict handling is not forgotten.
+    pub remote_changed: bool,
 }
 
 /// The server-owned part of an item, as a delta or an upload response reports it.
@@ -189,23 +203,38 @@ pub struct RemoteMetadata {
 /// What [`apply_remote_metadata`](crate::Queries::apply_remote_metadata) did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteApplied {
-    /// The content identity did not change; every server-owned column was written.
+    /// The content identity did not change. On a clean item every server-owned column was
+    /// written; on a dirty item only parent and name were.
     ContentUnchanged,
-    /// The content changed and nothing local was pending (sync `in-sync` or
-    /// `pending-download`): every server-owned column was written, the hydrated ranges
-    /// were cleared and hydration set to `placeholder` (`full` for a folder).
+    /// The content changed and the item was clean: every server-owned column was written,
+    /// the hydrated ranges were cleared and hydration set to `placeholder` (`full` for a
+    /// folder).
     ContentReplaced {
         /// How many hydrated ranges were removed.
         ranges_cleared: u64,
     },
-    /// The content changed while the item holds local state that may not be on the server
-    /// (sync `pending-upload`, `uploading`, `conflict`, `error` or `blocked`). Only the
-    /// parent and name were written. Content columns (kind, size, timestamps, eTag, cTag,
-    /// server hash), ranges and every local column are untouched, so the stale eTag still
-    /// makes the next upload fail with 412. The engine runs conflict handling.
+    /// The content changed while the item is dirty. Only parent and name were written;
+    /// nothing describing content (kind, size, timestamps, eTag, cTag, server hash),
+    /// ranges or local state changed, and the durable `remote_changed` flag was set. The
+    /// stale eTag still makes the next upload fail with 412. The engine runs conflict
+    /// handling.
     ContentChangedUnderLocalState {
         /// The item's sync state, unchanged.
         sync: mydrive_core::state::Sync,
+    },
+}
+
+/// What [`complete_upload`](crate::Queries::complete_upload) did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadCompleted {
+    /// The uploaded version is still the local version: the item is clean and `in-sync`.
+    Synced,
+    /// The item changed locally after the upload started. The server columns and hashes
+    /// now describe the uploaded version (so the next upload's `If-Match` is right), but
+    /// the item stays dirty and `pending-upload`.
+    LocalChangedSince {
+        /// The item's current local generation.
+        generation: u64,
     },
 }
 
@@ -213,8 +242,7 @@ pub enum RemoteApplied {
 /// changes that have not reached the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingChanges {
-    /// Refuse if the item, or any descendant, has sync `pending-upload`, `uploading` or
-    /// `conflict`.
+    /// Refuse if the item, or any descendant, is dirty (`local_dirty`).
     Refuse,
     /// The server has confirmed a delete the user made locally, so the pending state is
     /// that delete and removing the rows loses nothing.

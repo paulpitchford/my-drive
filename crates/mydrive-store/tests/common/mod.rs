@@ -124,6 +124,9 @@ pub fn file(id: &str, parent: Option<&str>, name: &str, size: u64) -> Item {
         },
         last_error: None,
         is_provisional: false,
+        local_dirty: false,
+        local_generation: 0,
+        remote_changed: false,
     }
 }
 

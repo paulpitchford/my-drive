@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::error::{SqlContext, StoreError};
 use crate::types::{
     Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, PendingChanges,
-    RemoteApplied, RemoteMetadata, Timestamp,
+    RemoteApplied, RemoteMetadata, Timestamp, UploadCompleted,
 };
 
 pub(crate) mod sealed {
@@ -43,18 +43,10 @@ pub(crate) mod sealed {
 
 const ITEM_COLUMNS: &str = "drive_id, item_id, parent_item_id, name, kind, size, created_at, \
      modified_at, etag, ctag, server_hash, local_hash, hydration, pin, sync, last_error, \
-     is_provisional";
+     is_provisional, local_dirty, local_generation, remote_changed";
 
 const MOUNT_COLUMNS: &str = "mount_id, account_id, drive_id, root_item_id, mount_point, \
      delta_token, read_only, blocked_reason";
-
-/// Sync states that mean local changes may not be on the server. A delete is refused for
-/// them unless the server confirmed it.
-const PENDING_LOCAL: [SyncState; 3] = [
-    SyncState::PendingUpload,
-    SyncState::Uploading,
-    SyncState::Conflict,
-];
 
 /// Every typed operation on the store.
 ///
@@ -245,19 +237,23 @@ pub trait Queries: sealed::Connected {
 
     /// Applies what the server reports about an existing item, writing only server-owned
     /// columns: parent, name, kind, size, timestamps, eTag, cTag and server hash. Local
-    /// hash, hydration, pin, sync and last error are never written here, except as below.
+    /// hash, pin, sync and last error are never written here.
     ///
-    /// The content identity has changed when the server hash differs, or, where neither
-    /// side has a hash, when the eTag or size differs; a kind change also counts.
+    /// The content identity has changed when the server hash differs; where neither side
+    /// has a hash, when the cTag differs (if both have one; a rename changes the eTag but
+    /// not the cTag), else the eTag, or the size differs; a kind change also counts.
     ///
-    /// - Unchanged: every server-owned column is written.
-    /// - Changed, sync `in-sync` or `pending-download`: every server-owned column is
-    ///   written, the hydrated ranges are cleared and hydration is set to `placeholder`
-    ///   (`full` for a folder), in one operation, so the ranges never describe another
-    ///   version than the hashes.
-    /// - Changed, any other sync: only parent and name are written; content columns,
-    ///   ranges and local state are untouched, and the result says so, so the engine can
-    ///   run conflict handling. The old eTag stays, so an upload still meets 412.
+    /// - Dirty item (`local_dirty`): only parent and name are written. Nothing describing
+    ///   content changes, so size and ranges keep describing the local content and the old
+    ///   eTag still makes an upload meet 412. If the content identity differs, the durable
+    ///   `remote_changed` flag is set and the result is
+    ///   [`RemoteApplied::ContentChangedUnderLocalState`], so the engine runs conflict
+    ///   handling, now or after a restart.
+    /// - Clean item, unchanged content: every server-owned column is written and
+    ///   `remote_changed` cleared.
+    /// - Clean item, changed content: as above, and the hydrated ranges are cleared and
+    ///   hydration set to `placeholder` (`full` for a folder) in the same operation, so the
+    ///   ranges never describe another version than the hashes.
     ///
     /// A move or rename is one row update; every descendant's resolved path follows
     /// (WP-006 AC4).
@@ -323,60 +319,54 @@ pub trait Queries: sealed::Connected {
         })
     }
 
-    /// Sets the hydration state.
+    /// Sets the hydration state. Moving a dirty item to `placeholder` or `partial` is
+    /// refused: that would claim its unsynced local bytes are gone. Use
+    /// [`dehydrate`](Self::dehydrate) to release content.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`].
+    /// [`StoreError::ItemNotFound`], [`StoreError::LocalChanges`].
     fn set_hydration(&self, key: &ItemKey, hydration: Hydration) -> Result<(), StoreError> {
         run(self, |c| {
-            update_item(c, key, "hydration", hydration.as_str(), "set the hydration")
+            atomic(c, |c| {
+                let item = load_item(c, key, "set the hydration")?;
+                if item.local_dirty && hydration != Hydration::Full {
+                    return Err(StoreError::LocalChanges {
+                        action: "lower the hydration of",
+                        key: key.clone(),
+                    });
+                }
+                update_item(c, key, "hydration", hydration.as_str(), "set the hydration")
+            })
         })
     }
 
-    /// Sets both hashes, for example after an upload: `local_hash` is the hash of the bytes
-    /// sent, `server_hash` the one the server reported (ADR-0012 "Two hashes"). Call it
-    /// before [`apply_remote_metadata`](Self::apply_remote_metadata) with the upload
-    /// response, so the response is not mistaken for a remote content change.
+    /// Records, durably, that a local change to the item's content is about to be made:
+    /// sets `local_dirty` and bumps `local_generation`, returning the new generation. Call
+    /// it, and commit, before the change touches the backing file (ADR-0012 R3). The sync
+    /// state is not changed here; the engine sets it in the same transaction.
     ///
     /// # Errors
     ///
     /// [`StoreError::ItemNotFound`].
-    fn set_hashes(
-        &self,
-        key: &ItemKey,
-        local_hash: Option<QuickXorHash>,
-        server_hash: Option<QuickXorHash>,
-    ) -> Result<(), StoreError> {
-        run(self, |c| {
-            let changed = c
-                .execute(
-                    "UPDATE items SET local_hash = ?3, server_hash = ?4 \
-                     WHERE drive_id = ?1 AND item_id = ?2",
-                    params![
-                        key.drive_id.as_str(),
-                        key.item_id.as_str(),
-                        local_hash.as_ref().map(QuickXorHash::to_base64),
-                        server_hash.as_ref().map(QuickXorHash::to_base64),
-                    ],
-                )
-                .ctx(|| describe("set the hashes of", key))?;
-            found(changed, key, "set the hashes")
-        })
+    fn mark_local_change(&self, key: &ItemKey) -> Result<u64, StoreError> {
+        run(self, |c| mark_local_change(c, key))
     }
 
-    /// Sets the size after a local write or truncate.
+    /// Records a local write that changes the size: marks a local change (as
+    /// [`mark_local_change`](Self::mark_local_change)) and sets the size, returning the new
+    /// generation. A shrink that would strand recorded ranges is refused; use
+    /// [`truncate_local`](Self::truncate_local) to shrink.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`], [`StoreError::SizeTooLarge`], and
-    /// [`StoreError::RangesWouldExceedItem`] if recorded ranges reach past the new size
-    /// (clear or re-record them first, in the same transaction).
-    fn set_local_size(&self, key: &ItemKey, size: u64) -> Result<(), StoreError> {
+    /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`], [`StoreError::SizeTooLarge`],
+    /// [`StoreError::RangesWouldExceedItem`]. A refusal changes nothing.
+    fn set_local_size(&self, key: &ItemKey, size: u64) -> Result<u64, StoreError> {
         run(self, |c| {
             atomic(c, |c| {
                 let stored = to_i64_checked(size, key)?;
-                load_item(c, key, "set the size")?;
+                file_size(c, key, "set the size")?;
                 if let Some(end) = covered_end(c, key)?
                     && end > size
                 {
@@ -386,13 +376,136 @@ pub trait Queries: sealed::Connected {
                         covered_end: end,
                     });
                 }
-                c.execute(
-                    "UPDATE items SET size = ?3 WHERE drive_id = ?1 AND item_id = ?2",
-                    params![key.drive_id.as_str(), key.item_id.as_str(), stored],
+                let generation = mark_local_change(c, key)?;
+                set_size(c, key, stored)?;
+                Ok(generation)
+            })
+        })
+    }
+
+    /// Records a local truncate (or extension) to `size`: marks a local change, sets the
+    /// size and trims the recorded ranges to it, in one operation. Returns the new
+    /// generation.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`], [`StoreError::SizeTooLarge`].
+    fn truncate_local(&self, key: &ItemKey, size: u64) -> Result<u64, StoreError> {
+        run(self, |c| {
+            atomic(c, |c| {
+                let stored = to_i64_checked(size, key)?;
+                file_size(c, key, "truncate")?;
+                let generation = mark_local_change(c, key)?;
+                set_size(c, key, stored)?;
+                trim_ranges(c, key, stored)?;
+                Ok(generation)
+            })
+        })
+    }
+
+    /// Records a finished upload, in one operation:
+    ///
+    /// 1. A provisional item takes the server's ID (`new_item_id`), as
+    ///    [`rekey_item`](Self::rekey_item).
+    /// 2. `uploaded_local_hash` becomes `local_hash`, and the server's eTag, cTag, hash,
+    ///    parent and name from `response` are written; `remote_changed` is cleared.
+    /// 3. If `local_generation` still equals `expected_generation` (the generation that was
+    ///    uploaded), the size and timestamps are written too, ranges are trimmed to the
+    ///    server size, and the item becomes clean and `in-sync`:
+    ///    [`UploadCompleted::Synced`].
+    /// 4. Otherwise the item changed locally while uploading: size, timestamps and ranges
+    ///    keep describing the local content, and the item stays dirty and
+    ///    `pending-upload`: [`UploadCompleted::LocalChangedSince`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`]; [`StoreError::UploadMismatch`] if a provisional item
+    /// gets no server ID, a non-provisional one gets a different one, or `response`
+    /// names another item; [`StoreError::ItemExists`] if the server ID is already stored
+    /// (see "Recovery" in `docs/architecture/store-schema.md`); [`StoreError::InvalidName`],
+    /// [`StoreError::SizeTooLarge`]. A refusal changes nothing.
+    fn complete_upload(
+        &self,
+        key: &ItemKey,
+        expected_generation: u64,
+        uploaded_local_hash: QuickXorHash,
+        response: &RemoteMetadata,
+        new_item_id: Option<&ItemId>,
+    ) -> Result<UploadCompleted, StoreError> {
+        run(self, |c| {
+            atomic(c, |c| {
+                complete_upload(
+                    c,
+                    key,
+                    expected_generation,
+                    uploaded_local_hash,
+                    response,
+                    new_item_id,
                 )
-                .ctx(|| describe("set the size of", key))?;
+            })
+        })
+    }
+
+    /// Throws away the item's unsynced local content, explicitly: clears `local_dirty`,
+    /// the hydrated ranges and sets hydration to `placeholder` (`full` for a folder) and
+    /// sync to `in-sync`. `remote_changed` is kept, so stale server columns stay flagged
+    /// until fresh metadata is applied. The caller must also discard the bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`].
+    fn discard_local_changes(&self, key: &ItemKey) -> Result<(), StoreError> {
+        run(self, |c| {
+            atomic(c, |c| {
+                let item = load_item(c, key, "discard local changes")?;
+                clear_ranges(c, key)?;
+                let hydration = match item.kind {
+                    ItemKind::File => Hydration::Placeholder,
+                    ItemKind::Folder => Hydration::Full,
+                };
+                c.execute(
+                    "UPDATE items SET local_dirty = 0, hydration = ?3, sync = ?4 \
+                     WHERE drive_id = ?1 AND item_id = ?2",
+                    params![
+                        key.drive_id.as_str(),
+                        key.item_id.as_str(),
+                        hydration.as_str(),
+                        SyncState::InSync.as_str()
+                    ],
+                )
+                .ctx(|| describe("discard the local changes of", key))?;
                 Ok(())
             })
+        })
+    }
+
+    /// Records a local rename or move: writes only parent and name, with the same name
+    /// validation as everywhere else. Works on provisional items.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`], [`StoreError::InvalidName`].
+    fn move_item_local(
+        &self,
+        key: &ItemKey,
+        new_parent: Option<&ItemId>,
+        new_name: &str,
+    ) -> Result<(), StoreError> {
+        run(self, |c| {
+            check_name(key, new_name)?;
+            let changed = c
+                .execute(
+                    "UPDATE items SET parent_item_id = ?3, name = ?4 \
+                     WHERE drive_id = ?1 AND item_id = ?2",
+                    params![
+                        key.drive_id.as_str(),
+                        key.item_id.as_str(),
+                        new_parent.map(ItemId::as_str),
+                        new_name
+                    ],
+                )
+                .ctx(|| describe("move", key))?;
+            found(changed, key, "move an item")
         })
     }
 
@@ -479,17 +592,17 @@ pub trait Queries: sealed::Connected {
     /// With [`DeleteMode::ItemOnly`] an item that has children is refused. With
     /// [`DeleteMode::Recursive`] every descendant goes too, with its ranges.
     ///
-    /// With [`PendingChanges::Refuse`], a delete that would remove any item whose sync is
-    /// `pending-upload`, `uploading` or `conflict` is refused, naming every such item.
+    /// With [`PendingChanges::Refuse`], a delete that would remove any dirty item
+    /// (`local_dirty`), whatever its sync state, is refused, naming every such item.
     /// [`PendingChanges::ServerConfirmedLocalDelete`] is only for the case where the server
-    /// confirmed a delete the user made locally. Deleting rows never touches a backing
-    /// directory.
+    /// confirmed a delete the user made locally. A delete that would remove a mount's root
+    /// item is always refused. Deleting rows never touches a backing directory.
     ///
     /// # Errors
     ///
     /// [`StoreError::ItemNotFound`], [`StoreError::HasChildren`] for a non-recursive
-    /// delete of an item with children, [`StoreError::HasPendingLocalChanges`]. A refused
-    /// delete changes nothing.
+    /// delete of an item with children, [`StoreError::MountRoot`],
+    /// [`StoreError::HasPendingLocalChanges`]. A refused delete changes nothing.
     fn delete_item(
         &self,
         key: &ItemKey,
@@ -552,17 +665,67 @@ pub trait Queries: sealed::Connected {
         })
     }
 
-    /// Forgets every hydrated range of an item, for example when its content is released
-    /// or replaced. Returns how many ranges were removed.
+    /// Forgets every hydrated range of a clean item, for example when its backing file was
+    /// found damaged. Returns how many ranges were removed. Refused on a dirty item, whose
+    /// ranges are the record of unsynced local bytes.
     ///
     /// # Errors
     ///
-    /// [`StoreError::ItemNotFound`] if the item is not stored.
+    /// [`StoreError::ItemNotFound`], [`StoreError::LocalChanges`].
     fn clear_hydrated_ranges(&self, key: &ItemKey) -> Result<u64, StoreError> {
         run(self, |c| {
             atomic(c, |c| {
-                load_item(c, key, "clear hydrated ranges")?;
+                let item = load_item(c, key, "clear hydrated ranges")?;
+                if item.local_dirty {
+                    return Err(StoreError::LocalChanges {
+                        action: "clear the hydrated ranges of",
+                        key: key.clone(),
+                    });
+                }
                 clear_ranges(c, key)
+            })
+        })
+    }
+
+    /// Releases a file's local content (dehydrate): clears its ranges and sets hydration
+    /// to `placeholder`, together. Requires the item to be clean and `in-sync`. Effective
+    /// pin is the engine's check (ADR-0008 R5). The caller punches the holes afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`], [`StoreError::NotAFile`], [`StoreError::LocalChanges`]
+    /// for a dirty item, [`StoreError::NotInSync`] for any sync state but `in-sync`. A
+    /// refusal changes nothing.
+    fn dehydrate(&self, key: &ItemKey) -> Result<(), StoreError> {
+        run(self, |c| {
+            atomic(c, |c| {
+                let item = load_item(c, key, "dehydrate")?;
+                if item.kind == ItemKind::Folder {
+                    return Err(StoreError::NotAFile {
+                        action: "dehydrate",
+                        key: key.clone(),
+                    });
+                }
+                if item.local_dirty {
+                    return Err(StoreError::LocalChanges {
+                        action: "dehydrate",
+                        key: key.clone(),
+                    });
+                }
+                if item.state.sync != SyncState::InSync {
+                    return Err(StoreError::NotInSync {
+                        key: key.clone(),
+                        sync: item.state.sync,
+                    });
+                }
+                clear_ranges(c, key)?;
+                update_item(
+                    c,
+                    key,
+                    "hydration",
+                    Hydration::Placeholder.as_str(),
+                    "dehydrate",
+                )
             })
         })
     }
@@ -735,7 +898,8 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
     c.execute(
         &format!(
             "INSERT INTO items ({ITEM_COLUMNS}) VALUES \
-             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+              ?18, ?19, ?20)"
         ),
         params![
             key.drive_id.as_str(),
@@ -755,13 +919,25 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
             item.state.sync.as_str(),
             item.last_error.as_deref(),
             item.is_provisional,
+            item.local_dirty,
+            generation_to_i64(item.local_generation, key)?,
+            item.remote_changed,
         ],
     )
     .ctx(|| describe("insert", key))?;
     Ok(())
 }
 
-/// Whether the server's content differs from what the stored row describes.
+fn generation_to_i64(generation: u64, key: &ItemKey) -> Result<i64, StoreError> {
+    i64::try_from(generation).map_err(|_| StoreError::Corrupt {
+        what: describe("local generation of", key),
+        value: generation.to_string(),
+        reason: "larger than i64::MAX".to_owned(),
+    })
+}
+
+/// Whether the server's content differs from the version the stored server columns
+/// describe.
 fn content_changed(old: &Item, new: &RemoteMetadata) -> bool {
     if old.kind != new.kind {
         return true;
@@ -770,9 +946,138 @@ fn content_changed(old: &Item, new: &RemoteMetadata) -> bool {
         return false;
     }
     match (&old.server_hash, &new.server_hash) {
-        (None, None) => old.etag != new.etag || old.size != new.size,
+        // A rename changes the eTag but not the cTag, so prefer the cTag.
+        (None, None) => match (&old.ctag, &new.ctag) {
+            (Some(a), Some(b)) => a != b || old.size != new.size,
+            _ => old.etag != new.etag || old.size != new.size,
+        },
         (old_hash, new_hash) => old_hash != new_hash,
     }
+}
+
+fn mark_local_change(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
+    let generation: Option<i64> = c
+        .query_row(
+            "UPDATE items SET local_dirty = 1, local_generation = local_generation + 1 \
+             WHERE drive_id = ?1 AND item_id = ?2 RETURNING local_generation",
+            [key.drive_id.as_str(), key.item_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .ctx(|| describe("mark a local change of", key))?;
+    let generation = generation.ok_or_else(|| StoreError::ItemNotFound {
+        action: "mark a local change",
+        key: key.clone(),
+    })?;
+    to_u64(generation, "items", "local_generation", key)
+}
+
+fn set_size(c: &Connection, key: &ItemKey, size: i64) -> Result<(), StoreError> {
+    c.execute(
+        "UPDATE items SET size = ?3 WHERE drive_id = ?1 AND item_id = ?2",
+        params![key.drive_id.as_str(), key.item_id.as_str(), size],
+    )
+    .ctx(|| describe("set the size of", key))?;
+    Ok(())
+}
+
+/// Removes recorded bytes at or past `size`. Merged ranges stay merged.
+fn trim_ranges(c: &Connection, key: &ItemKey, size: i64) -> Result<(), StoreError> {
+    let ids = [key.drive_id.as_str(), key.item_id.as_str()];
+    c.execute(
+        "DELETE FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2 AND range_start >= ?3",
+        params![ids[0], ids[1], size],
+    )
+    .ctx(|| describe("trim the hydrated ranges of", key))?;
+    c.execute(
+        "UPDATE hydrated_ranges SET range_end = ?3 \
+         WHERE drive_id = ?1 AND item_id = ?2 AND range_end > ?3",
+        params![ids[0], ids[1], size],
+    )
+    .ctx(|| describe("trim the hydrated ranges of", key))?;
+    Ok(())
+}
+
+fn complete_upload(
+    c: &Connection,
+    key: &ItemKey,
+    expected_generation: u64,
+    uploaded_local_hash: QuickXorHash,
+    response: &RemoteMetadata,
+    new_item_id: Option<&ItemId>,
+) -> Result<UploadCompleted, StoreError> {
+    let item = load_item(c, key, "complete an upload")?;
+    let mismatch = |reason: &str| StoreError::UploadMismatch {
+        key: key.clone(),
+        reason: reason.to_owned(),
+    };
+    let final_key = match (item.is_provisional, new_item_id) {
+        (true, Some(id)) => {
+            rekey_item(c, key, id)?;
+            ItemKey::new(key.drive_id.clone(), id.clone())
+        }
+        (true, None) => {
+            return Err(mismatch(
+                "the item is provisional and the response gave no server item ID",
+            ));
+        }
+        (false, Some(id)) if id != &key.item_id => {
+            return Err(mismatch(
+                "the item already has a server ID and the response gave another",
+            ));
+        }
+        (false, _) => key.clone(),
+    };
+    if response.key != final_key {
+        return Err(mismatch("the response describes a different item"));
+    }
+    check_name(&final_key, &response.name)?;
+    let size = to_i64_checked(response.size, &final_key)?;
+    let ids = [final_key.drive_id.as_str(), final_key.item_id.as_str()];
+    // The uploaded version's identity, written in both cases so the next upload's
+    // If-Match carries the right eTag.
+    c.execute(
+        "UPDATE items SET parent_item_id = ?3, name = ?4, etag = ?5, ctag = ?6, \
+         server_hash = ?7, local_hash = ?8, remote_changed = 0 \
+         WHERE drive_id = ?1 AND item_id = ?2",
+        params![
+            ids[0],
+            ids[1],
+            response.parent_item_id.as_ref().map(ItemId::as_str),
+            response.name,
+            response.etag.as_deref(),
+            response.ctag.as_deref(),
+            response.server_hash.as_ref().map(QuickXorHash::to_base64),
+            uploaded_local_hash.to_base64(),
+        ],
+    )
+    .ctx(|| describe("record the upload of", &final_key))?;
+
+    if item.local_generation != expected_generation {
+        c.execute(
+            "UPDATE items SET sync = ?3 WHERE drive_id = ?1 AND item_id = ?2",
+            params![ids[0], ids[1], SyncState::PendingUpload.as_str()],
+        )
+        .ctx(|| describe("keep pending the upload of", &final_key))?;
+        return Ok(UploadCompleted::LocalChangedSince {
+            generation: item.local_generation,
+        });
+    }
+    c.execute(
+        "UPDATE items SET size = ?3, created_at = ?4, modified_at = ?5, local_dirty = 0, \
+         sync = ?6 WHERE drive_id = ?1 AND item_id = ?2",
+        params![
+            ids[0],
+            ids[1],
+            size,
+            response.created.as_unix_seconds(),
+            response.modified.as_unix_seconds(),
+            SyncState::InSync.as_str(),
+        ],
+    )
+    .ctx(|| describe("mark in sync", &final_key))?;
+    trim_ranges(c, &final_key, size)?;
+    Ok(UploadCompleted::Synced)
 }
 
 fn apply_remote_metadata(
@@ -795,29 +1100,31 @@ fn apply_remote_metadata(
     let ids = [key.drive_id.as_str(), key.item_id.as_str()];
     let parent = remote.parent_item_id.as_ref().map(ItemId::as_str);
 
-    if content_changed(&old, remote)
-        && !matches!(
-            old.state.sync,
-            SyncState::InSync | SyncState::PendingDownload
-        )
-    {
-        // Local state that may not be on the server: change nothing about content.
+    let replaced = content_changed(&old, remote);
+
+    if old.local_dirty {
+        // Unsynced local content: write nothing that describes content, so size and
+        // ranges keep describing the local bytes and the old eTag keeps the 412 check.
         c.execute(
-            "UPDATE items SET parent_item_id = ?3, name = ?4 \
+            "UPDATE items SET parent_item_id = ?3, name = ?4, \
+             remote_changed = MAX(remote_changed, ?5) \
              WHERE drive_id = ?1 AND item_id = ?2",
-            params![ids[0], ids[1], parent, remote.name],
+            params![ids[0], ids[1], parent, remote.name, replaced],
         )
         .ctx(|| describe("apply a remote move of", key))?;
-        return Ok(RemoteApplied::ContentChangedUnderLocalState {
-            sync: old.state.sync,
+        return Ok(if replaced {
+            RemoteApplied::ContentChangedUnderLocalState {
+                sync: old.state.sync,
+            }
+        } else {
+            RemoteApplied::ContentUnchanged
         });
     }
 
-    let replaced = content_changed(&old, remote);
     c.execute(
         "UPDATE items SET parent_item_id = ?3, name = ?4, kind = ?5, size = ?6, \
-         created_at = ?7, modified_at = ?8, etag = ?9, ctag = ?10, server_hash = ?11 \
-         WHERE drive_id = ?1 AND item_id = ?2",
+         created_at = ?7, modified_at = ?8, etag = ?9, ctag = ?10, server_hash = ?11, \
+         remote_changed = 0 WHERE drive_id = ?1 AND item_id = ?2",
         params![
             ids[0],
             ids[1],
@@ -913,16 +1220,32 @@ fn delete_item(
             });
         }
     }
+    let root_of: Option<(String, String)> = c
+        .query_row(
+            &format!(
+                "{SUBTREE} SELECT mount_id, root_item_id FROM mounts WHERE drive_id = ?1 \
+                 AND root_item_id IN (SELECT item_id FROM subtree) \
+                 ORDER BY mount_id LIMIT 1"
+            ),
+            ids,
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .ctx(|| describe("look for mount roots below", key))?;
+    if let Some((mount_id, root)) = root_of {
+        return Err(StoreError::MountRoot {
+            key: ItemKey::new(
+                key.drive_id.clone(),
+                parse_id("mounts row", "root_item_id", root, ItemId::new)?,
+            ),
+            mount_id: parse_id("mounts row", "mount_id", mount_id, MountId::new)?,
+        });
+    }
     if pending == PendingChanges::Refuse {
-        let states = PENDING_LOCAL
-            .iter()
-            .map(|s| format!("'{}'", s.as_str()))
-            .collect::<Vec<_>>()
-            .join(", ");
         let mut stmt = c
             .prepare(&format!(
                 "{SUBTREE} SELECT item_id FROM items WHERE drive_id = ?1 \
-                 AND item_id IN (SELECT item_id FROM subtree) AND sync IN ({states}) \
+                 AND item_id IN (SELECT item_id FROM subtree) AND local_dirty = 1 \
                  ORDER BY item_id"
             ))
             .ctx(|| describe("look for pending local changes below", key))?;
@@ -1203,14 +1526,24 @@ impl<'c> Savepoint<'c> {
 
 impl Drop for Savepoint<'_> {
     fn drop(&mut self) {
-        if !self.released {
-            // If SQLite already rolled the whole transaction back (after an I/O error, for
-            // example) the savepoint is gone and this fails; there is nothing left to undo.
-            if let Err(error) = self
-                .conn
-                .execute_batch("ROLLBACK TO mydrive_op; RELEASE mydrive_op")
-            {
-                tracing::debug!(%error, "rolling back a store savepoint failed");
+        if self.released {
+            return;
+        }
+        let Err(error) = self
+            .conn
+            .execute_batch("ROLLBACK TO mydrive_op; RELEASE mydrive_op")
+        else {
+            return;
+        };
+        // If SQLite already rolled the whole transaction back (after an I/O error, for
+        // example) the savepoint is gone and there is nothing left to undo. Otherwise part
+        // of this operation may still be applied inside an open transaction: roll the
+        // whole transaction back, so the caller's `Transaction` sees autocommit and refuses
+        // every further call (`TransactionAborted`) instead of committing half of it.
+        if !self.conn.is_autocommit() {
+            tracing::warn!(%error, "rolling back a store savepoint failed; aborting the transaction");
+            if let Err(error) = self.conn.execute_batch("ROLLBACK") {
+                tracing::error!(%error, "rolling back the store transaction failed");
             }
         }
     }
@@ -1368,6 +1701,9 @@ struct RawItem {
     sync: String,
     last_error: Option<String>,
     is_provisional: bool,
+    local_dirty: bool,
+    local_generation: i64,
+    remote_changed: bool,
 }
 
 impl RawItem {
@@ -1390,6 +1726,9 @@ impl RawItem {
             sync: row.get(14)?,
             last_error: row.get(15)?,
             is_provisional: row.get(16)?,
+            local_dirty: row.get(17)?,
+            local_generation: row.get(18)?,
+            remote_changed: row.get(19)?,
         })
     }
 
@@ -1425,6 +1764,9 @@ impl RawItem {
             },
             last_error: self.last_error,
             is_provisional: self.is_provisional,
+            local_dirty: self.local_dirty,
+            local_generation: to_u64(self.local_generation, "items", "local_generation", &key)?,
+            remote_changed: self.remote_changed,
             key,
         })
     }
@@ -1513,5 +1855,29 @@ mod tests {
             1,
             "only the caller's own statement was committed"
         );
+    }
+
+    /// Review N3: when rolling back to the savepoint itself fails while a transaction is
+    /// open, the whole transaction is rolled back, so the connection is in autocommit and
+    /// `Transaction` refuses every further call (`TransactionAborted`) rather than
+    /// committing half an operation.
+    #[test]
+    fn failed_savepoint_rollback_aborts_the_transaction() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        let result: Result<(), StoreError> = atomic(&tx, |c| {
+            c.execute("INSERT INTO t VALUES (1)", []).ctx(|| "insert")?;
+            // Make the savepoint disappear, so ROLLBACK TO cannot undo the insert.
+            c.execute_batch("RELEASE mydrive_op").ctx(|| "release")?;
+            c.execute("INSERT INTO missing VALUES (1)", [])
+                .ctx(|| "insert")?;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(tx.is_autocommit(), "the whole transaction was rolled back");
+        drop(tx);
+        assert_eq!(count(&c), 0, "nothing from the transaction survived");
     }
 }
