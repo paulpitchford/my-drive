@@ -1,0 +1,456 @@
+//! The store's error type.
+
+use std::path::PathBuf;
+
+use mydrive_core::ids::{AccountId, ItemId, ItemKey, MountId};
+
+use crate::types::ByteRange;
+
+/// Why a store operation failed. Every variant says what was being done and to what.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StoreError {
+    /// SQLite reported an error.
+    #[error("state store: {action}: {source}")]
+    Sqlite {
+        /// What the store was doing, including the item or mount concerned.
+        action: String,
+        /// The SQLite error.
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// The database was written by a newer my-drive. Nothing was changed.
+    #[error(
+        "cannot open state store {path}: its schema version is {found}, this build understands \
+         up to {supported}; the store was not modified"
+    )]
+    SchemaTooNew {
+        /// The database file.
+        path: PathBuf,
+        /// The schema version found in the file.
+        found: i64,
+        /// The newest schema version this build can use.
+        supported: i64,
+    },
+
+    /// The file is not a my-drive state store: not SQLite, or SQLite with another
+    /// application ID, or with tables but no my-drive schema. Nothing was changed.
+    #[error(
+        "cannot open state store {path}: {reason}, so it is not a my-drive state store; the \
+         file was not modified"
+    )]
+    NotAStateStore {
+        /// The database file.
+        path: PathBuf,
+        /// What gave it away.
+        reason: String,
+    },
+
+    /// SQLite rolled the transaction back on its own (for example after `SQLITE_FULL` or an
+    /// I/O error). Nothing in it was applied, and every further call on it is refused so
+    /// that no later statement can commit on its own.
+    #[error("state store: the transaction was rolled back by SQLite and can no longer be used")]
+    TransactionAborted {
+        /// The error that ended the transaction, when this call saw it.
+        #[source]
+        cause: Option<Box<StoreError>>,
+    },
+
+    /// An item with this key already exists.
+    #[error("state store: {action}: item {item_id} in drive {drive_id} already exists",
+        drive_id = .key.drive_id, item_id = .key.item_id)]
+    ItemExists {
+        /// What was being done.
+        action: &'static str,
+        /// The existing key.
+        key: ItemKey,
+    },
+
+    /// Only a provisional item can be given its server ID.
+    #[error("state store: cannot re-key item {item_id} in drive {drive_id}: it is not \
+             provisional", drive_id = .key.drive_id, item_id = .key.item_id)]
+    NotProvisional {
+        /// The item.
+        key: ItemKey,
+    },
+
+    /// A compare-and-set of the sync state found another value.
+    #[error("state store: cannot set sync of item {item_id} in drive {drive_id} to {new}: \
+             expected {expected}, found {actual}",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    SyncMismatch {
+        /// The item.
+        key: ItemKey,
+        /// The value the caller expected.
+        expected: mydrive_core::state::Sync,
+        /// The value stored.
+        actual: mydrive_core::state::Sync,
+        /// The value the caller wanted to set.
+        new: mydrive_core::state::Sync,
+    },
+
+    /// A folder that has children cannot become a file.
+    #[error("state store: refusing to turn folder {item_id} in drive {drive_id} into a file: \
+             it has {children} children", drive_id = .key.drive_id, item_id = .key.item_id)]
+    FolderHasChildren {
+        /// The folder.
+        key: ItemKey,
+        /// How many direct children it has.
+        children: u64,
+    },
+
+    /// The operation would discard or misdescribe local content that has not reached the
+    /// server (the item is dirty). Nothing changed.
+    #[error("state store: refusing to {action} item {item_id} in drive {drive_id}: it holds \
+             local changes that have not reached the server",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    LocalChanges {
+        /// What was refused.
+        action: &'static str,
+        /// The dirty item.
+        key: ItemKey,
+    },
+
+    /// `complete_upload` was called for an item with no local changes, for example a
+    /// replayed completion. Nothing changed.
+    #[error("state store: refusing to complete an upload of item {item_id} in drive \
+             {drive_id}: it has no local changes", drive_id = .key.drive_id, item_id = .key.item_id)]
+    NotDirty {
+        /// The item.
+        key: ItemKey,
+    },
+
+    /// The operation is not allowed on a provisional item (one the server has never
+    /// seen). Nothing changed.
+    #[error("state store: refusing to {action} item {item_id} in drive {drive_id}: it was \
+             never uploaded", drive_id = .key.drive_id, item_id = .key.item_id)]
+    ProvisionalItem {
+        /// What was refused.
+        action: &'static str,
+        /// The item.
+        key: ItemKey,
+    },
+
+    /// The item changed locally after the caller read its generation. Nothing changed.
+    #[error("state store: refusing to delete item {item_id} in drive {drive_id}: it changed \
+             locally since (generation {actual}, expected {expected})",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    GenerationMismatch {
+        /// The item.
+        key: ItemKey,
+        /// The generation the caller expected.
+        expected: u64,
+        /// The stored generation.
+        actual: u64,
+    },
+
+    /// An item to insert breaks a rule of the dirty mark. Nothing changed.
+    #[error("state store: cannot insert item {item_id} in drive {drive_id}: {reason}",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    InvalidItem {
+        /// The item.
+        key: ItemKey,
+        /// The rule it breaks.
+        reason: &'static str,
+    },
+
+    /// A migration left foreign-key violations; it was rolled back and nothing changed.
+    #[error(
+        "cannot migrate state store {path}: migration {version} left {violations} \
+             foreign-key violation(s); it was rolled back"
+    )]
+    MigrationForeignKeys {
+        /// The database file.
+        path: PathBuf,
+        /// The migration that left them.
+        version: i64,
+        /// How many violations `PRAGMA foreign_key_check` reported.
+        violations: usize,
+    },
+
+    /// Dehydration needs the item to be in sync with the server. Nothing changed.
+    #[error("state store: refusing to dehydrate item {item_id} in drive {drive_id}: its sync \
+             state is {sync}, not in-sync", drive_id = .key.drive_id, item_id = .key.item_id)]
+    NotInSync {
+        /// The item.
+        key: ItemKey,
+        /// Its sync state.
+        sync: mydrive_core::state::Sync,
+    },
+
+    /// The item is the root of a mount and cannot be deleted while the mount exists.
+    #[error("state store: refusing to delete item {item_id} in drive {drive_id}: it is the \
+             root of mount {mount_id}", drive_id = .key.drive_id, item_id = .key.item_id)]
+    MountRoot {
+        /// The root item, which may be a descendant of the item asked to be deleted.
+        key: ItemKey,
+        /// The mount it is the root of.
+        mount_id: MountId,
+    },
+
+    /// An upload response for a provisional item must carry the server's item ID, and for
+    /// any item must name the item that was uploaded.
+    #[error("state store: cannot complete the upload of item {item_id} in drive {drive_id}: \
+             {reason}", drive_id = .key.drive_id, item_id = .key.item_id)]
+    UploadMismatch {
+        /// The item.
+        key: ItemKey,
+        /// What did not match.
+        reason: String,
+    },
+
+    /// A delete would remove local changes that have not reached the server.
+    #[error("state store: refusing to delete item {item_id} in drive {drive_id}: {count} \
+             item(s) have local changes not on the server: {listed}",
+             drive_id = .key.drive_id, item_id = .key.item_id,
+             count = .pending.len(), listed = list_keys(.pending))]
+    HasPendingLocalChanges {
+        /// The item asked to be deleted.
+        key: ItemKey,
+        /// Every dirty item the delete would remove.
+        pending: Vec<ItemKey>,
+    },
+
+    /// SQLite would not switch the database to WAL mode (ADR-0006 R2).
+    #[error("cannot open state store {path}: journal mode is {mode:?}, expected \"wal\"")]
+    NotWal {
+        /// The database file.
+        path: PathBuf,
+        /// The journal mode SQLite reported.
+        mode: String,
+    },
+
+    /// A path given to the store is not valid UTF-8.
+    #[error("state store: {what} {path:?} is not valid UTF-8")]
+    NonUtf8Path {
+        /// Which path, for example `"mount point of mount m1"`.
+        what: String,
+        /// The path.
+        path: PathBuf,
+    },
+
+    /// A column held a value the store cannot interpret. The database is damaged or was
+    /// edited by hand.
+    #[error("state store: {what} holds {value:?}, which is not valid: {reason}")]
+    Corrupt {
+        /// The row and column concerned.
+        what: String,
+        /// The stored value.
+        value: String,
+        /// Why it is not valid.
+        reason: String,
+    },
+
+    /// No item has this key.
+    #[error("state store: {action}: item {item_id} in drive {drive_id} is not in the store",
+        drive_id = .key.drive_id, item_id = .key.item_id)]
+    ItemNotFound {
+        /// What was being done.
+        action: &'static str,
+        /// The item looked for.
+        key: ItemKey,
+    },
+
+    /// No mount has this ID.
+    #[error("state store: {action}: mount {mount_id} is not in the store")]
+    MountNotFound {
+        /// What was being done.
+        action: &'static str,
+        /// The mount looked for.
+        mount_id: MountId,
+    },
+
+    /// No account has this ID.
+    #[error("state store: {action}: account {account_id} is not in the store")]
+    AccountNotFound {
+        /// What was being done.
+        action: &'static str,
+        /// The account looked for.
+        account_id: AccountId,
+    },
+
+    /// A mount with this ID already exists.
+    #[error("state store: cannot add mount {mount_id}: a mount with that ID already exists")]
+    MountExists {
+        /// The mount ID that is taken.
+        mount_id: MountId,
+    },
+
+    /// Another mount already has this root (ADR-0007 R4).
+    #[error(
+        "state store: cannot add mount {mount_id}: its root item {item_id} in drive {drive_id} \
+         is already mounted as {existing}",
+        drive_id = .root.drive_id, item_id = .root.item_id
+    )]
+    MountRootTaken {
+        /// The mount being added.
+        mount_id: MountId,
+        /// The root it asked for.
+        root: ItemKey,
+        /// The mount that already has that root.
+        existing: MountId,
+    },
+
+    /// An item's name would make its path ambiguous.
+    #[error("state store: cannot store item {item_id} in drive {drive_id}: name {name:?} {reason}",
+        drive_id = .key.drive_id, item_id = .key.item_id)]
+    InvalidName {
+        /// The item.
+        key: ItemKey,
+        /// The rejected name.
+        name: String,
+        /// Why it was rejected.
+        reason: &'static str,
+    },
+
+    /// An item's size does not fit the store's 63-bit integer column.
+    #[error("state store: cannot store item {item_id} in drive {drive_id}: size {size} is larger \
+             than {max}", drive_id = .key.drive_id, item_id = .key.item_id, max = i64::MAX)]
+    SizeTooLarge {
+        /// The item.
+        key: ItemKey,
+        /// The rejected size.
+        size: u64,
+    },
+
+    /// A local change was asked of a file that is not fully local. A dirty file is always
+    /// fully local, so the engine hydrates it first (ADR-0012 R1). Nothing changed.
+    #[error(
+        "state store: refusing to {action} item {item_id} in drive {drive_id}: it is not \
+         fully local (hydration {hydration}); hydrate it first",
+        drive_id = .key.drive_id, item_id = .key.item_id
+    )]
+    NotFullyLocal {
+        /// What was refused.
+        action: &'static str,
+        /// The item.
+        key: ItemKey,
+        /// Its hydration state.
+        hydration: mydrive_core::state::Hydration,
+    },
+
+    /// The server reported a newer version that has not been applied yet
+    /// (`remote_changed`), so the operation would act on stale state. Nothing changed.
+    #[error("state store: refusing to {action} item {item_id} in drive {drive_id}: the \
+             server has a newer version that has not been applied",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    RemoteChanged {
+        /// What was refused.
+        action: &'static str,
+        /// The item.
+        key: ItemKey,
+    },
+
+    /// `end` is before `start`.
+    #[error("invalid byte range: end {end} is before start {start}")]
+    InvalidRange {
+        /// The requested start.
+        start: u64,
+        /// The requested end.
+        end: u64,
+    },
+
+    /// A byte range reaches past the end of the item.
+    #[error("state store: {action}: range {range} is outside item {item_id} in drive \
+             {drive_id}, which is {size} bytes", drive_id = .key.drive_id, item_id = .key.item_id)]
+    RangeOutOfBounds {
+        /// What was being done.
+        action: &'static str,
+        /// The item.
+        key: ItemKey,
+        /// The requested range.
+        range: ByteRange,
+        /// The item's size.
+        size: u64,
+    },
+
+    /// Hydrated ranges were asked of a folder.
+    #[error("state store: {action}: item {item_id} in drive {drive_id} is a folder, which has \
+             no content ranges", drive_id = .key.drive_id, item_id = .key.item_id)]
+    NotAFile {
+        /// What was being done.
+        action: &'static str,
+        /// The item.
+        key: ItemKey,
+    },
+
+    /// A non-recursive delete was asked of a folder that has children (WP-006 AC5).
+    #[error(
+        "state store: refusing to delete item {item_id} in drive {drive_id}: it has {children} \
+         children; ask for a recursive delete explicitly",
+        drive_id = .key.drive_id, item_id = .key.item_id
+    )]
+    HasChildren {
+        /// The item.
+        key: ItemKey,
+        /// How many direct children it has.
+        children: u64,
+    },
+
+    /// The item belongs to a different drive than the mount.
+    #[error("state store: cannot resolve the path of item {item_id} in drive {drive_id} within \
+             mount {mount_id}: the item is not in that mount's drive",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    WrongDrive {
+        /// The item.
+        key: ItemKey,
+        /// The mount.
+        mount_id: MountId,
+    },
+
+    /// Walking the parent chain reached the drive root without passing the mount's root, so
+    /// the item is outside the mount.
+    #[error("state store: cannot resolve the path of item {item_id} in drive {drive_id} within \
+             mount {mount_id}: the item is not below the mount's root",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    NotInMount {
+        /// The item.
+        key: ItemKey,
+        /// The mount.
+        mount_id: MountId,
+    },
+
+    /// Walking the parent chain reached a parent that is not in the store.
+    #[error("state store: cannot resolve the path of item {item_id} in drive {drive_id}: its \
+             ancestor {missing} is not in the store",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    MissingAncestor {
+        /// The item.
+        key: ItemKey,
+        /// The parent that is missing.
+        missing: ItemId,
+    },
+
+    /// The parent chain loops (WP-006 AC8).
+    #[error("state store: cannot resolve the path of item {item_id} in drive {drive_id}: its \
+             parent chain loops back to {repeated}",
+             drive_id = .key.drive_id, item_id = .key.item_id)]
+    ParentCycle {
+        /// The item.
+        key: ItemKey,
+        /// The first item seen twice.
+        repeated: ItemId,
+    },
+}
+
+fn list_keys(keys: &[ItemKey]) -> String {
+    keys.iter()
+        .map(|k| format!("{} in drive {}", k.item_id, k.drive_id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Adds what was being done to a SQLite error. The description is built only on failure.
+pub(crate) trait SqlContext<T> {
+    fn ctx<S: Into<String>>(self, action: impl FnOnce() -> S) -> Result<T, StoreError>;
+}
+
+impl<T> SqlContext<T> for Result<T, rusqlite::Error> {
+    fn ctx<S: Into<String>>(self, action: impl FnOnce() -> S) -> Result<T, StoreError> {
+        self.map_err(|source| StoreError::Sqlite {
+            action: action().into(),
+            source,
+        })
+    }
+}

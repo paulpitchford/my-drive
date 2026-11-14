@@ -8,5 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[dependencies]
+mydrive-core.workspace = true
+# Bundled so behaviour does not depend on the system SQLite (WP-006).
+rusqlite = { workspace = true, features = ["bundled"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true
