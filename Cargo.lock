@@ -914,6 +914,7 @@ dependencies = [
  "base64",
  "futures-core",
  "mydrive-core",
+ "mydrive-graph-sim",
  "rand",
  "reqwest",
  "serde",

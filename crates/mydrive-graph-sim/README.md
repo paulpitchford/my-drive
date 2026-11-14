@@ -100,7 +100,7 @@ Per drive, in `DriveOptions` (`add_drive_with`, `set_options`).
 
 | Behaviour | Source |
 |---|---|
-| A FIFO queue of scripted faults. Each fault has an optional method and path-fragment matcher and applies to exactly the first later request that matches, then is removed. Actions: a status with a Graph error body and optional `Retry-After`; a delay before handling; a truncated body (announces the full `Content-Length`, sends the head and the first N body bytes, then closes the connection). Faults apply before the token check, on both origins. | ADR-0017 decision 2 and R5; `Retry-After` on 429/503 from the throttling guidance (research section 3) |
+| A FIFO queue of scripted faults. Each fault has an optional method and path-fragment matcher and applies to exactly the first later request that matches, then is removed. Actions: a status with a Graph error body (its `code` is the one listed above for that status unless the fault sets one, such as `resyncChangesApplyDifferences`), an optional `Retry-After` and an optional `Location` (the documented `410 Gone` resync responses carry both a code and a `Location`); a delay before handling; a truncated body (announces the full `Content-Length`, sends the head and the first N body bytes, then closes the connection). Faults apply before the token check, on both origins. | ADR-0017 decision 2 and R5; `Retry-After` on 429/503 from the throttling guidance (research section 3); the `410` codes and `Location` from [delta](https://learn.microsoft.com/en-us/graph/api/driveitem-delta?view=graph-rest-1.0) (WP-008) |
 | A log of every request: origin, method, path, query, the headers `authorization`, `range`, `if-match`, `if-none-match`, `user-agent`, `prefer`, `deltaexcludeparent`, and the response status. It keeps the newest 10,000 requests (`MAX_LOGGED_REQUESTS`), dropping the oldest first; a long test that asserts on the log calls `clear_requests` before the part it checks. | WP-007 |
 
 ## Departures from Graph
@@ -131,8 +131,9 @@ Planned for M1 simulator work packages (WP-007 out of scope):
   fragments, `nextExpectedRanges`, `uploadUrl` with or without `Authorization`,
   `deferCommit`), `If-Match`/`If-None-Match` and `412`, `@microsoft.graph.conflictBehavior`,
   `409 nameAlreadyExists`, `507` quota.
-- `410 Gone` resync with `resyncChangesApplyDifferences` and
-  `resyncChangesUploadDifferences` and a `Location` nextLink.
+- `410 Gone` resync as delta behaviour (a token that expires on its own). The response
+  itself, with `resyncChangesApplyDifferences` or `resyncChangesUploadDifferences` and a
+  `Location` restart link, can be scripted with a status fault (see Faults above).
 - A throttling model (resource units per request, per-user and per-tenant limits). Only
   scripted 429/503 faults exist now.
 - Ancestor folders appearing in delta when a child changes, and the `deltaExcludeParent`

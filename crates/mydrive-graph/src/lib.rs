@@ -5,3 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod client;
+pub mod model;
+
+pub use client::{GraphClient, GraphError, GraphErrorKind};
