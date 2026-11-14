@@ -1166,25 +1166,172 @@ mod tests {
     }
 
     /// ADR-0020 R4: refused paths whose messages escape badly are shortened until the result
-    /// fits, keeping one entry per path.
+    /// fits, keeping one entry per path. The verifier's worst case: 100 escape-heavy paths
+    /// filling the action path-byte limit, every one refused with a 1 KiB message of
+    /// characters JSON escapes six-fold. With 1 KiB messages the result is over the line, so
+    /// the shrinking really runs.
     #[test]
     fn refusal_messages_shrink_to_fit() {
-        let id = Id::Number(1);
-        let reports: Vec<ActionReport> = (0..100)
-            .map(|i| ActionReport {
-                // Within the 512 KiB path budget.
-                path: ProtocolPath::new(format!("/{i:03}{}", "a".repeat(4092))).unwrap(),
+        let id = Id::String("\u{1}".repeat(crate::envelope::MAX_ID_BYTES));
+        // Each path is "/NNN" plus quotes, sized so the 100 paths together take as many
+        // encoded bytes as the limit allows.
+        let per_path = usize::try_from(crate::methods::MAX_ACTION_PATH_BYTES).unwrap() / 100;
+        let quotes = (per_path - 2 - 4) / 2;
+        let paths: Vec<ProtocolPath> = (0..100)
+            .map(|i| ProtocolPath::new(format!("/{i:03}{}", "\"".repeat(quotes))).unwrap())
+            .collect();
+        let path_bytes = crate::methods::encoded_path_bytes(&paths);
+        assert!(path_bytes <= crate::methods::MAX_ACTION_PATH_BYTES);
+        assert!(path_bytes > crate::methods::MAX_ACTION_PATH_BYTES - 1_000);
+        // The request itself is within the hello limits.
+        let params = serde_json::json!({"paths": paths});
+        assert!(crate::methods::MethodCall::parse(method::ITEM_DEHYDRATE, Some(&params)).is_ok());
+
+        let reports: Vec<ActionReport> = paths
+            .iter()
+            .map(|path| ActionReport {
+                path: path.clone(),
                 outcome: ActionOutcome::Refused(refused(
                     RefusalReason::InUse,
                     &"\u{1}".repeat(1_024),
                 )),
             })
             .collect();
+        // Without shrinking, the result would not fit.
+        let unshrunk = ItemActionResult {
+            entries: reports
+                .iter()
+                .map(|r| ItemActionEntry {
+                    path: r.path.clone(),
+                    outcome: r.outcome.clone(),
+                })
+                .collect(),
+        };
+        assert!(response_len(&id, &unshrunk).unwrap() > MAX_LINE_BYTES);
+
         let result = action_result(&id, reports).unwrap();
         let line = encode_line(&SuccessResponse::new(id, &result).unwrap()).unwrap();
         assert!(line.len() - 1 <= MAX_LINE_BYTES);
         assert_eq!(result.entries.len(), 100);
-        assert!(result.entries.iter().all(|e| e.error().is_some()));
+        for (entry, path) in result.entries.iter().zip(&paths) {
+            assert_eq!(&entry.path, path, "each path keeps its own entry, in order");
+            let error = entry.error().expect("each refusal is kept");
+            assert_eq!(error.refusal_reason(), Some(RefusalReason::InUse));
+        }
+    }
+
+    /// ADR-0020 R4: an entry too large for one `status.changed` line is replaced by a
+    /// `refresh` of its path, and the other entries are still delivered.
+    #[test]
+    fn oversize_change_entries_become_refresh() {
+        let small = entry("/m/dir/small");
+        let mut item = info();
+        // An unknown modifier of 2 MiB: an open value, so nothing caps it.
+        item.modifiers = crate::values::WireModifiers(vec![crate::values::Modifier::Other(
+            "x".repeat(2 * MAX_LINE_BYTES),
+        )]);
+        let huge_path = ProtocolPath::new("/m/dir/huge").unwrap();
+        let huge = ItemStatusEntry::known(huge_path.clone(), item);
+        let notes = status_changed_notifications(
+            vec![small.clone(), huge, small.clone()],
+            Vec::new(),
+            Some(9),
+        )
+        .unwrap();
+        let mut entries = Vec::new();
+        let mut refresh = Vec::new();
+        for n in &notes {
+            assert!(encode_line(n).unwrap().len() - 1 <= MAX_LINE_BYTES);
+            let params: StatusChangedParams =
+                serde_json::from_value(n.params.clone().unwrap_or(Value::Null)).unwrap();
+            assert_eq!(params.seq, Some(9));
+            entries.extend(params.entries);
+            refresh.extend(params.refresh);
+        }
+        assert_eq!(entries, [small.clone(), small]);
+        assert_eq!(refresh, [huge_path]);
+    }
+
+    /// ADR-0019 R3: `next_cursor` is absent on the last page and present on every earlier
+    /// page, for directory, batch, mount and account listings.
+    #[test]
+    fn adr_0019_r3_next_cursor_is_absent_only_on_the_last_page() {
+        let id = Id::Number(1);
+        // Directory.
+        let mut d = MapDir::new("/m/dir", (0..30_000).map(|i| format!("f{i:05}")));
+        let total = d.children.len();
+        let dir = dir_path(&d);
+        let dir_entry = entry("/m/dir");
+        let (mut delivered, mut cursor, mut pages) = (0, None::<String>, 0);
+        loop {
+            let page =
+                directory_page(&dir, &dir_entry, &mut d, cursor.as_deref(), None, &id).unwrap();
+            pages += 1;
+            delivered += page.entries.len();
+            if delivered < total {
+                assert!(
+                    page.next_cursor.is_some(),
+                    "directory page {pages}: cursor missing"
+                );
+                cursor = page.next_cursor;
+            } else {
+                assert_eq!(page.next_cursor, None, "directory: cursor on the last page");
+                break;
+            }
+        }
+        assert!(pages > 2);
+
+        // Batch.
+        let batch: Vec<ProtocolPath> = (0..20_000)
+            .map(|i| ProtocolPath::new(format!("/m/p{i:05}")).unwrap())
+            .collect();
+        let (mut delivered, mut cursor, mut pages) = (0, None::<String>, 0);
+        loop {
+            let page =
+                batch_page(&batch, cursor.as_deref(), None, &id, |p| entry(p.as_str())).unwrap();
+            pages += 1;
+            delivered += page.entries.len();
+            if delivered < batch.len() {
+                assert!(
+                    page.next_cursor.is_some(),
+                    "batch page {pages}: cursor missing"
+                );
+                cursor = page.next_cursor;
+            } else {
+                assert_eq!(page.next_cursor, None, "batch: cursor on the last page");
+                break;
+            }
+        }
+        assert!(pages > 1);
+
+        // Mounts.
+        let mounts: Vec<MountInfo> = (0..300).map(worst_mount).collect();
+        let total = mounts.len();
+        let mut source = MountSource(mounts);
+        let (mut delivered, mut cursor, mut pages) = (0, None::<String>, 0);
+        loop {
+            let page = mount_page(&mut source, cursor.as_deref(), &id).unwrap();
+            pages += 1;
+            delivered += page.mounts.len();
+            if delivered < total {
+                assert!(
+                    page.next_cursor.is_some(),
+                    "mount page {pages}: cursor missing"
+                );
+                cursor = page.next_cursor;
+            } else {
+                assert_eq!(page.next_cursor, None, "mounts: cursor on the last page");
+                break;
+            }
+        }
+        assert!(pages > 1);
+
+        // A listing that fits one page has no cursor at all.
+        let mut small = MapDir::new("/m/s", ["a".to_owned(), "b".to_owned()]);
+        let small_dir = dir_path(&small);
+        let page = directory_page(&small_dir, &entry("/m/s"), &mut small, None, None, &id).unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.next_cursor, None);
     }
 
     #[test]

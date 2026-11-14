@@ -50,8 +50,19 @@ fn is_json_fence(line: &str) -> bool {
     })
 }
 
-/// The labelled examples. Fails if any JSON block is not directly preceded by a label, or a
-/// label is not followed by exactly "```json".
+/// The fence marker and language tag of a line that opens a fenced block, if it does.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn fence_opener(line: &str) -> Option<(&'static str, String)> {
+    let t = line.trim();
+    ["```", "~~~"].into_iter().find_map(|fence| {
+        t.strip_prefix(fence)
+            .map(|tag| (fence, tag.trim().to_owned()))
+    })
+}
+
+/// The labelled examples. Fails if any JSON block is not directly preceded by a label, if a
+/// label is not followed by exactly "```json", or if a fenced block with no language tag
+/// holds a JSON object or array (an example that would escape the checks).
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
 fn parse_examples(text: &str) -> Vec<Example> {
     let lines: Vec<&str> = text.lines().collect();
@@ -64,6 +75,27 @@ fn parse_examples(text: &str) -> Vec<Example> {
             "line {}: JSON block without an example label",
             i + 1
         );
+        // Any other fenced block: skip its body, so its lines are never read as labels or
+        // fences, but refuse an untagged block whose content is JSON.
+        if let Some((fence, tag)) = fence_opener(line) {
+            let mut body = String::new();
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim() != fence {
+                body.push_str(lines[j]);
+                body.push('\n');
+                j += 1;
+            }
+            if tag.is_empty() {
+                let parsed = serde_json::from_str::<Value>(&body);
+                assert!(
+                    !matches!(parsed, Ok(Value::Object(_) | Value::Array(_))),
+                    "line {}: untagged fenced block holds JSON; label it as an example",
+                    i + 1
+                );
+            }
+            i = j + 1;
+            continue;
+        }
         let Some(label) = line
             .strip_prefix("<!-- example:")
             .and_then(|rest| rest.strip_suffix("-->"))
@@ -518,6 +550,27 @@ fn catalogue_parser_rejects_unchecked_blocks_and_rows() {
     assert!(std::panic::catch_unwind(|| parse_examples(labelled)).is_err());
     let ok = "<!-- example: error -->\n```json\n{}\n```\n";
     assert_eq!(parse_examples(ok).len(), 1);
+
+    // An untagged fence holding JSON escapes the checks, so it is refused.
+    for json in [
+        "{\"jsonrpc\": \"2.0\", \"id\": 1, \"result\": {}}",
+        "[1, 2]",
+        "{\n  \"a\": 1\n}",
+    ] {
+        for fence in ["```", "~~~"] {
+            let text = format!("intro\n{fence}\n{json}\n{fence}\n");
+            let result = std::panic::catch_unwind(|| parse_examples(&text));
+            assert!(
+                result.is_err(),
+                "untagged {fence} block with {json:?} was accepted"
+            );
+        }
+    }
+    // Untagged blocks that are not JSON, and tagged blocks in other languages, are fine; a
+    // label or JSON fence inside them is not read as one.
+    let other = "```\nplain text\n```\n```sh\n{ echo; }\n<!-- example: error -->\n```\n\
+                 ```python\nprint([1])\n```\n";
+    assert!(parse_examples(other).is_empty());
 
     let unlinked = "\n## Methods\n\n| Method | Does |\n|---|---|\n| `hello` | x |\n\n### hello\n";
     assert!(std::panic::catch_unwind(|| method_table_names(unlinked)).is_err());
