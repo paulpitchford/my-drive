@@ -36,9 +36,17 @@ below are run against a fake daemon by `crates/mydrive-ipc/tests/readme_examples
 - Blank lines are ignored.
 - JSON-RPC batches (a JSON array of requests on one line) are not supported and get one
   `invalid-request` error with `"id": null`.
-- **Request IDs** are an integer in the signed 64-bit range or a string of at most 128 UTF-8
-  bytes. Anything else (a fraction, a larger integer, a longer string, `null`, an array or
-  an object) is refused with `invalid-request` and `"id": null`.
+- **Request IDs** are an integer in the signed 64-bit range (-9223372036854775808 to
+  9223372036854775807), written as plain digits with an optional leading `-`, or a string
+  of at most 128 UTF-8 bytes. Anything else is refused with `invalid-request` and
+  `"id": null`: a longer string, `null`, a boolean, an array, an object, and these numeric
+  forms, **even when the value is a whole number**: a fraction (`1.5`), a decimal point
+  (`1.0`, `0.0`), an exponent (`1e3`, `1E0`), `-0`, and an integer outside the signed
+  64-bit range (`9223372036854775808`, `-9223372036854775809`). Forms that are not JSON
+  numbers at all (`01`, `+1`, `0x1`, `NaN`) make the whole line a `parse-error`.
+- **Duplicate keys.** Send each key once per object. If a request repeats a key, at any
+  level (the envelope, `params` or deeper), the daemon reads the last occurrence and
+  ignores the earlier ones. Clients must not rely on this.
 - Parameters are always passed by name, as an object. Positional (array) parameters get
   `invalid-params`.
 
@@ -53,6 +61,11 @@ below are run against a fake daemon by `crates/mydrive-ipc/tests/readme_examples
   `not-in-a-mount`. File names under a mount are always valid UTF-8 (the VFS refuses any
   other name), so a path that is not valid UTF-8 is never under a mount: clients must never
   send one, and must not "repair" one into a different string.
+- **Large integers.** `seq`, `skipped_count` and `bytes_freed` are unsigned 64-bit
+  integers, and a client may receive values above 2^53 (9007199254740992), beyond which a
+  double-precision float cannot hold every integer exactly. A client whose JSON parser
+  reads numbers as doubles (JavaScript's `JSON.parse`, for example) must read these fields
+  as 64-bit or arbitrary-precision integers, or it will compare and show wrong values.
 - Optional fields are omitted when they have no value. **A client or daemon treats an
   absent field and a `null` one the same way**, for every optional field, including
   `params` itself.
@@ -129,8 +142,8 @@ closed: the state axes are open on the wire (ADR-0020).
    `invalid-request`. A client that also needs requests opens a second connection.
 6. **Subscribe first, then list.** A client that shows live state subscribes on one
    connection, then lists what it shows on another, so no change between the two is lost.
-   For each entry it keeps whichever state came with the higher `seq`, from a listing page
-   or from `status.changed`.
+   For each entry it keeps the newer state by the [`seq` rules](#statuschanged), whether it
+   came from a listing page or from `status.changed`.
 7. The daemon closes a subscribed connection that falls too far behind in reading, rather
    than buffering without bound. **A client treats any close of either connection the same
    way: reconnect, `hello`, re-subscribe, and re-request what it is showing.**
@@ -152,10 +165,21 @@ cursor never goes stale because the directory changed. A directory cursor is bou
 directory's **path**: if the directory is replaced by another at the same path during the
 loop, the loop continues into the new one, and its entries count as changed.
 
-The longest cursors, for sizing: a directory cursor is 36 + 2 × (bytes of the last name)
-bytes, so at most 546 for a 255-byte name; an `item.status` batch cursor is at most 56
-bytes; a `mount.list` cursor at most 131 bytes; an `account.list` cursor is 3 + 2 × (bytes
-of the account ID).
+The longest cursors, for sizing. These figures describe the cursors this version of the
+daemon issues; clients still treat cursors as opaque and must not rely on their form. Each
+cursor is ASCII, so it takes the same number of bytes inside a JSON string.
+
+- A directory cursor is 36 + 2 × (bytes of the last name returned). That is at most 546
+  bytes **if names are at most 255 bytes**, the usual Linux limit. The state store can hold
+  an item with a longer name (it is kept with sync `error`), and a cursor after such a name
+  is longer by the same formula; names are still bounded by the 4,096-byte path limit.
+- An `item.status` batch cursor is at most 56 bytes, assuming the batch position fits in
+  an unsigned 64-bit integer (20 digits). With the version 1 limit of 10,000 paths per batch
+  the position has at most 4 digits, so the cursor is at most 40 bytes.
+- A `mount.list` cursor is 3 + 2 × (bytes of the `mount_id`), so at most 131 bytes, because
+  a `mount_id` is at most 64 ASCII characters.
+- An `account.list` cursor is 3 + 2 × (bytes of the account ID). Account IDs have no fixed
+  length limit in the protocol, so neither does this cursor.
 
 **Order.** A directory's children come in name order, comparing names as bytes (UTF-8), not
 in locale order; a client that wants another order sorts them itself. Mounts come in byte
@@ -179,8 +203,12 @@ taking at most `limits.max_status_path_bytes`; a larger batch is refused with
 `invalid-params`, and a client with more paths splits them into several batches.
 
 A cursor loop in shell with `socat` and `jq`, printing every child of a directory. It fails
-cleanly if the daemon refuses a request or closes the connection. Bash reads a socket slowly,
-a byte at a time; large listings belong in Python.
+cleanly, with a message and a non-zero exit status, if the daemon refuses a request, closes
+the connection or sends a reply that is not JSON. **It streams: each page is printed as it
+arrives, so when it fails it may already have printed part of the listing.** A consumer must
+check its exit status and, if it is not zero, discard what it read, never treat it as the
+whole directory. Bash reads a socket slowly, a byte at a time; large listings belong in
+Python.
 
 ```sh
 #!/usr/bin/env bash
@@ -222,7 +250,9 @@ while :; do
 done
 ```
 
-The same in Python:
+The same in Python. It prints nothing until the listing is complete, and reports a refused
+request, a closed connection or a reply that is not JSON with a message and a non-zero exit
+status:
 
 ```python
 #!/usr/bin/env python3
@@ -247,10 +277,20 @@ def list_directory(path):
             sock.sendall((json.dumps(request) + "\n").encode())
         except OSError as e:
             raise ConnectionError("connection closed") from e
-        line = lines.readline()
+        try:
+            line = lines.readline()
+        except OSError as e:
+            raise ConnectionError("connection closed") from e
+        except ValueError as e:  # not UTF-8
+            raise ConnectionError("unreadable reply") from e
         if not line:
             raise ConnectionError("connection closed")
-        reply = json.loads(line)  # one request in flight, so this is its reply
+        try:
+            reply = json.loads(line)  # one request in flight, so this is its reply
+        except ValueError as e:
+            raise ConnectionError("unreadable reply") from e
+        if not isinstance(reply, dict):
+            raise ConnectionError("unreadable reply")
         if "error" in reply:
             raise RuntimeError(f"error {reply['error']['code']}: {reply['error']['message']}")
         return reply["result"]
@@ -415,7 +455,8 @@ Parameters: exactly one of
   a folder this way, with one [cursor loop](#pagination), and never ask once per file.
 
 and optionally `cursor`. The result carries `next_cursor` while more entries remain, and
-`seq`: the daemon-wide change sequence number the page was read at.
+`seq`, which is optional: the daemon-wide change sequence number the page was read at. A
+client orders a page's states against notifications by the [`seq` rules](#statuschanged).
 
 Each entry has `path` and exactly one of `item` or `error`. `item` holds:
 
@@ -634,9 +675,15 @@ A request on a subscribed connection:
 
 A notification (no `id`, no response) on a subscribed connection. Parameters:
 
-- `seq`: the daemon-wide change sequence number of this change. It only increases. A client
-  holding state for an entry keeps whichever came with the higher `seq`, from a listing
-  page or from a notification.
+- `seq` (optional): the daemon-wide change sequence number of this change. It only
+  increases. A client holding state for an entry, from a listing page or a notification,
+  decides which state to keep by these rules:
+  - The state with the higher `seq` wins.
+  - **On equal `seq`, a notification's state wins over a page's.** Two pages, or two
+    notifications, with the same `seq` describe the same change; the one received last
+    wins.
+  - `seq` is optional on both pages and notifications. When either state has no `seq`,
+    they cannot be ordered by it, and the one received last wins.
 - `entries`: changed items, in the same shape as `item.status` entries, with each item's new
   state. An entry whose `error` is `unknown-path` means the item no longer exists.
 - `refresh`: paths whose state changed too much to enumerate (for example a renamed folder

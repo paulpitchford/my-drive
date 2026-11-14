@@ -1061,6 +1061,11 @@ mod tests {
         );
         assert_eq!(batch_cursor(&"f".repeat(32), usize::MAX).len(), 56);
         assert_eq!(KeyCursor::mounts().encode(&"m".repeat(64)).len(), 131);
+        // The catalogue's sizing assumptions: a batch of at most 10,000 paths gives cursors of
+        // at most 40 bytes, and an account cursor is 3 + 2 × the account ID's bytes.
+        let last_index = crate::methods::MAX_STATUS_PATHS as usize - 1;
+        assert_eq!(batch_cursor(&"f".repeat(32), last_index).len(), 40);
+        assert_eq!(KeyCursor::accounts().encode(&"é".repeat(100)).len(), 403);
         let keys = KeyCursor::directory(&dir);
         assert_eq!(
             keys.decode(method::ITEM_STATUS, &keys.encode("é x"))
@@ -1467,6 +1472,53 @@ mod tests {
         let err =
             mount_page(&mut MountSource(Vec::new()), Some("m0.6d"), &Id::Number(1)).unwrap_err();
         assert_eq!(err.reason_code().as_deref(), Some("restart-listing"));
+    }
+
+    /// ADR-0020 R3: a forged mount or account cursor naming a key that cannot exist (the
+    /// empty ID, which neither `MountId` nor `AccountId` admits) is refused with
+    /// `restart-listing`, and the source is never asked for rows after it.
+    #[test]
+    fn adr_0020_r3_forged_list_cursors_naming_impossible_keys_are_refused() {
+        struct NeverRead;
+        impl KeysetSource<MountInfo> for NeverRead {
+            fn rows_after(
+                &mut self,
+                after: Option<&str>,
+                _: usize,
+            ) -> Result<Vec<MountInfo>, RpcError> {
+                panic!("source read after a forged mount cursor ({after:?})");
+            }
+        }
+        impl KeysetSource<AccountInfo> for NeverRead {
+            fn rows_after(
+                &mut self,
+                after: Option<&str>,
+                _: usize,
+            ) -> Result<Vec<AccountInfo>, RpcError> {
+                panic!("source read after a forged account cursor ({after:?})");
+            }
+        }
+        let id = Id::Number(1);
+        let check = |err: RpcError, cursor: &str| {
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{cursor:?}");
+            assert_eq!(
+                err.reason_code().as_deref(),
+                Some("restart-listing"),
+                "{cursor:?}"
+            );
+        };
+        for cursor in ["m1.", "m1"] {
+            check(
+                mount_page(&mut NeverRead, Some(cursor), &id).unwrap_err(),
+                cursor,
+            );
+        }
+        for cursor in ["a1.", "a1"] {
+            check(
+                account_page(&mut NeverRead, Some(cursor), &id).unwrap_err(),
+                cursor,
+            );
+        }
     }
 
     struct MountSource(Vec<MountInfo>);

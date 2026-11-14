@@ -1,20 +1,23 @@
 //! Runs the shell and Python cursor loops from `docs/protocol/README.md` against a small
 //! fake daemon: a full listing over several pages, a daemon that closes the connection in
-//! the middle of the loop, and a refused `hello`. Each client must finish, fail cleanly with
-//! a clear message, and never spin.
+//! the middle of the loop, a reply that is not JSON, and a refused `hello`. Each client must
+//! finish, fail cleanly with a clear message, and never spin.
 //!
 //! Needs `bash`, `jq`, `socat`, `python3` and `timeout`; without them the test is skipped
-//! with a message saying which tool is missing.
+//! with a message saying which tool is missing. Set `MYDRIVE_REQUIRE_README_TOOLS=1` to turn
+//! that skip into a failure; CI does this, so the examples cannot go unchecked there.
 
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// The fake daemon: serves one connection on a Unix socket, then exits.
+/// The fake daemon: serves one connection on a Unix socket, then exits. It ends itself with
+/// an alarm after the bound (argument 3), so no wait on it can hang.
 const FAKE_DAEMON: &str = r#"
-import json, socket, sys
+import json, signal, socket, sys
 
-path, mode = sys.argv[1], sys.argv[2]
+path, mode, bound = sys.argv[1], sys.argv[2], int(sys.argv[3])
+signal.alarm(bound)  # the default action of SIGALRM ends the process
 srv = socket.socket(socket.AF_UNIX)
 srv.bind(path)
 srv.listen(1)
@@ -42,6 +45,9 @@ for raw in lines:
     if mode == "close-mid" and pages == 2:
         conn.close()
         break
+    if mode == "not-json" and pages == 2:
+        conn.sendall(b"this is not JSON\n")
+        continue
     params = req["params"]
     start = int(params["cursor"][1:]) if params.get("cursor") else 0
     end = min(start + PAGE, TOTAL)
@@ -53,6 +59,32 @@ for raw in lines:
         result["next_cursor"] = f"c{end}"
     send({"jsonrpc": "2.0", "id": rid, "result": result})
 "#;
+
+/// Environment variable that turns "a tool is missing" from a skip into a failure.
+const REQUIRE_ENV: &str = "MYDRIVE_REQUIRE_README_TOOLS";
+
+/// How long any one process of the test may run before it is killed, in seconds. Every
+/// wait in the test is bounded by it, so a stuck client or daemon fails instead of hanging.
+const BOUND_SECS: &str = "30";
+
+/// Returns true if the test should run. Skips loudly, or fails if `REQUIRE_ENV` is `1`.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn tools_available_or_skip(test: &str) -> bool {
+    let Some(tool) = missing_tool() else {
+        return true;
+    };
+    assert!(
+        std::env::var_os(REQUIRE_ENV).is_none_or(|value| value != "1"),
+        "{test}: {REQUIRE_ENV}=1 but `{tool}` is not installed"
+    );
+    // Written to the real stderr, so the skip shows even when the harness captures output.
+    let _ = writeln!(
+        io::stderr().lock(),
+        "SKIPPED {test}: `{tool}` is not installed. Install it or set {REQUIRE_ENV}=1 to make \
+         this a failure."
+    );
+    false
+}
 
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
 fn missing_tool() -> Option<&'static str> {
@@ -93,11 +125,13 @@ fn run(work: &Path, client: &[&str], mode: &str) -> Output {
     let runtime = work.join(format!("run-{mode}-{}", client[0]));
     std::fs::create_dir_all(runtime.join("mydrive")).unwrap();
     let socket = runtime.join("mydrive").join("daemon.sock");
+    // The daemon bounds its own life with an alarm, so the read of "ready" below ends too.
     let mut daemon = Command::new("python3")
         .arg("-I")
         .arg(work.join("fake_daemon.py"))
         .arg(&socket)
         .arg(mode)
+        .arg(BOUND_SECS)
         .stdout(Stdio::piped())
         .spawn()
         .expect("start the fake daemon");
@@ -107,7 +141,7 @@ fn run(work: &Path, client: &[&str], mode: &str) -> Output {
         .unwrap();
     assert_eq!(ready.trim(), "ready");
     let output = Command::new("timeout")
-        .arg("30")
+        .arg(BOUND_SECS)
         .args(client)
         .arg("/home/user/OneDrive/Pictures")
         .env("XDG_RUNTIME_DIR", &runtime)
@@ -119,21 +153,44 @@ fn run(work: &Path, client: &[&str], mode: &str) -> Output {
     output
 }
 
+/// Checks that a client run failed cleanly: it ended by itself, with a failure status, a
+/// clear message on stderr, and no Python traceback.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn assert_fails_cleanly(out: &Output, client: &str, case: &str, message: &str) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(
+        out.status.code(),
+        Some(124),
+        "{client}, {case}: spun until the timeout"
+    );
+    assert!(!out.status.success(), "{client}, {case}: must fail");
+    assert!(
+        stderr.contains(message),
+        "{client}, {case}: unclear failure, expected {message:?}: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Traceback"),
+        "{client}, {case}: crashed instead of reporting: {stderr}"
+    );
+}
+
 #[test]
 fn readme_cursor_loops_run_and_fail_cleanly() {
-    if let Some(tool) = missing_tool() {
-        eprintln!("skipping readme_cursor_loops_run_and_fail_cleanly: `{tool}` is not installed");
+    if !tools_available_or_skip("readme_cursor_loops_run_and_fail_cleanly") {
         return;
     }
     let work = tempfile::tempdir().unwrap();
     std::fs::write(work.path().join("fake_daemon.py"), FAKE_DAEMON).unwrap();
     std::fs::write(work.path().join("list-dir.sh"), catalogue_block("sh")).unwrap();
     std::fs::write(work.path().join("list_dir.py"), catalogue_block("python")).unwrap();
-    let clients: [(&str, Vec<&str>); 2] = [
-        ("shell", vec!["bash", "list-dir.sh"]),
-        ("python", vec!["python3", "-I", "list_dir.py"]),
+    // The shell loop streams each page as it arrives; the Python loop prints only a complete
+    // listing. So after a failure on page two the shell has printed page one (which is why
+    // the catalogue tells consumers to check its exit status) and Python has printed nothing.
+    let clients: [(&str, Vec<&str>, usize); 2] = [
+        ("shell", vec!["bash", "list-dir.sh"], 300),
+        ("python", vec!["python3", "-I", "list_dir.py"], 0),
     ];
-    for (name, client) in &clients {
+    for (name, client, printed_before_failure) in &clients {
         let out = run(work.path(), client, "ok");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -145,33 +202,20 @@ fn readme_cursor_loops_run_and_fail_cleanly() {
             "{name}"
         );
 
-        let out = run(work.path(), client, "close-mid");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_ne!(
-            out.status.code(),
-            Some(124),
-            "{name}: spun until the timeout"
-        );
-        assert!(
-            !out.status.success(),
-            "{name}: a closed connection must fail"
-        );
-        assert!(
-            stderr.contains("connection closed"),
-            "{name}: unclear failure on close: {stderr}"
-        );
+        for (mode, message) in [
+            ("close-mid", "connection closed"),
+            ("not-json", "unreadable reply"),
+        ] {
+            let out = run(work.path(), client, mode);
+            assert_fails_cleanly(&out, name, mode, message);
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout).lines().count(),
+                *printed_before_failure,
+                "{name}, {mode}: entries printed before the failure"
+            );
+        }
 
         let out = run(work.path(), client, "hello-error");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_ne!(
-            out.status.code(),
-            Some(124),
-            "{name}: spun until the timeout"
-        );
-        assert!(!out.status.success(), "{name}: a refused hello must fail");
-        assert!(
-            stderr.contains("error 1009"),
-            "{name}: unclear failure on hello: {stderr}"
-        );
+        assert_fails_cleanly(&out, name, "hello-error", "error 1009");
     }
 }

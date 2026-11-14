@@ -440,6 +440,73 @@ mod tests {
         assert_eq!(req.params, None);
     }
 
+    /// Decodes one raw line as the daemon does: framing, then envelope.
+    fn decode_line(line: &str) -> Result<Message, String> {
+        let mut decoder = crate::codec::LineDecoder::new();
+        decoder.push(line.as_bytes());
+        decoder.push(b"\n");
+        let value = decoder
+            .next_message()
+            .expect("one line")
+            .map_err(|e| format!("frame: {e}"))?;
+        Message::from_value(value)
+            .map_err(|e| format!("envelope: {}", e.to_response().error.message))
+    }
+
+    /// The numeric forms of an `id` the catalogue lists as refused are refused with
+    /// `invalid-request`, as written on the wire (not as `json!` would normalise them):
+    /// any fraction, decimal point or exponent, even when the value is a whole number, `-0`,
+    /// and integers outside the signed 64-bit range. The i64 bounds themselves are accepted.
+    #[test]
+    fn refused_numeric_id_forms() {
+        for ok in ["0", "-9223372036854775808", "9223372036854775807"] {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":{ok},"method":"daemon.status"}}"#);
+            assert!(decode_line(&line).is_ok(), "{ok}");
+        }
+        for bad in [
+            "1.5",
+            "1.0",
+            "0.0",
+            "1e3",
+            "1E0",
+            "-0",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "18446744073709551616",
+        ] {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":{bad},"method":"daemon.status"}}"#);
+            let err = decode_line(&line).unwrap_err();
+            assert!(err.starts_with("envelope: "), "{bad}: {err}");
+            let value: Value = serde_json::from_str(&line).unwrap();
+            let err = Message::from_value(value).unwrap_err();
+            assert_eq!(err.id, None, "{bad}");
+            assert_eq!(
+                err.to_response().error.kind(),
+                Some(ErrorCode::InvalidRequest),
+                "{bad}"
+            );
+        }
+        // Forms that are not JSON numbers at all are parse errors of the whole line.
+        for not_json in ["01", "+1", "0x1", "NaN", "Infinity"] {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":{not_json},"method":"daemon.status"}}"#);
+            let err = decode_line(&line).unwrap_err();
+            assert!(err.starts_with("frame: "), "{not_json}: {err}");
+        }
+    }
+
+    /// A request that repeats a key, at any level, is read with the last occurrence of that
+    /// key, as the catalogue documents.
+    #[test]
+    fn duplicate_keys_take_the_last_value() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"item.pin","params":{"paths":["/m/a"],"paths":["/m/b"]},"id":2,"method":"item.unpin"}"#;
+        let Message::Request(req) = decode_line(line).unwrap() else {
+            panic!("not a request");
+        };
+        assert_eq!(req.id, Id::Number(2));
+        assert_eq!(req.method, "item.unpin");
+        assert_eq!(req.params, Some(json!({"paths": ["/m/b"]})));
+    }
+
     #[test]
     fn error_response_always_carries_id() {
         let resp = ErrorResponse::new(None, RpcError::new(ErrorCode::ParseError, "bad"));
