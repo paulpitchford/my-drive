@@ -11,18 +11,18 @@
 
 use mydrive_core::ids::{AccountId, DriveId, MountId, TenantId};
 use mydrive_core::state::{
-    DisplayStatus, EffectivePin, Hydration, ItemState, Modifiers, Pin, Sync as SyncState,
-    display_status, effective_pin,
+    DisplayStatus, EffectivePin, ItemState, Modifiers, Pin, display_status, effective_pin,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::envelope::{Id, Request};
-use crate::error::{ErrorCode, RpcError};
+use crate::error::{ErrorCode, RpcError, cap_message};
 use crate::path::ProtocolPath;
 use crate::values::{
-    AccountKind, AccountState, BlockedReason, ItemReason, MountState, WireModifiers,
+    AccountKind, AccountState, BlockedReason, ItemReason, MountState, WireEffectivePin,
+    WireHydration, WireModifiers, WirePin, WireSync,
 };
 
 /// The protocol major version this build speaks.
@@ -96,6 +96,38 @@ pub struct HelloResult {
     /// Optional features the daemon offers. An open set: clients ignore capabilities they do
     /// not know (ADR-0009 R5, ADR-0019). Version 1 defines none.
     pub capabilities: Vec<String>,
+    /// Size limits the client must respect (ADR-0020 R5).
+    pub limits: Limits,
+}
+
+/// The longest line, in either direction, in protocol version 1.
+pub const MAX_LINE_BYTES: u64 = crate::codec::MAX_LINE_BYTES as u64;
+
+/// The most paths one action request may carry in protocol version 1 (ADR-0020 R5).
+pub const MAX_ACTION_PATHS: u32 = 100;
+
+/// The most bytes the paths of one action request may take, encoded as JSON strings. Half
+/// the line, so that one result entry per path always fits in the response line.
+pub const MAX_ACTION_PATH_BYTES: u64 = MAX_LINE_BYTES / 2;
+
+/// Limits returned by `hello` (ADR-0020 R5). New limits may be added as fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    /// The longest line, in bytes, excluding the `\n`.
+    pub max_line_bytes: u64,
+    /// The most paths in one `item.pin`, `item.unpin`, `item.hydrate` or `item.dehydrate`.
+    pub max_action_paths: u32,
+    /// The most bytes those paths may take together, each encoded as a JSON string.
+    pub max_action_path_bytes: u64,
+}
+
+impl Limits {
+    /// The limits of protocol version 1.
+    pub const V1: Self = Self {
+        max_line_bytes: MAX_LINE_BYTES,
+        max_action_paths: MAX_ACTION_PATHS,
+        max_action_path_bytes: MAX_ACTION_PATH_BYTES,
+    };
 }
 
 /// Chooses the highest protocol major version both sides support (ADR-0009 R4).
@@ -242,18 +274,18 @@ impl From<ItemStatusParams> for ItemStatusWire {
 /// (ADR-0014 R5); the axes are included for clients that want detail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemInfo {
-    /// The display status, from `mydrive_core::state::display_status`. Closed set.
+    /// The display status, from `mydrive_core::state::display_status`. The only closed set.
     pub status: DisplayStatus,
     /// The `read-only` and `shortcut` indicators, as a list. Open set.
     pub modifiers: WireModifiers,
-    /// Hydration axis. Closed set.
-    pub hydration: Hydration,
-    /// Pin axis, as set on the item itself. Closed set.
-    pub pin: Pin,
-    /// The pin after inheritance. Closed set.
-    pub effective_pin: EffectivePin,
-    /// Sync axis. Closed set.
-    pub sync: SyncState,
+    /// Hydration axis. Open on the wire (ADR-0020).
+    pub hydration: WireHydration,
+    /// Pin axis, as set on the item itself. Open on the wire.
+    pub pin: WirePin,
+    /// The pin after inheritance. Open on the wire.
+    pub effective_pin: WireEffectivePin,
+    /// Sync axis. Open on the wire.
+    pub sync: WireSync,
     /// Why the status is `error` or `blocked`, as a code (ADR-0019 R6). Open set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<ItemReason>,
@@ -278,31 +310,33 @@ impl ItemInfo {
         Self {
             status: display_status(&state, effective),
             modifiers: modifiers.into(),
-            hydration: state.hydration,
-            pin: state.pin,
-            effective_pin: effective,
-            sync: state.sync,
+            hydration: state.hydration.into(),
+            pin: state.pin.into(),
+            effective_pin: effective.into(),
+            sync: state.sync.into(),
             reason: None,
             message: None,
         }
     }
 
-    /// Adds the reason code and message for an item in `error` or `blocked`.
+    /// Adds the reason code and message for an item in `error` or `blocked`. The message is
+    /// capped at 1 KiB.
     #[must_use]
-    pub fn with_reason(mut self, reason: ItemReason, message: impl Into<String>) -> Self {
+    pub fn with_reason(mut self, reason: ItemReason, message: impl AsRef<str>) -> Self {
         self.reason = Some(reason);
-        self.message = Some(message.into());
+        self.message = Some(cap_message(message.as_ref()));
         self
     }
 
-    /// The three axes.
+    /// The three axes as `mydrive-core` values, or `None` if any of them is a value this
+    /// build does not know.
     #[must_use]
-    pub const fn state(&self) -> ItemState {
-        ItemState {
-            hydration: self.hydration,
-            pin: self.pin,
-            sync: self.sync,
-        }
+    pub fn state(&self) -> Option<ItemState> {
+        Some(ItemState {
+            hydration: self.hydration.to_core()?,
+            pin: self.pin.to_core()?,
+            sync: self.sync.to_core()?,
+        })
     }
 }
 
@@ -442,21 +476,147 @@ pub struct SkippedItem {
     pub error: RpcError,
 }
 
+/// What happened for one requested path of an item action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionOutcome {
+    /// Not accepted for this path at all; nothing changed. Has no `skipped`.
+    Refused(RpcError),
+    /// Accepted, possibly with descendants skipped.
+    Accepted {
+        /// A sample of the skipped descendants: at most `skipped_count` of them, as many as
+        /// fit in the line, possibly none (ADR-0020 R6).
+        skipped: Vec<SkippedItem>,
+        /// The exact number of skipped descendants.
+        skipped_count: u64,
+        /// For `item.dehydrate`: local bytes released.
+        bytes_freed: Option<u64>,
+    },
+}
+
 /// The outcome for one requested path of an item action.
+///
+/// On the wire: `path`, and either `error` alone, or any of `skipped`, `skipped_count`
+/// (present whenever anything was skipped) and `bytes_freed`. An entry with `error` and
+/// `skipped`, or with more `skipped` entries than `skipped_count`, fails to deserialise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ActionEntryWire", into = "ActionEntryWire")]
 pub struct ItemActionEntry {
     /// The path acted on.
     pub path: ProtocolPath,
-    /// Why the action was not accepted for this path at all. A refused action changed
-    /// nothing. Absent when accepted.
+    /// What happened.
+    pub outcome: ActionOutcome,
+}
+
+impl ItemActionEntry {
+    /// An accepted path with nothing skipped.
+    #[must_use]
+    pub fn accepted(path: ProtocolPath) -> Self {
+        Self {
+            path,
+            outcome: ActionOutcome::Accepted {
+                skipped: Vec::new(),
+                skipped_count: 0,
+                bytes_freed: None,
+            },
+        }
+    }
+
+    /// A refused path.
+    #[must_use]
+    pub fn refused(path: ProtocolPath, error: RpcError) -> Self {
+        Self {
+            path,
+            outcome: ActionOutcome::Refused(error),
+        }
+    }
+
+    /// The error, if the path was refused.
+    #[must_use]
+    pub fn error(&self) -> Option<&RpcError> {
+        match &self.outcome {
+            ActionOutcome::Refused(error) => Some(error),
+            ActionOutcome::Accepted { .. } => None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ActionEntryWire {
+    path: ProtocolPath,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<RpcError>,
-    /// For a folder: descendants that were not acted on, each with its reason.
+    error: Option<RpcError>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub skipped: Vec<SkippedItem>,
-    /// For `item.dehydrate`: local bytes released.
+    skipped: Vec<SkippedItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bytes_freed: Option<u64>,
+    skipped_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes_freed: Option<u64>,
+}
+
+impl TryFrom<ActionEntryWire> for ItemActionEntry {
+    type Error = String;
+
+    fn try_from(wire: ActionEntryWire) -> Result<Self, String> {
+        let outcome = match wire.error {
+            Some(error) => {
+                if !wire.skipped.is_empty()
+                    || wire.skipped_count.is_some()
+                    || wire.bytes_freed.is_some()
+                {
+                    return Err(format!(
+                        "action entry for {} has \"error\" and also skipped or freed items",
+                        wire.path
+                    ));
+                }
+                ActionOutcome::Refused(error)
+            }
+            None => {
+                let skipped_count = wire.skipped_count.unwrap_or(0);
+                if (wire.skipped.len() as u64) > skipped_count {
+                    return Err(format!(
+                        "action entry for {} lists {} skipped items but skipped_count is {}",
+                        wire.path,
+                        wire.skipped.len(),
+                        skipped_count
+                    ));
+                }
+                ActionOutcome::Accepted {
+                    skipped: wire.skipped,
+                    skipped_count,
+                    bytes_freed: wire.bytes_freed,
+                }
+            }
+        };
+        Ok(Self {
+            path: wire.path,
+            outcome,
+        })
+    }
+}
+
+impl From<ItemActionEntry> for ActionEntryWire {
+    fn from(entry: ItemActionEntry) -> Self {
+        match entry.outcome {
+            ActionOutcome::Refused(error) => Self {
+                path: entry.path,
+                error: Some(error),
+                skipped: Vec::new(),
+                skipped_count: None,
+                bytes_freed: None,
+            },
+            ActionOutcome::Accepted {
+                skipped,
+                skipped_count,
+                bytes_freed,
+            } => Self {
+                path: entry.path,
+                error: None,
+                skipped,
+                skipped_count: (skipped_count > 0).then_some(skipped_count),
+                bytes_freed,
+            },
+        }
+    }
 }
 
 /// Result of `item.pin`, `item.unpin`, `item.hydrate` and `item.dehydrate`: one entry per
@@ -491,8 +651,9 @@ pub struct StatusChangedParams {
     /// is gone.
     #[serde(default)]
     pub entries: Vec<ItemStatusEntry>,
-    /// Directories whose listing changed too much to enumerate (for example a renamed folder
-    /// with many descendants); the client re-requests each one it is showing.
+    /// Paths whose state changed too much to enumerate (for example a renamed folder with
+    /// many descendants). For each one the client discards what it has cached for that path
+    /// and everything below it, and re-requests what it is showing (ADR-0020 R8).
     #[serde(default)]
     pub refresh: Vec<ProtocolPath>,
 }
@@ -543,10 +704,10 @@ impl MethodCall {
             }
             method::MOUNT_LIST => decode::<NoParams>(method, params).map(|_| Self::MountList)?,
             method::ITEM_STATUS => Self::ItemStatus(decode(method, params)?),
-            method::ITEM_PIN => Self::ItemPin(decode(method, params)?),
-            method::ITEM_UNPIN => Self::ItemUnpin(decode(method, params)?),
-            method::ITEM_HYDRATE => Self::ItemHydrate(decode(method, params)?),
-            method::ITEM_DEHYDRATE => Self::ItemDehydrate(decode(method, params)?),
+            method::ITEM_PIN => Self::ItemPin(decode_action(method, params)?),
+            method::ITEM_UNPIN => Self::ItemUnpin(decode_action(method, params)?),
+            method::ITEM_HYDRATE => Self::ItemHydrate(decode_action(method, params)?),
+            method::ITEM_DEHYDRATE => Self::ItemDehydrate(decode_action(method, params)?),
             method::STATUS_SUBSCRIBE => Self::StatusSubscribe(decode(method, params)?),
             other => return Err(RpcError::method_not_found(other)),
         };
@@ -611,6 +772,41 @@ impl MethodCall {
             params: self.params()?,
         })
     }
+}
+
+/// Decodes action parameters and enforces [`Limits::V1`] (ADR-0020 R5): a request over a
+/// limit is refused as a whole, before anything is done.
+fn decode_action(method: &str, params: Option<&Value>) -> Result<ItemPathsParams, RpcError> {
+    let params: ItemPathsParams = decode(method, params)?;
+    if params.paths.len() > MAX_ACTION_PATHS as usize {
+        return Err(RpcError::invalid_params(
+            method,
+            format!(
+                "{} paths given, the limit is {MAX_ACTION_PATHS}; split the request",
+                params.paths.len()
+            ),
+        ));
+    }
+    let bytes = encoded_path_bytes(&params.paths);
+    if bytes > MAX_ACTION_PATH_BYTES {
+        return Err(RpcError::invalid_params(
+            method,
+            format!(
+                "the paths take {bytes} bytes, the limit is {MAX_ACTION_PATH_BYTES}; split the \
+                 request"
+            ),
+        ));
+    }
+    Ok(params)
+}
+
+/// The bytes `paths` take as JSON strings, the measure `max_action_path_bytes` limits.
+#[must_use]
+pub fn encoded_path_bytes(paths: &[ProtocolPath]) -> u64 {
+    paths
+        .iter()
+        .map(|p| serde_json::to_string(p.as_str()).map_or(0, |s| s.len() as u64))
+        .sum()
 }
 
 fn decode<P: DeserializeOwned>(method: &str, params: Option<&Value>) -> Result<P, RpcError> {
@@ -721,6 +917,7 @@ impl Session {
         Ok(HelloResult {
             protocol_version: version,
             capabilities: capabilities.iter().map(|&c| c.to_owned()).collect(),
+            limits: Limits::V1,
         })
     }
 
@@ -737,8 +934,10 @@ impl Session {
 mod tests {
     use serde_json::json;
 
+    use mydrive_core::state::{Hydration, Sync as SyncState};
+
     use super::*;
-    use crate::values::Modifier;
+    use crate::values::{Modifier, RefusalReason};
 
     fn p(s: &str) -> ProtocolPath {
         ProtocolPath::new(s).unwrap()
@@ -950,8 +1149,8 @@ mod tests {
                             }],
                         );
                         assert_eq!(info.status, display_status(&state, effective));
-                        assert_eq!(info.effective_pin, effective);
-                        assert_eq!(info.state(), state);
+                        assert_eq!(info.effective_pin, effective.into());
+                        assert_eq!(info.state(), Some(state));
                         let v = serde_json::to_value(&info).unwrap();
                         assert_eq!(v["status"], info.status.as_str());
                         assert_eq!(v["hydration"], hydration.as_str());
@@ -978,7 +1177,9 @@ mod tests {
     #[test]
     fn results_with_extra_fields_still_decode() {
         let hello: HelloResult = serde_json::from_value(json!({
-            "protocol_version": 1, "capabilities": ["future-thing"], "motd": "hi"
+            "protocol_version": 1, "capabilities": ["future-thing"], "motd": "hi",
+            "limits": {"max_line_bytes": 1, "max_action_paths": 1, "max_action_path_bytes": 1,
+                       "max_new_thing": 3}
         }))
         .unwrap();
         assert_eq!(hello.capabilities, ["future-thing"]);
@@ -1028,20 +1229,75 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(&info).unwrap(), item);
 
+        let mut item = info_json();
+        item["status"] = json!("sparkly");
+        assert!(
+            serde_json::from_value::<ItemInfo>(item).is_err(),
+            "the closed display status accepted an unknown value"
+        );
+    }
+
+    /// ADR-0020 R7: an unknown axis value is kept and does not fail the response; the
+    /// display status still rejects an unknown value.
+    #[test]
+    fn unknown_axis_values_are_kept() {
         for (field, value) in [
-            ("status", "sparkly"),
             ("hydration", "half"),
-            ("pin", "maybe"),
-            ("effective_pin", "inherit"),
-            ("sync", "melting"),
+            ("pin", "excluded"),
+            ("effective_pin", "excluded"),
+            ("sync", "paused-upload"),
         ] {
             let mut item = info_json();
             item[field] = json!(value);
-            assert!(
-                serde_json::from_value::<ItemInfo>(item).is_err(),
-                "closed set {field} accepted {value}"
-            );
+            let result: ItemStatusResult = serde_json::from_value(
+                json!({"entries": [{"path": "/home/u/OneDrive/a", "item": item.clone()}]}),
+            )
+            .unwrap_or_else(|e| panic!("unknown {field} failed the response: {e}"));
+            let info = result.entries[0].item().unwrap();
+            assert_eq!(serde_json::to_value(info).unwrap(), item);
+            if field != "effective_pin" {
+                assert_eq!(info.state(), None, "{field}");
+            }
         }
+    }
+
+    /// ADR-0020 R5: `hello` returns the limits, and an action request over a limit is
+    /// refused with invalid-params before anything is done.
+    #[test]
+    fn hello_returns_limits_and_oversize_actions_are_refused() {
+        let mut session = Session::new();
+        let result = session
+            .hello(&hello(&[1]), SUPPORTED_VERSIONS, &[])
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(result.limits).unwrap(),
+            json!({"max_line_bytes": 1_048_576, "max_action_paths": 100,
+                   "max_action_path_bytes": 524_288})
+        );
+        let at_limit: Vec<String> = (0..100).map(|i| format!("/m/f{i}")).collect();
+        for m in [
+            method::ITEM_PIN,
+            method::ITEM_UNPIN,
+            method::ITEM_HYDRATE,
+            method::ITEM_DEHYDRATE,
+        ] {
+            assert!(MethodCall::parse(m, Some(&json!({"paths": at_limit}))).is_ok());
+            let mut over = at_limit.clone();
+            over.push("/m/one-more".into());
+            let err = MethodCall::parse(m, Some(&json!({"paths": over}))).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{m}");
+            assert!(err.message.contains("limit is 100"), "{}", err.message);
+        }
+        // 100 paths of 4,096 bytes fit the byte limit; paths full of quotes do not.
+        let long: Vec<String> = (0..100)
+            .map(|i| format!("/{i:03}{}", "a".repeat(4092)))
+            .collect();
+        assert!(MethodCall::parse(method::ITEM_PIN, Some(&json!({"paths": long}))).is_ok());
+        let quoted: Vec<String> = (0..100)
+            .map(|i| format!("/{i:03}{}", "\"".repeat(4092)))
+            .collect();
+        let err = MethodCall::parse(method::ITEM_PIN, Some(&json!({"paths": quoted}))).unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
     }
 
     /// Exactly one of `item` and `error` per status entry.
@@ -1079,12 +1335,39 @@ mod tests {
 
     #[test]
     fn action_entry_optional_fields_are_omitted_when_empty() {
-        let entry = ItemActionEntry {
-            path: p("/a"),
-            error: None,
-            skipped: Vec::new(),
-            bytes_freed: None,
-        };
+        let entry = ItemActionEntry::accepted(p("/a"));
         assert_eq!(serde_json::to_value(&entry).unwrap(), json!({"path": "/a"}));
+        let entry =
+            ItemActionEntry::refused(p("/a"), RpcError::refused(&RefusalReason::InUse, "open"));
+        assert_eq!(
+            serde_json::to_value(&entry).unwrap(),
+            json!({"path": "/a", "error": {"code": 1004, "message": "open",
+                   "data": {"reason": "in-use"}}})
+        );
+    }
+
+    /// ADR-0020 R6: an entry with `error` has no `skipped`, and `skipped` never holds more
+    /// than `skipped_count`.
+    #[test]
+    fn action_entry_shape_is_enforced() {
+        let error = json!({"code": 1004, "message": "no"});
+        let skipped = json!([{"path": "/a/b", "error": error}]);
+        let ok = json!({"path": "/a", "skipped": skipped, "skipped_count": 7000});
+        let entry: ItemActionEntry = serde_json::from_value(ok.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&entry).unwrap(), ok);
+        let ok = json!({"path": "/a", "skipped_count": 7000});
+        assert!(serde_json::from_value::<ItemActionEntry>(ok).is_ok());
+        for bad in [
+            json!({"path": "/a", "error": error, "skipped": skipped}),
+            json!({"path": "/a", "error": error, "skipped_count": 1}),
+            json!({"path": "/a", "error": error, "bytes_freed": 1}),
+            json!({"path": "/a", "skipped": skipped}),
+            json!({"path": "/a", "skipped": skipped, "skipped_count": 0}),
+        ] {
+            assert!(
+                serde_json::from_value::<ItemActionEntry>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

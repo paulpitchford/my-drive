@@ -30,7 +30,14 @@ pub enum PathProblem {
     /// The path has a `.` or `..` component, so its meaning depends on resolution.
     #[error("it contains a '.' or '..' component")]
     DotComponent,
+    /// The path is longer than [`MAX_PATH_BYTES`], the Linux `PATH_MAX`.
+    #[error("it is longer than {MAX_PATH_BYTES} bytes")]
+    TooLong,
 }
+
+/// The longest protocol path, in bytes: Linux `PATH_MAX`. Bounding paths is what lets every
+/// message be bounded (ADR-0020 R4).
+pub const MAX_PATH_BYTES: usize = 4096;
 
 /// A string that cannot be used as a protocol path.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -78,6 +85,9 @@ fn problem(path: &str) -> Option<PathProblem> {
     }
     if !path.starts_with('/') {
         return Some(PathProblem::NotAbsolute);
+    }
+    if path.len() > MAX_PATH_BYTES {
+        return Some(PathProblem::TooLong);
     }
     if path.contains('\0') {
         return Some(PathProblem::NulByte);
@@ -157,6 +167,14 @@ mod tests {
         }
         // Names that merely start with dots are ordinary names.
         assert!(ProtocolPath::new("/a/.hidden/...").is_ok());
+        let longest = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
+        assert!(ProtocolPath::new(longest.clone()).is_ok());
+        assert_eq!(
+            ProtocolPath::new(format!("{longest}b"))
+                .unwrap_err()
+                .problem,
+            PathProblem::TooLong
+        );
     }
 
     #[test]

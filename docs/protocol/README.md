@@ -1,10 +1,11 @@
 # my-drive IPC protocol, version 1
 
 The wire protocol between `mydrived` and every client: the CLI, the UI, the tray and the
-file-manager adapters. Decided in [ADR-0009](../adr/0009-ipc-versioned-json-rpc-over-unix-socket.md)
-and amended by [ADR-0019](../adr/0019-protocol-pagination-and-open-value-sets.md) (pagination
-and open value sets). The Rust types are in `crates/mydrive-ipc`. How adapters use it is
-shown in [F11](../flows/F11-status-for-file-managers.md).
+file-manager adapters. Decided in [ADR-0009](../adr/0009-ipc-versioned-json-rpc-over-unix-socket.md),
+amended by [ADR-0019](../adr/0019-protocol-pagination-and-open-value-sets.md) (pagination
+and open value sets) and [ADR-0020](../adr/0020-protocol-results-are-bounded-and-cursors-survive-change.md)
+(bounded messages and keyset cursors). The Rust types are in `crates/mydrive-ipc`. How
+adapters use it is shown in [F11](../flows/F11-status-for-file-managers.md).
 
 Every JSON example on this page is parsed by a test (`crates/mydrive-ipc/tests/protocol_examples.rs`)
 into the matching Rust type and serialised back to the same JSON, and every request marked
@@ -19,12 +20,15 @@ that test; every JSON block on this page must carry one.
 - JSON-RPC 2.0. Each message, in either direction, is **one JSON object on one line**,
   terminated by `\n`. Encoders emit compact JSON, so newlines inside strings are always
   escaped.
-- A line is at most **1 MiB** (1,048,576 bytes, not counting the `\n`), in both directions.
-  The daemon never sends a longer line; results that could be larger are
-  [paginated](#pagination). A longer line from a client is discarded up to the next `\n` and
-  answered with `invalid-request`; the connection stays open and the next line is read
-  normally. Lines that are not UTF-8 or not one JSON document get `parse-error`. These errors
-  carry `"id": null`.
+- **Every message is bounded.** A line is at most **1 MiB** (1,048,576 bytes, not counting
+  the `\n`), in both directions and for every kind of message: listings, action results,
+  notifications and errors. The daemon never sends a longer line: listings are
+  [paginated](#pagination), action results carry a [sample](#item-actions) of skipped items,
+  large changes are split across notifications, and human-readable messages are capped at
+  1 KiB. A longer line from a client is discarded up to the next `\n` and answered with
+  `invalid-request`; the connection stays open and the next line is read normally. Lines
+  that are not UTF-8 or not one JSON document get `parse-error`. These errors carry
+  `"id": null`.
 - Blank lines are ignored.
 - JSON-RPC batches (a JSON array of requests on one line) are not supported and get one
   `invalid-request` error with `"id": null`.
@@ -35,18 +39,20 @@ that test; every JSON block on this page must carry one.
 
 - Field names are `snake_case`. Enumerated values are lowercase kebab-case strings, never
   objects or tagged unions. Each enumerated field is [closed or open](#value-sets).
-- **Paths** are absolute UTF-8 paths under a mount point, never backing-directory paths. A
-  path that is empty, relative, contains a NUL byte, or has a `.` or `..` component is
-  rejected with `invalid-params`. A path outside every mount gets `not-in-a-mount`. File
-  names under a mount are always valid UTF-8 (the VFS refuses any other name), so a path that
-  is not valid UTF-8 is never under a mount: clients must never send one, and must not
-  "repair" one into a different string.
-- Optional fields are omitted when they have no value, rather than sent as `null`.
+- **Paths** are absolute UTF-8 paths under a mount point, never backing-directory paths, at
+  most 4,096 bytes long. A path that is empty, relative, longer than that, contains a NUL
+  byte, or has a `.` or `..` component is rejected with `invalid-params`. A path outside
+  every mount gets `not-in-a-mount`. File names under a mount are always valid UTF-8 (the VFS
+  refuses any other name), so a path that is not valid UTF-8 is never under a mount: clients
+  must never send one, and must not "repair" one into a different string.
+- Optional fields are omitted when they have no value, rather than sent as `null`. A client
+  treats an absent field and a `null` one the same way.
 - **Unknown fields are ignored**, by the daemon and by clients, at every level. Clients also
   ignore unknown notification methods and unknown capabilities.
-- **Reasons are codes.** Wherever a program might act on a reason (a refusal, a blocked
-  mount, an item in `error` or `blocked`), it is a kebab-case code from an open set, with a
-  separate human-readable message. Programs never parse messages.
+- **Reasons are codes.** Wherever a program might act on a reason (a refusal, a policy block,
+  a read-only refusal, a blocked mount, an item in `error` or `blocked`), it is a kebab-case
+  code from an open set, with a separate human-readable message. Programs never parse
+  messages.
 - Clients draw from `status` and `modifiers`. They never derive a status from the axes
   themselves; the axes are there for clients that want detail.
 
@@ -54,16 +60,16 @@ that test; every JSON block on this page must carry one.
 
 *Closed* sets never gain a value within a major version; a client may reject an unknown
 value. *Open* sets may gain values in any daemon release; a client must accept an unknown
-value without failing the response and use the fallback below.
+value without failing the response and use the fallback below. Only the display status is
+closed: the state axes are open on the wire (ADR-0020).
 
 | Field | Set | Values | Client fallback for an unknown value |
 |---|---|---|---|
 | `item.status` | closed | `blocked`, `error`, `syncing`, `pinned`, `local`, `online-only` | — |
-| `item.hydration` | closed | `placeholder`, `partial`, `full` | — |
-| `item.pin` | closed | `inherit`, `pinned`, `unpinned` | — |
-| `item.effective_pin` | closed | `pinned`, `unpinned` | — |
-| `item.sync` | closed | `in-sync`, `pending-download`, `pending-upload`, `uploading`, `conflict`, `error`, `blocked` | — |
-| `error.data.sync` | closed | as `item.sync` | — |
+| `item.hydration` | open | `placeholder`, `partial`, `full` | Keep it; show the word |
+| `item.pin` | open | `inherit`, `pinned`, `unpinned` | Keep it; show the word |
+| `item.effective_pin` | open | `pinned`, `unpinned` | Keep it; show the word |
+| `item.sync` | open | `in-sync`, `pending-download`, `pending-upload`, `uploading`, `conflict`, `error`, `blocked` | Keep it; show the word |
 | `item.modifiers` | open | `read-only`, `shortcut` | Ignore it |
 | `item.reason` | open | `conflict`, `name-not-allowed`, `storage-full`, `read-only`, `download-failed`, `hash-mismatch`, `local-change-lost`, `organisation-policy` | Show `message` |
 | `mount.state` | open | `active`, `paused`, `blocked`, `resyncing` | Treat the mount as not active; show the word |
@@ -71,15 +77,18 @@ value without failing the response and use the fallback below.
 | `account.state` | open | `signed-in`, `needs-sign-in` | Treat the account as not active; show the word |
 | `account.kind` | open | `personal`, `work` | Show the word |
 | `error.code` | open | the [error table](#errors) | Treat as a failure; show `message` |
-| `error.data.reason` | open | `not-in-sync`, `pinned`, `in-use`, `remote-changed`, `insufficient-space` | Show `message` |
+| `refused.data.reason` | open | `not-in-sync`, `pinned`, `in-use`, `remote-changed`, `insufficient-space` | Show `message` |
+| `refused.data.sync` | open | `in-sync`, `pending-download`, `pending-upload`, `uploading`, `conflict`, `error`, `blocked` | Show the word |
+| `blocked-by-policy.data.reason` | open | `organisation-policy`, `tenant-refused` | Show `message` |
+| `read-only.data.reason` | open | `library-read-only`, `no-write-permission` | Show `message` |
 | `hello.capabilities` | open | none in version 1 | Ignore it |
 
 ## Versioning
 
 - The protocol has an integer **major version**. This page describes version `1`.
 - Within a major version, changes are **additive only**: new methods, new optional
-  parameters, new result fields, new notification methods, and new values of open sets.
-  Clients must tolerate all of these.
+  parameters, new result fields, new limits, new notification methods, and new values of
+  open sets. Clients must tolerate all of these.
 - Removing anything, renaming anything, making an optional parameter required, adding a value
   to a closed set, or changing what a field or value means requires a new major version.
 - The first request on every connection is `hello`. The client lists the major versions it
@@ -107,23 +116,105 @@ value without failing the response and use the fallback below.
 
 ## Pagination
 
-`item.status` results may be split across several calls (ADR-0019). The request may carry
-`cursor`; the result carries `next_cursor` when more remains and omits it on the last page.
-To read a whole listing, repeat the call with **the same parameters** plus `cursor` set to
-the previous `next_cursor`, until a result has no `next_cursor`. The listing is complete only
-then; a client must not cache a partial listing as complete. Cursors are opaque strings: do
-not parse or construct them. A cursor the daemon did not issue for this listing gets
-`invalid-params`.
+`item.status` results may be split across several calls. The request may carry `cursor`;
+the result carries `next_cursor` when more remains. **`next_cursor` is never an empty string;
+when it is absent (or `null`) the listing is complete.** To read a whole listing, repeat the
+call with **the same parameters** plus `cursor` set to the previous `next_cursor`, until a
+result has no `next_cursor`. A client must not cache a partial listing as complete. No page
+is empty while more remains.
 
-Entries come in a stable order: children by name for a directory, request order for a batch
-of paths. Each page is sized so that the whole response fits in one 1 MiB line. If the
-directory changes between calls, re-request it from the start when `status.changed` says so.
+Cursors are opaque, non-empty strings: do not parse, build or change them. A cursor is bound
+to its request: used with a different directory or a different batch of paths, or altered
+in any way, it gets `invalid-params`. A cursor never goes stale because the directory
+changed.
+
+**Order.** A directory's children come in name order, comparing names as bytes (UTF-8), not
+in locale order; a client that wants another order sorts them itself. A batch of paths comes
+in request order.
+
+**Guarantee under change** (ADR-0020). While a directory is listed through a cursor loop:
+
+- An entry that exists, unchanged, for the whole cursor loop is delivered exactly once.
+- An entry added, removed or renamed during the loop may or may not appear. A subscribed
+  client learns of it from `status.changed`; a client that does not subscribe sees it on its
+  next listing.
+
+So a client that does not subscribe can rely on this: each listing it completes contains
+every entry that existed unchanged while it was listing, each once, and nothing it shows is
+more out of date than its most recent listing. To stay current it must list again; to be
+told of changes it must subscribe.
+
+**Large batches.** A batch of paths is paginated like a directory, but each request line is
+still limited to 1 MiB: a client with a very large batch splits it into several requests.
+
+A cursor loop in shell with `socat` and `jq`, printing every child of a directory:
+
+```sh
+sock="$XDG_RUNTIME_DIR/mydrive/daemon.sock"
+dir="$HOME/OneDrive/Pictures/2026"
+coproc DAEMON { socat - "UNIX-CONNECT:$sock"; }
+send() { printf '%s\n' "$1" >&"${DAEMON[1]}"; IFS= read -r reply <&"${DAEMON[0]}"; }
+
+send '{"jsonrpc":"2.0","id":0,"method":"hello","params":{"client_name":"example-sh","protocol_versions":[1]}}'
+cursor=null
+id=1
+while :; do
+  send "$(jq -cn --arg d "$dir" --argjson c "$cursor" --argjson id "$id" \
+    '{jsonrpc: "2.0", id: $id, method: "item.status",
+      params: ({directory: $d} + (if $c == null then {} else {cursor: $c} end))}')"
+  if printf '%s\n' "$reply" | jq -e 'has("error")' >/dev/null; then
+    printf '%s\n' "$reply" | jq -r '.error.message' >&2
+    exit 1
+  fi
+  printf '%s\n' "$reply" | jq -c '.result.entries[]'
+  cursor=$(printf '%s\n' "$reply" | jq -c '.result.next_cursor // null')
+  [ "$cursor" = null ] && break
+  id=$((id + 1))
+done
+```
+
+The same in Python:
+
+```python
+import json
+import os
+import socket
+
+
+def list_directory(path):
+    sock = socket.socket(socket.AF_UNIX)
+    sock.connect(os.path.join(os.environ["XDG_RUNTIME_DIR"], "mydrive", "daemon.sock"))
+    lines = sock.makefile("r", encoding="utf-8")
+    next_id = 0
+
+    def call(method, params):
+        nonlocal next_id
+        next_id += 1
+        request = {"jsonrpc": "2.0", "id": next_id, "method": method, "params": params}
+        sock.sendall((json.dumps(request) + "\n").encode())
+        reply = json.loads(lines.readline())  # one request in flight, so this is its reply
+        if "error" in reply:
+            raise RuntimeError(reply["error"]["message"])
+        return reply["result"]
+
+    call("hello", {"client_name": "example-py", "protocol_versions": [1]})
+    entries, cursor = [], None
+    while True:
+        params = {"directory": path}
+        if cursor:
+            params["cursor"] = cursor
+        result = call("item.status", params)
+        entries.extend(result["entries"])
+        cursor = result.get("next_cursor")
+        if not cursor:  # absent or null: the listing is complete
+            return entries
+```
 
 ## Methods
 
 | Method | Does |
 |---|---|
-| [`hello`](#hello) | Handshake: negotiate the protocol version |
+| [`hello`](#hello) | Handshake: negotiate the protocol version and learn the limits |
 | [`daemon.status`](#daemonstatus) | Daemon version and readiness |
 | [`account.list`](#accountlist) | Accounts and their sign-in state |
 | [`mount.list`](#mountlist) | Mounts and their state |
@@ -141,8 +232,17 @@ directory changes between calls, re-request it from the start when `status.chang
 ### hello
 
 Parameters: `client_name` (string, for logs) and `protocol_versions` (the major versions the
-client supports). Result: `protocol_version` (the chosen major) and `capabilities` (strings
-naming optional features; version 1 defines none, and clients ignore names they do not know).
+client supports). Result: `protocol_version` (the chosen major), `capabilities` (strings
+naming optional features; version 1 defines none, and clients ignore names they do not know)
+and `limits`:
+
+- `max_line_bytes`: the longest line in either direction, 1,048,576 in version 1;
+- `max_action_paths`: the most paths in one item action request, 100 in version 1;
+- `max_action_path_bytes`: the most bytes those paths may take together, each counted as a
+  JSON string with its quotes and escapes, 524,288 in version 1.
+
+An action request over a limit is refused with `invalid-params` and has no effect; the client
+splits it. New limits may be added as fields.
 
 <!-- example: request -->
 ```json
@@ -151,7 +251,7 @@ naming optional features; version 1 defines none, and clients ignore names they 
 
 <!-- example: response hello -->
 ```json
-{"jsonrpc": "2.0", "id": 1, "result": {"protocol_version": 1, "capabilities": []}}
+{"jsonrpc": "2.0", "id": 1, "result": {"protocol_version": 1, "capabilities": [], "limits": {"max_line_bytes": 1048576, "max_action_paths": 100, "max_action_path_bytes": 524288}}}
 ```
 
 No version in common:
@@ -225,10 +325,10 @@ Parameters: exactly one of
 
 - `paths`: a list of paths. The result's `entries` has one entry per path, in request order.
 - `directory`: one directory. The result's `directory` is the directory's own entry (repeated
-  on every page) and `entries` has one entry per child, in name order. Adapters fetch a folder
-  this way, with one [cursor loop](#pagination), and never ask once per file.
+  on every page) and `entries` has one entry per child, in byte order of name. Adapters fetch
+  a folder this way, with one [cursor loop](#pagination), and never ask once per file.
 
-and optionally `cursor`. The result carries `next_cursor` when more entries remain.
+and optionally `cursor`. The result carries `next_cursor` while more entries remain.
 
 Each entry has `path` and exactly one of `item` or `error`. `item` holds:
 
@@ -262,7 +362,8 @@ and never cause a download.
 ]}}
 ```
 
-A directory, first page:
+A directory, first page (real pages hold thousands of entries; this one is cut short to keep
+the example readable):
 
 <!-- example: request -->
 ```json
@@ -277,7 +378,7 @@ A directory, first page:
     {"path": "/home/user/OneDrive/Pictures/2026/IMG_2001.jpg", "item": {"status": "syncing", "modifiers": [], "hydration": "placeholder", "pin": "inherit", "effective_pin": "pinned", "sync": "pending-download"}},
     {"path": "/home/user/OneDrive/Pictures/2026/IMG_2002.jpg", "item": {"status": "pinned", "modifiers": [], "hydration": "full", "pin": "inherit", "effective_pin": "pinned", "sync": "in-sync"}}
   ],
-  "next_cursor": "2"
+  "next_cursor": "d1.c8ab48c736ffc35c4d7698ae57bb450d.494d475f323030322e6a7067"
 }}
 ```
 
@@ -286,7 +387,7 @@ The next page, with the same parameters and the cursor; it is the last page, so 
 
 <!-- example: request -->
 ```json
-{"jsonrpc": "2.0", "id": 7, "method": "item.status", "params": {"directory": "/home/user/OneDrive/Pictures/2026", "cursor": "2"}}
+{"jsonrpc": "2.0", "id": 7, "method": "item.status", "params": {"directory": "/home/user/OneDrive/Pictures/2026", "cursor": "d1.c8ab48c736ffc35c4d7698ae57bb450d.494d475f323030322e6a7067"}}
 ```
 
 <!-- example: response item.status -->
@@ -320,16 +421,21 @@ A directory outside every mount:
 
 ### Item actions
 
-`item.pin`, `item.unpin`, `item.hydrate` and `item.dehydrate` all take `paths` and return
-`entries`: one per requested path, in request order. Each entry has `path` and:
+`item.pin`, `item.unpin`, `item.hydrate` and `item.dehydrate` all take `paths`, at most
+`limits.max_action_paths` of them taking at most `limits.max_action_path_bytes`; a larger
+request is refused with `invalid-params` before anything is done. They return `entries`: one
+per requested path, in request order. Each entry has `path` and either:
 
-- `error`, when the action was not accepted for that path at all. A refused action changes
-  nothing for that path.
-- `skipped`, for a folder: descendants the action did not apply to, each with `path` and
-  `error`. Those descendants are unchanged.
-- `bytes_freed`, for `item.dehydrate`: the local bytes released.
-
-An entry without `error` was accepted.
+- `error` alone, when the action was not accepted for that path at all. A refused action
+  changes nothing for that path. An entry with `error` never has `skipped`.
+- or, when accepted, any of:
+  - `skipped_count`: the exact number of descendants of a folder the action did not apply
+    to. Present whenever anything was skipped.
+  - `skipped`: a **sample** of those descendants, each with `path` and `error`, holding as
+    many as fit in the line, possibly none. It is never complete by promise: use
+    `skipped_count` for the number, and list the folder with `item.status` for the full
+    picture. Skipped descendants are unchanged.
+  - `bytes_freed`, for `item.dehydrate`: the local bytes released.
 
 - `item.pin`: set the pin to `pinned`; the daemon hydrates the item (and, for a folder, its
   contents) and keeps it hydrated. Accepted when the pin is recorded; downloads happen in the
@@ -367,16 +473,20 @@ Refusals use code `refused` with `data.reason` (open): `not-in-sync` (with `data
 
 <!-- example: request -->
 ```json
-{"jsonrpc": "2.0", "id": 12, "method": "item.hydrate", "params": {"paths": ["/home/user/OneDrive/Documents/budget.xlsx", "/home/user/Example/Site - Documents/plan.docx"]}}
+{"jsonrpc": "2.0", "id": 12, "method": "item.hydrate", "params": {"paths": ["/home/user/OneDrive/Documents/budget.xlsx", "/home/user/Example/Site - Documents/plan.docx", "/home/user/Example/Archive/old.docx"]}}
 ```
 
 <!-- example: response item.hydrate -->
 ```json
 {"jsonrpc": "2.0", "id": 12, "result": {"entries": [
   {"path": "/home/user/OneDrive/Documents/budget.xlsx"},
-  {"path": "/home/user/Example/Site - Documents/plan.docx", "error": {"code": 1006, "message": "the organisation does not allow access from unmanaged devices"}}
+  {"path": "/home/user/Example/Site - Documents/plan.docx", "error": {"code": 1006, "message": "the organisation does not allow access from unmanaged devices", "data": {"reason": "organisation-policy"}}},
+  {"path": "/home/user/Example/Archive/old.docx", "error": {"code": 1008, "message": "cannot download while offline"}}
 ]}}
 ```
+
+Free up space on a folder of 7,000 files, 6,998 of them still uploading and one open: the
+sample shows two of the 6,999 skipped files.
 
 <!-- example: request -->
 ```json
@@ -386,9 +496,10 @@ Refusals use code `refused` with `data.reason` (open): `not-in-sync` (with `data
 <!-- example: response item.dehydrate -->
 ```json
 {"jsonrpc": "2.0", "id": 13, "result": {"entries": [
-  {"path": "/home/user/OneDrive/Videos/2025", "bytes_freed": 7340032000, "skipped": [
-    {"path": "/home/user/OneDrive/Videos/2025/edit.mp4", "error": {"code": 1004, "message": "dehydrate refused: the file is open", "data": {"reason": "in-use"}}}
-  ]},
+  {"path": "/home/user/OneDrive/Videos/2025", "skipped": [
+    {"path": "/home/user/OneDrive/Videos/2025/edit.mp4", "error": {"code": 1004, "message": "dehydrate refused: the file is open", "data": {"reason": "in-use"}}},
+    {"path": "/home/user/OneDrive/Videos/2025/clip-0001.mp4", "error": {"code": 1004, "message": "dehydrate refused: sync state is uploading, not in-sync", "data": {"reason": "not-in-sync", "sync": "uploading"}}}
+  ], "skipped_count": 6999, "bytes_freed": 734003200},
   {"path": "/home/user/OneDrive/Documents/notes.md", "error": {"code": 1004, "message": "dehydrate refused: sync state is pending-upload, not in-sync", "data": {"reason": "not-in-sync", "sync": "pending-upload"}}}
 ]}}
 ```
@@ -422,11 +533,13 @@ A notification (no `id`, no response) on a subscribed connection. Parameters:
 
 - `entries`: changed items, in the same shape as `item.status` entries, with each item's new
   state. An entry whose `error` is `unknown-path` means the item no longer exists.
-- `refresh`: directories whose listing changed too much to enumerate (for example a renamed
-  folder with many descendants). The client re-requests each one it is showing, from the
-  first page.
+- `refresh`: paths whose state changed too much to enumerate (for example a renamed folder
+  with many descendants). For each path in `refresh`, the client discards what it has cached
+  for that path and everything below it, and re-requests whatever of it the client is
+  showing, from the first page.
 
-Both are always present, possibly empty.
+Both are always present, possibly empty. One change too large for one line is split across
+several notifications, or replaced by a `refresh` of the paths concerned.
 
 <!-- example: notification -->
 ```json
@@ -441,26 +554,26 @@ Both are always present, possibly empty.
 
 ## Errors
 
-Errors are JSON-RPC error objects: `code` (integer), `message` (for people; it may change)
-and optional `data`. Programs act on `code` and `data`, never on `message`. The codes are
-stable: once released, a code never changes meaning. Codes are an open set: a client must
-handle a code it does not know as a failure and show its `message`. Clients must also
-tolerate a `data` of a shape they do not expect.
+Errors are JSON-RPC error objects: `code` (integer), `message` (for people; at most 1 KiB; it
+may change) and optional `data`. Programs act on `code` and `data`, never on `message`. The
+codes are stable: once released, a code never changes meaning. Codes are an open set: a
+client must handle a code it does not know as a failure and show its `message`. Clients must
+also tolerate a `data` of a shape they do not expect.
 
 | Code | Name | Meaning | `data` |
 |---|---|---|---|
 | -32700 | `parse-error` | The line was not UTF-8 or not one JSON document | |
 | -32600 | `invalid-request` | Not a valid JSON-RPC message (including a batch array); line over 1 MiB; second `hello`; request on a subscribed connection | |
 | -32601 | `method-not-found` | No such method in this version | |
-| -32602 | `invalid-params` | Parameters malformed, including any relative path, a foreign cursor, or a file given as `directory` | |
+| -32602 | `invalid-params` | Parameters malformed, including any relative path, a cursor not issued for these parameters, a file given as `directory`, or an action request over the `hello` limits | |
 | -32603 | `internal` | A daemon fault | |
 | 1001 | `not-ready` | The daemon is still starting; retry later | |
 | 1002 | `unknown-path` | Under a mount point, but no such item | |
 | 1003 | `not-in-a-mount` | Not under any mount point | |
 | 1004 | `refused` | Understood and refused; nothing changed | `reason`, and `sync` for `not-in-sync` |
 | 1005 | `needs-sign-in` | The account must sign in again | |
-| 1006 | `blocked-by-policy` | Organisation policy refuses access | |
-| 1007 | `read-only` | The item or its mount is read-only | |
+| 1006 | `blocked-by-policy` | Organisation policy refuses access | `reason` |
+| 1007 | `read-only` | The item or its mount is read-only | `reason` |
 | 1008 | `offline` | The request needs the server and the daemon is offline | |
 | 1009 | `unsupported-version` | `hello` offered no supported version | `supported_versions` |
 | 1010 | `hello-required` | A request other than `hello` before `hello` completed; a client bug, retrying does not help | |
@@ -507,15 +620,10 @@ The remaining codes, which also appear as per-path `error` objects inside result
 
 <!-- example: error -->
 ```json
-{"jsonrpc": "2.0", "id": 20, "error": {"code": 1007, "message": "/home/user/Example/Site - Documents is a read-only library"}}
+{"jsonrpc": "2.0", "id": 20, "error": {"code": 1007, "message": "/home/user/Example/Site - Documents is a read-only library", "data": {"reason": "library-read-only"}}}
 ```
 
 <!-- example: error -->
 ```json
-{"jsonrpc": "2.0", "id": 21, "error": {"code": 1008, "message": "cannot confirm the online copy while offline"}}
-```
-
-<!-- example: error -->
-```json
-{"jsonrpc": "2.0", "id": 22, "error": {"code": -32603, "message": "internal error while reading the state store"}}
+{"jsonrpc": "2.0", "id": 21, "error": {"code": -32603, "message": "internal error while reading the state store"}}
 ```

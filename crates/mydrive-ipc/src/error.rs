@@ -9,12 +9,12 @@
 
 use std::fmt;
 
-use mydrive_core::state::{DehydrateRefusal, Sync as SyncState};
+use mydrive_core::state::DehydrateRefusal;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::values::RefusalReason;
+use crate::values::{BlockedReason, ReadOnlyReason, RefusalReason, WireSync};
 
 /// Every error code this build defines, with its stable integer value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -131,17 +131,49 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// The longest human-readable `message` the daemon sends, in bytes (ADR-0020 "Every message
+/// is bounded").
+pub const MAX_MESSAGE_BYTES: usize = 1024;
+
+/// Truncates `message` to at most [`MAX_MESSAGE_BYTES`] bytes on a character boundary,
+/// marking a truncation with `…`.
+#[must_use]
+pub fn cap_message(message: &str) -> String {
+    truncate_to(message, MAX_MESSAGE_BYTES)
+}
+
+/// Truncates `text` to at most `max` bytes on a character boundary, ending a truncated text
+/// with `…` when there is room for it.
+pub(crate) fn truncate_to(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    const ELLIPSIS: &str = "…";
+    let room = if max >= ELLIPSIS.len() {
+        max - ELLIPSIS.len()
+    } else {
+        max
+    };
+    let mut end = room;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_owned();
+    if max >= ELLIPSIS.len() {
+        out.push_str(ELLIPSIS);
+    }
+    out
+}
+
 /// Structured detail for building `error.data`. Every field is optional.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorData {
-    /// For `refused`: why.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<RefusalReason>,
+    /// A reason code: a [`RefusalReason`] for `refused`, a [`BlockedReason`] for
+    /// `blocked-by-policy`, a [`ReadOnlyReason`] for `read-only` (ADR-0020).
+    pub reason: Option<String>,
     /// For `refused` with reason `not-in-sync`: the item's sync state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sync: Option<SyncState>,
+    pub sync: Option<WireSync>,
     /// For `unsupported-version`: the protocol major versions the daemon supports.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_versions: Option<Vec<u32>>,
 }
 
@@ -149,7 +181,7 @@ impl ErrorData {
     fn into_value(self) -> Option<Value> {
         let mut map = Map::new();
         if let Some(reason) = self.reason {
-            map.insert("reason".into(), Value::String(reason.as_str().to_owned()));
+            map.insert("reason".into(), Value::String(reason));
         }
         if let Some(sync) = self.sync {
             map.insert("sync".into(), Value::String(sync.as_str().to_owned()));
@@ -158,6 +190,13 @@ impl ErrorData {
             map.insert("supported_versions".into(), Value::from(versions));
         }
         (!map.is_empty()).then_some(Value::Object(map))
+    }
+
+    fn reason(reason: &str) -> Self {
+        Self {
+            reason: Some(reason.to_owned()),
+            ..Self::default()
+        }
     }
 }
 
@@ -169,22 +208,24 @@ impl ErrorData {
 pub struct RpcError {
     /// The integer code; see [`ErrorCode`].
     pub code: i64,
-    /// A human-readable description that says what failed and why.
+    /// A human-readable description that says what failed and why. Errors built here are
+    /// capped at [`MAX_MESSAGE_BYTES`].
     pub message: String,
-    /// Structured detail as received. Read it with [`RpcError::reason`],
-    /// [`RpcError::sync`] and [`RpcError::supported_versions`], which return `None` for a
-    /// missing or unexpected shape instead of failing.
+    /// Structured detail as received. Read it with the accessors ([`RpcError::reason_code`]
+    /// and the typed ones), which return `None` for a missing or unexpected shape instead of
+    /// failing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
 impl RpcError {
-    /// An error with a code and message and no data.
+    /// An error with a code and message and no data. The message is capped at
+    /// [`MAX_MESSAGE_BYTES`].
     #[must_use]
-    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+    pub fn new(code: ErrorCode, message: impl AsRef<str>) -> Self {
         Self {
             code: code.code(),
-            message: message.into(),
+            message: cap_message(message.as_ref()),
             data: None,
         }
     }
@@ -207,15 +248,39 @@ impl RpcError {
         T::deserialize(value).ok()
     }
 
-    /// `data.reason`, if present and a string.
+    /// `data.reason` as a raw code, if present and a string.
     #[must_use]
-    pub fn reason(&self) -> Option<RefusalReason> {
+    pub fn reason_code(&self) -> Option<String> {
         self.data_field("reason")
     }
 
-    /// `data.sync`, if present and a known sync state.
+    /// `data.reason` of a `refused` error.
     #[must_use]
-    pub fn sync(&self) -> Option<SyncState> {
+    pub fn refusal_reason(&self) -> Option<RefusalReason> {
+        (self.kind() == Some(ErrorCode::Refused))
+            .then(|| self.data_field("reason"))
+            .flatten()
+    }
+
+    /// `data.reason` of a `blocked-by-policy` error.
+    #[must_use]
+    pub fn blocked_reason(&self) -> Option<BlockedReason> {
+        (self.kind() == Some(ErrorCode::BlockedByPolicy))
+            .then(|| self.data_field("reason"))
+            .flatten()
+    }
+
+    /// `data.reason` of a `read-only` error.
+    #[must_use]
+    pub fn read_only_reason(&self) -> Option<ReadOnlyReason> {
+        (self.kind() == Some(ErrorCode::ReadOnly))
+            .then(|| self.data_field("reason"))
+            .flatten()
+    }
+
+    /// `data.sync`, if present and a string. Unknown sync values are kept (ADR-0020 R7).
+    #[must_use]
+    pub fn sync(&self) -> Option<WireSync> {
         self.data_field("sync")
     }
 
@@ -245,11 +310,20 @@ impl RpcError {
 
     /// `refused` with a reason.
     #[must_use]
-    pub fn refused(reason: RefusalReason, message: impl Into<String>) -> Self {
-        Self::new(ErrorCode::Refused, message).with_data(ErrorData {
-            reason: Some(reason),
-            ..ErrorData::default()
-        })
+    pub fn refused(reason: &RefusalReason, message: impl AsRef<str>) -> Self {
+        Self::new(ErrorCode::Refused, message).with_data(ErrorData::reason(reason.as_str()))
+    }
+
+    /// `blocked-by-policy` with a reason (ADR-0020).
+    #[must_use]
+    pub fn blocked_by_policy(reason: &BlockedReason, message: impl AsRef<str>) -> Self {
+        Self::new(ErrorCode::BlockedByPolicy, message).with_data(ErrorData::reason(reason.as_str()))
+    }
+
+    /// `read-only` with a reason (ADR-0020).
+    #[must_use]
+    pub fn read_only(reason: &ReadOnlyReason, message: impl AsRef<str>) -> Self {
+        Self::new(ErrorCode::ReadOnly, message).with_data(ErrorData::reason(reason.as_str()))
     }
 
     /// `unsupported-version`, listing the versions the daemon supports (ADR-0009 R4).
@@ -275,12 +349,12 @@ impl From<DehydrateRefusal> for RpcError {
         match refusal {
             DehydrateRefusal::NotInSync(sync) => {
                 Self::new(ErrorCode::Refused, message).with_data(ErrorData {
-                    reason: Some(RefusalReason::NotInSync),
-                    sync: Some(sync),
+                    reason: Some(RefusalReason::NotInSync.as_str().to_owned()),
+                    sync: Some(sync.into()),
                     ..ErrorData::default()
                 })
             }
-            DehydrateRefusal::Pinned => Self::refused(RefusalReason::Pinned, message),
+            DehydrateRefusal::Pinned => Self::refused(&RefusalReason::Pinned, message),
         }
     }
 }
@@ -292,6 +366,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use mydrive_core::state::Sync as SyncState;
 
     #[test]
     fn codes_and_names_are_unique_and_round_trip() {
@@ -337,10 +412,16 @@ mod tests {
     /// ADR-0019 R4: an unknown error code and an unknown reason parse and are preserved.
     #[test]
     fn unknown_codes_and_reasons_survive_parsing() {
-        let input = json!({"code":1999,"message":"new","data":{"reason":"brand-new","extra":1}});
+        let input = json!({"code":1004,"message":"new","data":{"reason":"brand-new","extra":1}});
+        let err: RpcError = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(
+            err.refusal_reason(),
+            Some(RefusalReason::Other("brand-new".into()))
+        );
+        assert_eq!(serde_json::to_value(&err).unwrap(), input);
+        let input = json!({"code":1999,"message":"new"});
         let err: RpcError = serde_json::from_value(input.clone()).unwrap();
         assert_eq!(err.kind(), None);
-        assert_eq!(err.reason(), Some(RefusalReason::Other("brand-new".into())));
         assert_eq!(serde_json::to_value(&err).unwrap(), input);
     }
 
@@ -350,11 +431,12 @@ mod tests {
         for data in [
             json!("text"),
             json!([1, 2]),
-            json!({"reason": 5, "sync": "melting", "supported_versions": "1"}),
+            json!({"reason": 5, "sync": 7, "supported_versions": "1"}),
         ] {
             let input = json!({"code": 1004, "message": "m", "data": data});
             let err: RpcError = serde_json::from_value(input.clone()).unwrap();
-            assert_eq!(err.reason(), None);
+            assert_eq!(err.refusal_reason(), None);
+            assert_eq!(err.reason_code(), None);
             assert_eq!(err.sync(), None);
             assert_eq!(err.supported_versions(), None);
             assert_eq!(serde_json::to_value(&err).unwrap(), input);
@@ -370,10 +452,53 @@ mod tests {
             err.data,
             Some(json!({"reason": "not-in-sync", "sync": "pending-upload"}))
         );
-        assert_eq!(err.reason(), Some(RefusalReason::NotInSync));
-        assert_eq!(err.sync(), Some(SyncState::PendingUpload));
+        assert_eq!(err.refusal_reason(), Some(RefusalReason::NotInSync));
+        assert_eq!(err.sync(), Some(WireSync::PendingUpload));
         let err = RpcError::from(DehydrateRefusal::Pinned);
-        assert_eq!(err.reason(), Some(RefusalReason::Pinned));
+        assert_eq!(err.refusal_reason(), Some(RefusalReason::Pinned));
+    }
+
+    /// ADR-0019 R6 (as extended by ADR-0020): `blocked-by-policy` and `read-only` carry a
+    /// reason code, read with the accessor for that code only.
+    #[test]
+    fn policy_and_read_only_errors_carry_reason_codes() {
+        let err = RpcError::blocked_by_policy(&BlockedReason::OrganisationPolicy, "no");
+        assert_eq!(err.code, 1006);
+        assert_eq!(
+            err.blocked_reason(),
+            Some(BlockedReason::OrganisationPolicy)
+        );
+        assert_eq!(err.refusal_reason(), None);
+        let err = RpcError::read_only(&ReadOnlyReason::LibraryReadOnly, "no");
+        assert_eq!(err.code, 1007);
+        assert_eq!(
+            err.read_only_reason(),
+            Some(ReadOnlyReason::LibraryReadOnly)
+        );
+        assert_eq!(err.data, Some(json!({"reason": "library-read-only"})));
+    }
+
+    /// ADR-0020 R4: messages are capped at 1 KiB on a character boundary.
+    #[test]
+    fn messages_are_capped_on_a_char_boundary() {
+        assert_eq!(cap_message("short"), "short");
+        let exact = "a".repeat(MAX_MESSAGE_BYTES);
+        assert_eq!(cap_message(&exact), exact);
+        for filler in ["a", "é", "€", "𝄞"] {
+            let long = filler.repeat(MAX_MESSAGE_BYTES + 1);
+            let capped = cap_message(&long);
+            assert!(capped.len() <= MAX_MESSAGE_BYTES, "{filler}");
+            assert!(capped.ends_with('…'));
+            assert!(
+                capped.len() > MAX_MESSAGE_BYTES - 8,
+                "{filler}: {}",
+                capped.len()
+            );
+        }
+        let err = RpcError::new(ErrorCode::Internal, "x".repeat(5_000));
+        assert!(err.message.len() <= MAX_MESSAGE_BYTES);
+        assert_eq!(truncate_to("abc", 0), "");
+        assert_eq!(truncate_to("abcdef", 2), "ab");
     }
 
     #[test]

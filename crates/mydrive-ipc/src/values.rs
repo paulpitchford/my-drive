@@ -4,13 +4,20 @@
 //! that keeps a value this build does not know, so a newer daemon never makes an older client
 //! fail a whole response (ADR-0019 R4). Code must therefore always have a fallback arm.
 //!
-//! The closed sets (hydration, pin, effective pin, sync and display status) are the
-//! `mydrive-core` types, which reject unknown values.
+//! The state axes are open on the wire only (ADR-0020): [`WireHydration`], [`WirePin`],
+//! [`WireEffectivePin`] and [`WireSync`] convert from the closed `mydrive-core` types the
+//! daemon uses internally. The display status is the only closed set; it is
+//! `mydrive_core::state::DisplayStatus`, which rejects unknown values (ADR-0020 R7).
+//!
+//! [`VALUE_SETS`] lists every enumerated wire field; a test checks it against the catalogue
+//! and against the types in this crate.
 
 use std::fmt;
 
 use mydrive_core::names;
-use mydrive_core::state::Modifiers as CoreModifiers;
+use mydrive_core::state::{
+    DisplayStatus, EffectivePin, Hydration, Modifiers as CoreModifiers, Pin, Sync as SyncState,
+};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -186,6 +193,93 @@ open_enum! {
 }
 
 open_enum! {
+    /// Why an item or mount is read-only (error code `read-only`). Open set.
+    pub enum ReadOnlyReason, kind = "read-only reason" {
+        /// The whole library is read-only for this account.
+        LibraryReadOnly => "library-read-only",
+        /// The account may read this item but not change it.
+        NoWritePermission => "no-write-permission",
+    }
+}
+
+/// Implements conversion between a closed `mydrive-core` axis and its open wire type.
+macro_rules! wire_axis {
+    ($wire:ident, $core:ty) => {
+        impl From<$core> for $wire {
+            fn from(value: $core) -> Self {
+                Self::from_wire(value.as_str())
+            }
+        }
+
+        impl $wire {
+            /// The `mydrive-core` value, or `None` for a value this build does not know.
+            #[must_use]
+            pub fn to_core(&self) -> Option<$core> {
+                self.as_str().parse().ok()
+            }
+        }
+    };
+}
+
+open_enum! {
+    /// Hydration axis on the wire. Open set (ADR-0020).
+    pub enum WireHydration, kind = "hydration state" {
+        /// Metadata only.
+        Placeholder => "placeholder",
+        /// Some byte ranges are local.
+        Partial => "partial",
+        /// All content is local.
+        Full => "full",
+    }
+}
+wire_axis!(WireHydration, Hydration);
+
+open_enum! {
+    /// Pin axis on the wire. Open set (ADR-0020).
+    pub enum WirePin, kind = "pin state" {
+        /// Take the nearest ancestor's value.
+        Inherit => "inherit",
+        /// Always keep on this device.
+        Pinned => "pinned",
+        /// May be dehydrated.
+        Unpinned => "unpinned",
+    }
+}
+wire_axis!(WirePin, Pin);
+
+open_enum! {
+    /// Effective pin on the wire. Open set (ADR-0020).
+    pub enum WireEffectivePin, kind = "effective pin" {
+        /// The item must stay hydrated.
+        Pinned => "pinned",
+        /// The item may be dehydrated.
+        Unpinned => "unpinned",
+    }
+}
+wire_axis!(WireEffectivePin, EffectivePin);
+
+open_enum! {
+    /// Sync axis on the wire. Open set (ADR-0020).
+    pub enum WireSync, kind = "sync state" {
+        /// Nothing pending.
+        InSync => "in-sync",
+        /// A download is scheduled.
+        PendingDownload => "pending-download",
+        /// Local changes not yet on the server.
+        PendingUpload => "pending-upload",
+        /// An upload is in flight.
+        Uploading => "uploading",
+        /// Local and remote changes collided.
+        Conflict => "conflict",
+        /// A permanent failure needs attention.
+        Error => "error",
+        /// Organisation policy refuses access.
+        Blocked => "blocked",
+    }
+}
+wire_axis!(WireSync, SyncState);
+
+open_enum! {
     /// One indicator that can accompany any display status. Open set.
     pub enum Modifier, kind = "modifier" {
         /// The item or its mount is read-only (lock).
@@ -228,6 +322,114 @@ impl WireModifiers {
     }
 }
 
+/// One enumerated wire field set, as listed in the catalogue's "Value sets" table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueSet {
+    /// The catalogue rows (fields) that use this set.
+    pub fields: &'static [&'static str],
+    /// The Rust type that carries it on the wire.
+    pub type_name: &'static str,
+    /// Whether values may be added within a major version.
+    pub open: bool,
+    /// The values this build knows, when the set is a fixed list of strings.
+    pub known: Option<&'static [&'static str]>,
+}
+
+/// Every enumerated field in the protocol (ADR-0019 R7). A test checks this list against the
+/// catalogue in both directions and against every enumerated wire type in this crate.
+pub const VALUE_SETS: &[ValueSet] = &[
+    ValueSet {
+        fields: &["item.status"],
+        type_name: "DisplayStatus",
+        open: false,
+        known: Some(DisplayStatus::WIRE_FORMS),
+    },
+    ValueSet {
+        fields: &["item.hydration"],
+        type_name: "WireHydration",
+        open: true,
+        known: Some(WireHydration::KNOWN),
+    },
+    ValueSet {
+        fields: &["item.pin"],
+        type_name: "WirePin",
+        open: true,
+        known: Some(WirePin::KNOWN),
+    },
+    ValueSet {
+        fields: &["item.effective_pin"],
+        type_name: "WireEffectivePin",
+        open: true,
+        known: Some(WireEffectivePin::KNOWN),
+    },
+    ValueSet {
+        fields: &["item.sync", "refused.data.sync"],
+        type_name: "WireSync",
+        open: true,
+        known: Some(WireSync::KNOWN),
+    },
+    ValueSet {
+        fields: &["item.modifiers"],
+        type_name: "Modifier",
+        open: true,
+        known: Some(Modifier::KNOWN),
+    },
+    ValueSet {
+        fields: &["item.reason"],
+        type_name: "ItemReason",
+        open: true,
+        known: Some(ItemReason::KNOWN),
+    },
+    ValueSet {
+        fields: &["mount.state"],
+        type_name: "MountState",
+        open: true,
+        known: Some(MountState::KNOWN),
+    },
+    ValueSet {
+        fields: &["mount.blocked_reason", "blocked-by-policy.data.reason"],
+        type_name: "BlockedReason",
+        open: true,
+        known: Some(BlockedReason::KNOWN),
+    },
+    ValueSet {
+        fields: &["account.state"],
+        type_name: "AccountState",
+        open: true,
+        known: Some(AccountState::KNOWN),
+    },
+    ValueSet {
+        fields: &["account.kind"],
+        type_name: "AccountKind",
+        open: true,
+        known: Some(AccountKind::KNOWN),
+    },
+    ValueSet {
+        fields: &["refused.data.reason"],
+        type_name: "RefusalReason",
+        open: true,
+        known: Some(RefusalReason::KNOWN),
+    },
+    ValueSet {
+        fields: &["read-only.data.reason"],
+        type_name: "ReadOnlyReason",
+        open: true,
+        known: Some(ReadOnlyReason::KNOWN),
+    },
+    ValueSet {
+        fields: &["error.code"],
+        type_name: "i64",
+        open: true,
+        known: None,
+    },
+    ValueSet {
+        fields: &["hello.capabilities"],
+        type_name: "String",
+        open: true,
+        known: None,
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use serde::de::DeserializeOwned;
@@ -242,6 +444,28 @@ mod tests {
         assert_eq!(serde_json::to_string(&v).unwrap(), "\"from-the-future\"");
     }
 
+    /// ADR-0020 R7: the wire axes convert from core both ways and keep unknown values; the
+    /// display status rejects one.
+    #[test]
+    fn axes_are_open_on_the_wire_and_display_status_is_closed() {
+        for &h in Hydration::ALL {
+            assert_eq!(WireHydration::from(h).to_core(), Some(h));
+        }
+        for &p in Pin::ALL {
+            assert_eq!(WirePin::from(p).to_core(), Some(p));
+        }
+        for &p in EffectivePin::ALL {
+            assert_eq!(WireEffectivePin::from(p).to_core(), Some(p));
+        }
+        for &s in SyncState::ALL {
+            assert_eq!(WireSync::from(s).to_core(), Some(s));
+        }
+        let unknown: WireSync = serde_json::from_str("\"paused-upload\"").unwrap();
+        assert_eq!(unknown, WireSync::Other("paused-upload".into()));
+        assert_eq!(unknown.to_core(), None);
+        assert!(serde_json::from_str::<DisplayStatus>("\"sparkly\"").is_err());
+    }
+
     /// ADR-0019 R4: every open set accepts and preserves an unknown value.
     #[test]
     fn open_sets_preserve_unknown_values() {
@@ -252,6 +476,11 @@ mod tests {
         open_round_trip::<RefusalReason>();
         open_round_trip::<ItemReason>();
         open_round_trip::<Modifier>();
+        open_round_trip::<ReadOnlyReason>();
+        open_round_trip::<WireHydration>();
+        open_round_trip::<WirePin>();
+        open_round_trip::<WireEffectivePin>();
+        open_round_trip::<WireSync>();
         assert_eq!(
             MountState::from_wire("frozen"),
             MountState::Other("frozen".into())

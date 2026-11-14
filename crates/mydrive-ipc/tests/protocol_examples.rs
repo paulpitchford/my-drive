@@ -1,13 +1,11 @@
 //! WP-005 AC1: every example in `docs/protocol/README.md` parses into the matching type and
 //! serialises back to equivalent JSON. Also checks that the catalogue and the code agree on
-//! the methods, error codes and value sets (ADR-0009 R9, ADR-0019 R7).
+//! the methods, error codes and value sets (ADR-0009 R9, ADR-0019 R7, ADR-0020 R7, R8).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use mydrive_core::state::{
-    DisplayStatus, EffectivePin, Hydration, Pin, Sync as SyncState, display_status, effective_pin,
-};
+use mydrive_core::state::{EffectivePin, Pin, display_status, effective_pin};
 use mydrive_ipc::envelope::{ErrorResponse, Message, Notification, Request, SuccessResponse};
 use mydrive_ipc::error::{ErrorCode, RpcError};
 use mydrive_ipc::methods::{
@@ -16,9 +14,7 @@ use mydrive_ipc::methods::{
     MountListResult, NoParams, StatusChangedParams, StatusSubscribeParams, StatusSubscribeResult,
     method,
 };
-use mydrive_ipc::values::{
-    AccountKind, AccountState, BlockedReason, ItemReason, Modifier, MountState, RefusalReason,
-};
+use mydrive_ipc::values::{BlockedReason, ReadOnlyReason, RefusalReason, VALUE_SETS};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -32,23 +28,40 @@ struct Example {
 }
 
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
-fn catalogue_text() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/protocol/README.md");
-    std::fs::read_to_string(&path).expect("read docs/protocol/README.md")
+fn crate_file(relative: &str) -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The labelled examples. Fails if any ```json block is not directly preceded by a label.
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
-fn catalogue() -> Vec<Example> {
-    let text = catalogue_text();
+fn catalogue_text() -> String {
+    crate_file("../../docs/protocol/README.md")
+}
+
+/// Whether a line opens a fenced block tagged as JSON, in any fence style or case.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn is_json_fence(line: &str) -> bool {
+    let t = line.trim().to_ascii_lowercase();
+    ["```", "~~~"].iter().any(|fence| {
+        t.strip_prefix(fence)
+            .is_some_and(|rest| rest.trim().starts_with("json"))
+    })
+}
+
+/// The labelled examples. Fails if any JSON block is not directly preceded by a label, or a
+/// label is not followed by exactly "```json".
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn parse_examples(text: &str) -> Vec<Example> {
     let lines: Vec<&str> = text.lines().collect();
     let mut examples = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i].trim();
-        if line.starts_with("```json") {
-            panic!("line {}: ```json block without an example label", i + 1);
-        }
+        assert!(
+            !is_json_fence(line),
+            "line {}: JSON block without an example label",
+            i + 1
+        );
         let Some(label) = line
             .strip_prefix("<!-- example:")
             .and_then(|rest| rest.strip_suffix("-->"))
@@ -79,6 +92,35 @@ fn catalogue() -> Vec<Example> {
         i = j + 1;
     }
     examples
+}
+
+/// The method names in the Methods section's tables. Every table row there must link.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn method_table_names(text: &str) -> BTreeSet<String> {
+    let section = text
+        .split("\n## Methods")
+        .nth(1)
+        .and_then(|s| s.split("\n### ").next())
+        .expect("a Methods section");
+    let mut names = BTreeSet::new();
+    for line in section.lines().filter(|l| l.starts_with('|')) {
+        let first = line.split('|').nth(1).unwrap_or("").trim();
+        if first == "Method" || first == "Notification" || first.starts_with("---") {
+            continue;
+        }
+        let name = first
+            .strip_prefix("[`")
+            .and_then(|rest| rest.split_once("`]("))
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| panic!("method table row without a link: {line}"));
+        names.insert(name.to_owned());
+    }
+    names
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn catalogue() -> Vec<Example> {
+    parse_examples(&catalogue_text())
 }
 
 /// Decodes `value` as `T` and serialises it back.
@@ -128,6 +170,61 @@ fn result_round_trip(method_name: &str, result: &Value, what: &str) -> Value {
     }
 }
 
+/// The typed reading of an example: what the Rust types make of it, re-serialised.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn typed_reading(label: &str, value: &Value, what: &str) -> Value {
+    let message = Message::from_value(value.clone())
+        .unwrap_or_else(|e| panic!("{what}: not a JSON-RPC message: {e}"));
+    let mut words = label.split_whitespace();
+    match (words.next(), words.next(), message) {
+        (Some("request"), None, Message::Request(req)) => {
+            let call = MethodCall::from_request(&req)
+                .unwrap_or_else(|e| panic!("{what}: request rejected: {e}"));
+            json!({
+                "id": req.id,
+                "method": call.method(),
+                "params": params_round_trip(&req.method, req.params.as_ref(), what),
+            })
+        }
+        (Some("request"), Some("rejected"), Message::Request(req)) => {
+            let err = MethodCall::from_request(&req)
+                .err()
+                .unwrap_or_else(|| panic!("{what}: request was accepted"));
+            json!({"id": req.id, "rejected": err.code})
+        }
+        (Some("response"), Some(method_name), Message::Success(resp)) => {
+            json!({"id": resp.id, "result": result_round_trip(method_name, &resp.result, what)})
+        }
+        (Some("error"), None, Message::Error(resp)) => serde_json::to_value(resp).unwrap(),
+        (Some("notification"), None, Message::Notification(note)) => {
+            let params = note.params.unwrap_or(Value::Null);
+            json!({
+                "method": note.method,
+                "params": round_trip::<StatusChangedParams>(&params, what),
+            })
+        }
+        (_, _, other) => panic!("{what}: label does not match message {other:?}"),
+    }
+}
+
+/// Adds an unknown field to every object in `value`, except inside error `data`, which is
+/// kept as raw JSON by design.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn inject_unknown_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key != "data" {
+                    inject_unknown_fields(child);
+                }
+            }
+            map.insert("zz_unknown_field".into(), json!({"nested": [1, "x"]}));
+        }
+        Value::Array(items) => items.iter_mut().for_each(inject_unknown_fields),
+        _ => {}
+    }
+}
+
 /// Walks `value`, collecting error codes and checking every item's display status.
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
 fn inspect(value: &Value, codes: &mut BTreeSet<i64>, items: &mut usize, what: &str) {
@@ -137,6 +234,7 @@ fn inspect(value: &Value, codes: &mut BTreeSet<i64>, items: &mut usize, what: &s
                 let error: RpcError = serde_json::from_value(value.clone()).expect("error object");
                 assert_eq!(&serde_json::to_value(&error).unwrap(), value, "{what}");
                 codes.insert(code.as_i64().expect("integer code"));
+                check_reason_codes(&error, what);
             }
             if map.contains_key("effective_pin") {
                 let info: ItemInfo = serde_json::from_value(value.clone())
@@ -151,22 +249,47 @@ fn inspect(value: &Value, codes: &mut BTreeSet<i64>, items: &mut usize, what: &s
     }
 }
 
+/// ADR-0019 R6 and ADR-0020: refusals, policy blocks and read-only errors carry a known
+/// reason code in every example.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn check_reason_codes(error: &RpcError, what: &str) {
+    let known =
+        |reason: Option<String>, set: &[&str]| reason.is_some_and(|r| set.contains(&r.as_str()));
+    match error.kind() {
+        Some(ErrorCode::Refused) => {
+            assert!(known(error.reason_code(), RefusalReason::KNOWN), "{what}");
+        }
+        Some(ErrorCode::BlockedByPolicy) => {
+            assert!(known(error.reason_code(), BlockedReason::KNOWN), "{what}");
+        }
+        Some(ErrorCode::ReadOnly) => {
+            assert!(known(error.reason_code(), ReadOnlyReason::KNOWN), "{what}");
+        }
+        _ => {}
+    }
+}
+
 /// The example's display status and effective pin are what `mydrive-core` derives from its
 /// axes.
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
 fn assert_status_consistent(info: &ItemInfo, what: &str) {
-    let inherited = match info.effective_pin {
-        EffectivePin::Pinned => Pin::Pinned,
-        EffectivePin::Unpinned => Pin::Unpinned,
+    let state = info
+        .state()
+        .unwrap_or_else(|| panic!("{what}: examples use known axis values"));
+    let inherited = match info.effective_pin.to_core() {
+        Some(EffectivePin::Pinned) => Pin::Pinned,
+        Some(EffectivePin::Unpinned) => Pin::Unpinned,
+        None => panic!("{what}: examples use known effective pins"),
     };
-    let effective = effective_pin(info.pin, [inherited]);
+    let effective = effective_pin(state.pin, [inherited]);
     assert_eq!(
-        info.effective_pin, effective,
+        info.effective_pin,
+        effective.into(),
         "{what}: effective_pin contradicts pin"
     );
     assert_eq!(
         info.status,
-        display_status(&info.state(), effective),
+        display_status(&state, effective),
         "{what}: status is not the one derived from the axes"
     );
 }
@@ -272,19 +395,34 @@ fn every_catalogue_example_round_trips() {
     assert!(items >= 8, "only {items} item states in the examples");
 }
 
+/// ADR-0009 R5, WP-005 AC5: unknown fields are ignored by every wire type. Each example is
+/// re-read with an unknown field added to every object at every level; the types must read
+/// exactly what they read without it.
+#[test]
+fn unknown_fields_at_every_level_are_ignored() {
+    for example in catalogue() {
+        let what = format!("example at line {} ({})", example.line, example.label);
+        let plain = typed_reading(&example.label, &example.value, &what);
+        let mut injected = example.value.clone();
+        inject_unknown_fields(&mut injected);
+        assert_ne!(injected, example.value);
+        let with_unknown = typed_reading(&example.label, &injected, &format!("{what}, injected"));
+        assert_eq!(
+            with_unknown, plain,
+            "{what}: an unknown field changed the reading"
+        );
+    }
+}
+
 /// ADR-0009 R9: the method tables and the error table name exactly what the code has.
 #[test]
 fn catalogue_tables_match_the_code() {
     let text = catalogue_text();
-    let documented: BTreeSet<&str> = text
-        .lines()
-        .filter_map(|l| l.strip_prefix("| [`"))
-        .filter_map(|l| l.split('`').next())
-        .collect();
-    let code: BTreeSet<&str> = method::ALL
+    let documented = method_table_names(&text);
+    let code: BTreeSet<String> = method::ALL
         .iter()
         .chain(method::NOTIFICATIONS)
-        .copied()
+        .map(|m| (*m).to_owned())
         .collect();
     assert_eq!(documented, code, "method tables differ from the code");
 
@@ -303,10 +441,48 @@ fn catalogue_tables_match_the_code() {
     assert_eq!(rows, table, "error table differs from the code");
 }
 
+/// The catalogue parser itself rejects the shapes that would let an example escape the test.
+#[test]
+fn catalogue_parser_rejects_unchecked_blocks_and_rows() {
+    for fence in ["```json", "~~~json", "```JSON", "~~~ JSON", "  ```Json  "] {
+        let text = format!("intro\n{fence}\n{{}}\n```\n");
+        let result = std::panic::catch_unwind(|| parse_examples(&text));
+        assert!(result.is_err(), "unlabelled {fence:?} block was accepted");
+    }
+    let labelled = "<!-- example: error -->\n~~~json\n{}\n~~~\n";
+    assert!(std::panic::catch_unwind(|| parse_examples(labelled)).is_err());
+    let ok = "<!-- example: error -->\n```json\n{}\n```\n";
+    assert_eq!(parse_examples(ok).len(), 1);
+
+    let unlinked = "\n## Methods\n\n| Method | Does |\n|---|---|\n| `hello` | x |\n\n### hello\n";
+    assert!(std::panic::catch_unwind(|| method_table_names(unlinked)).is_err());
+    let linked =
+        "\n## Methods\n\n| Method | Does |\n|---|---|\n| [`hello`](#hello) | x |\n\n### x\n";
+    assert_eq!(
+        method_table_names(linked),
+        BTreeSet::from(["hello".to_owned()])
+    );
+}
+
+/// ADR-0020 R8: the catalogue says `refresh` covers each listed path and everything below.
+#[test]
+fn refresh_is_documented_as_covering_the_subtree() {
+    let text = catalogue_text();
+    let section = text
+        .split("\n### status.changed")
+        .nth(1)
+        .and_then(|s| s.split("\n## ").next())
+        .expect("a status.changed section");
+    assert!(
+        section.contains("that path and everything below it"),
+        "status.changed must say refresh covers the whole subtree"
+    );
+}
+
 const UNKNOWN: &str = "zz-unknown-value";
 
-/// Sets `field` of `base` to the unknown value and reports whether the containing type still
-/// parses and keeps the value (open), or fails (closed).
+/// Sets `field` of `base` to `value` and reports whether the containing type still parses
+/// and keeps the value (open), or fails (closed).
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
 fn probe<T: DeserializeOwned + Serialize>(mut base: Value, field: &str, value: Value) -> bool {
     base[field] = value.clone();
@@ -323,6 +499,12 @@ fn probe<T: DeserializeOwned + Serialize>(mut base: Value, field: &str, value: V
     }
 }
 
+/// An error with `data` set, parsed, for the `*.data.*` probes.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn error_with(code: ErrorCode, data: Value) -> RpcError {
+    serde_json::from_value(json!({"code": code.code(), "message": "m", "data": data})).unwrap()
+}
+
 /// Whether the type behind a catalogue value-set row accepts and preserves an unknown value.
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
 fn accepts_unknown(field: &str) -> bool {
@@ -336,6 +518,7 @@ fn accepts_unknown(field: &str) -> bool {
     });
     let account = json!({"account_id": "a", "kind": "personal", "state": "signed-in"});
     let unknown = Value::String(UNKNOWN.into());
+    let reason = json!({"reason": UNKNOWN});
     match field {
         "item.status" | "item.hydration" | "item.pin" | "item.effective_pin" | "item.sync"
         | "item.reason" => {
@@ -354,41 +537,97 @@ fn accepts_unknown(field: &str) -> bool {
                 serde_json::from_value(json!({"code": 4242, "message": "m"})).unwrap();
             err.kind().is_none() && err.code == 4242
         }
-        "error.data.reason" => {
-            let err: RpcError = serde_json::from_value(
-                json!({"code": 1004, "message": "m", "data": {"reason": UNKNOWN}}),
-            )
-            .unwrap();
-            err.reason() == Some(RefusalReason::Other(UNKNOWN.into()))
+        "refused.data.reason" => {
+            error_with(ErrorCode::Refused, reason).refusal_reason()
+                == Some(RefusalReason::Other(UNKNOWN.into()))
         }
-        "error.data.sync" => {
-            let err: RpcError = serde_json::from_value(
-                json!({"code": 1004, "message": "m", "data": {"sync": UNKNOWN}}),
-            )
-            .unwrap();
-            err.sync().is_some()
+        "blocked-by-policy.data.reason" => {
+            error_with(ErrorCode::BlockedByPolicy, reason).blocked_reason()
+                == Some(BlockedReason::Other(UNKNOWN.into()))
         }
+        "read-only.data.reason" => {
+            error_with(ErrorCode::ReadOnly, reason).read_only_reason()
+                == Some(ReadOnlyReason::Other(UNKNOWN.into()))
+        }
+        "refused.data.sync" => error_with(ErrorCode::Refused, json!({"sync": UNKNOWN}))
+            .sync()
+            .is_some_and(|s| s.as_str() == UNKNOWN),
         "hello.capabilities" => probe::<HelloResult>(
-            json!({"protocol_version": 1, "capabilities": []}),
+            json!({"protocol_version": 1, "capabilities": [],
+                   "limits": {"max_line_bytes": 1, "max_action_paths": 1,
+                              "max_action_path_bytes": 1}}),
             "capabilities",
             json!([UNKNOWN]),
         ),
-        other => panic!("value-set row {other:?} has no probe; add one"),
+        other => panic!("value-set field {other:?} has no probe; add one"),
     }
 }
 
-/// ADR-0019 R7 (and R4): every enumerated field is marked closed or open in the catalogue,
-/// and the marking matches the types: open types accept and keep an unknown value, closed
-/// types reject it.
+/// Every enumerated type in this crate's sources: the `open_enum!` invocations and any enum
+/// deriving serde. Envelope enums that are not value sets are excluded by name.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn enumerated_wire_types() -> BTreeSet<String> {
+    const NOT_VALUE_SETS: &[&str] = &["Id", "Message"];
+    let mut found = BTreeSet::new();
+    for file in [
+        "codec.rs",
+        "envelope.rs",
+        "error.rs",
+        "methods.rs",
+        "paging.rs",
+        "path.rs",
+        "values.rs",
+        "lib.rs",
+    ] {
+        let source = crate_file(&format!("src/{file}"));
+        let lines: Vec<&str> = source.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("pub enum ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let macro_form = rest[name.len()..].trim_start().starts_with(", kind =");
+            let serde_derive = lines[i.saturating_sub(4)..i]
+                .iter()
+                .any(|l| l.contains("derive(") && l.contains("Serialize"));
+            if (macro_form || serde_derive) && !NOT_VALUE_SETS.contains(&name.as_str()) {
+                found.insert(name);
+            }
+        }
+    }
+    found
+}
+
+/// ADR-0019 R7, ADR-0020 R7: every enumerated field is marked closed or open in the
+/// catalogue, the marking matches the types, and the list cannot drift: every enumerated
+/// wire type is registered in `VALUE_SETS`, and every registered field has a catalogue row,
+/// in both directions.
 #[test]
 fn value_set_marking_matches_the_types() {
+    // Every enumerated wire type in the sources is registered, and every registered enum
+    // type exists (`DisplayStatus` comes from mydrive-core; i64 and String are not enums).
+    let in_sources = enumerated_wire_types();
+    let registered: BTreeSet<String> = VALUE_SETS
+        .iter()
+        .map(|s| s.type_name.to_owned())
+        .filter(|t| !["DisplayStatus", "i64", "String"].contains(&t.as_str()))
+        .collect();
+    assert_eq!(
+        in_sources, registered,
+        "enumerated wire types and VALUE_SETS differ; register the type and add a catalogue row"
+    );
+
     let text = catalogue_text();
     let section = text
         .split("## Value sets")
         .nth(1)
         .and_then(|s| s.split("\n## ").next())
         .expect("a Value sets section");
-    let mut marked = BTreeSet::new();
+    let mut rows = BTreeSet::new();
     for line in section.lines() {
         let cells: Vec<&str> = line.split('|').map(str::trim).collect();
         let (Some(field), Some(set)) = (cells.get(1), cells.get(2)) else {
@@ -402,6 +641,19 @@ fn value_set_marking_matches_the_types() {
             "closed" => false,
             other => panic!("{field}: set must be open or closed, not {other:?}"),
         };
+        let registered = VALUE_SETS
+            .iter()
+            .find(|s| s.fields.contains(&field))
+            .unwrap_or_else(|| panic!("catalogue row {field} is not in VALUE_SETS"));
+        assert_eq!(
+            open, registered.open,
+            "{field}: catalogue and VALUE_SETS disagree"
+        );
+        assert_eq!(
+            accepts_unknown(field),
+            open,
+            "{field} is marked {set} but its type disagrees"
+        );
         if open {
             let fallback = cells.get(4).copied().unwrap_or("");
             assert!(
@@ -409,67 +661,39 @@ fn value_set_marking_matches_the_types() {
                 "{field}: open set without a client fallback"
             );
         }
-        assert_eq!(
-            accepts_unknown(field),
-            open,
-            "{field} is marked {set} but its type disagrees"
-        );
-        marked.insert(field.to_owned());
+        if let Some(known) = registered.known {
+            let listed: BTreeSet<String> = cells
+                .get(3)
+                .copied()
+                .unwrap_or("")
+                .split(',')
+                .map(|v| v.trim().trim_matches('`').to_owned())
+                .filter(|v| !v.is_empty())
+                .collect();
+            let expected: BTreeSet<String> = known.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(
+                listed, expected,
+                "{field}: listed values differ from the type"
+            );
+        }
+        assert!(rows.insert(field.to_owned()), "{field} is listed twice");
     }
-    let expected: BTreeSet<String> = [
-        "item.status",
-        "item.hydration",
-        "item.pin",
-        "item.effective_pin",
-        "item.sync",
-        "item.modifiers",
-        "item.reason",
-        "mount.state",
-        "mount.blocked_reason",
-        "account.state",
-        "account.kind",
-        "error.code",
-        "error.data.reason",
-        "error.data.sync",
-        "hello.capabilities",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    assert_eq!(marked, expected, "every enumerated field is marked once");
-
-    // The closed sets' listed values are exactly the core wire forms.
-    let values_of = |field: &str| -> BTreeSet<String> {
-        section
-            .lines()
-            .find(|l| l.starts_with(&format!("| `{field}` |")))
-            .and_then(|l| l.split('|').nth(3))
-            .map(|cell| {
-                cell.split(',')
-                    .map(|v| v.trim().trim_matches('`').to_owned())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let wire =
-        |forms: &[&str]| -> BTreeSet<String> { forms.iter().map(|s| (*s).to_owned()).collect() };
-    assert_eq!(values_of("item.status"), wire(DisplayStatus::WIRE_FORMS));
-    assert_eq!(values_of("item.hydration"), wire(Hydration::WIRE_FORMS));
-    assert_eq!(values_of("item.pin"), wire(Pin::WIRE_FORMS));
+    let fields: BTreeSet<String> = VALUE_SETS
+        .iter()
+        .flat_map(|s| s.fields.iter().map(|f| (*f).to_owned()))
+        .collect();
     assert_eq!(
-        values_of("item.effective_pin"),
-        wire(EffectivePin::WIRE_FORMS)
+        rows, fields,
+        "every registered field has exactly one catalogue row"
     );
-    assert_eq!(values_of("item.sync"), wire(SyncState::WIRE_FORMS));
-    // The open sets' listed values are exactly the ones this build knows.
-    assert_eq!(values_of("item.modifiers"), wire(Modifier::KNOWN));
-    assert_eq!(values_of("item.reason"), wire(ItemReason::KNOWN));
-    assert_eq!(values_of("mount.state"), wire(MountState::KNOWN));
+    let closed: Vec<&str> = VALUE_SETS
+        .iter()
+        .filter(|s| !s.open)
+        .map(|s| s.type_name)
+        .collect();
     assert_eq!(
-        values_of("mount.blocked_reason"),
-        wire(BlockedReason::KNOWN)
+        closed,
+        ["DisplayStatus"],
+        "ADR-0020: only the display status is closed"
     );
-    assert_eq!(values_of("account.state"), wire(AccountState::KNOWN));
-    assert_eq!(values_of("account.kind"), wire(AccountKind::KNOWN));
-    assert_eq!(values_of("error.data.reason"), wire(RefusalReason::KNOWN));
 }

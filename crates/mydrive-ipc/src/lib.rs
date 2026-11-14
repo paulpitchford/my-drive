@@ -7,7 +7,8 @@
 //! - [`codec`]: one message per line, at most 1 MiB, robust to any read boundaries.
 //! - [`methods`]: the version 1 catalogue, the `hello` negotiation and per-connection
 //!   gatekeeping.
-//! - [`paging`]: splitting `item.status` results into pages that fit one line (ADR-0019).
+//! - [`paging`]: keyset-cursor pages of `item.status`, and action results and change
+//!   notifications that each fit one line (ADR-0020).
 //! - [`values`]: the open value sets (ADR-0019).
 //! - [`error`]: the error object and the stable error-code table.
 //! - [`path`]: absolute protocol paths.
