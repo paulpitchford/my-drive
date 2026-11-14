@@ -307,8 +307,15 @@ impl DeltaEntry {
 /// [`GraphClient::delta_from_link`](crate::client::GraphClient::delta_from_link) later.
 /// The client sends the bearer token with it only if it points at the client's own Graph
 /// base URL. A delta link carries a change token, not a credential.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DeltaLink(String);
+
+impl fmt::Debug for DeltaLink {
+    // Server-supplied: shown reduced, like every server string in `Debug` output.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DeltaLink({})", shown(&self.0))
+    }
+}
 
 impl DeltaLink {
     /// Wraps a link, for example one read back from the store.
@@ -365,9 +372,28 @@ impl DeltaPage {
     }
 }
 
+/// The longest form of a server-supplied identifier or link shown in an error message or
+/// `Debug` output, in characters.
+pub const MAX_SHOWN_LEN: usize = 128;
+
+/// A server-supplied string as it may appear in an error message, a log line or `Debug`
+/// output: printable ASCII only (control characters, escape sequences and non-ASCII
+/// dropped), at most [`MAX_SHOWN_LEN`] characters, with `...` marking a cut. The value
+/// itself stays available as data; only its shown form is reduced.
+#[must_use]
+pub fn shown(text: &str) -> String {
+    let mut kept = text.chars().filter(char::is_ascii_graphic);
+    let mut out: String = kept.by_ref().take(MAX_SHOWN_LEN).collect();
+    if kept.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Why a response body could not be turned into a model value. Messages name fields and
-/// fixed problems only.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// fixed problems only; an item ID is shown only in its [`shown`] form, and `Debug`
+/// prints the same text as `Display`, so neither repeats raw server text.
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
     /// The body is not JSON of the expected shape.
     #[error("the body is not the expected JSON: {0}")]
@@ -379,9 +405,9 @@ pub enum ModelError {
         field: &'static str,
     },
     /// An item has an ID but cannot be used.
-    #[error("item {id} cannot be used: {reason}")]
+    #[error("item {} cannot be used: {reason}", shown(id.as_str()))]
     Item {
-        /// The item.
+        /// The item, exactly as received (shown only in [`shown`] form).
         id: ItemId,
         /// Why: a field name and a fixed problem.
         reason: String,
@@ -390,6 +416,12 @@ pub enum ModelError {
     /// that is not a string.
     #[error("the delta page carries {0}")]
     Continuation(&'static str),
+}
+
+impl fmt::Debug for ModelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ModelError({self})")
+    }
 }
 
 // ---- strict JSON tree -------------------------------------------------------------------
@@ -936,6 +968,12 @@ impl DeltaPage {
         let J::Obj(mut pairs) = parse_json(body)? else {
             return Err(ModelError::Shape("the delta page is not an object"));
         };
+        // Any repeated key at page level makes the page ambiguous.
+        for (i, (key, _)) in pairs.iter().enumerate() {
+            if pairs[..i].iter().any(|(k, _)| k == key) {
+                return Err(ModelError::Shape("a page-level key appears more than once"));
+            }
+        }
         let continuation = match (
             link(&pairs, "@odata.nextLink")?,
             link(&pairs, "@odata.deltaLink")?,

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use mydrive_core::ids::{DriveId, ItemId};
 use mydrive_graph::client::{ByteRange, Download, MAX_CODE_LEN, MAX_RETRY_AFTER};
-use mydrive_graph::model::DeltaEntry;
+use mydrive_graph::model::{DeltaEntry, ModelError};
 use mydrive_graph::{GraphClient, GraphErrorKind};
 use raw::{RawServer, json, response};
 use support::{FakeTokens, TestResult, read_all, test_user_agent};
@@ -849,5 +849,112 @@ async fn huge_retry_after_is_capped() -> TestResult {
         }
         other => panic!("{other}"),
     }
+    Ok(())
+}
+
+/// A hostile item ID (very long, with a newline, an escape sequence and a token-like
+/// query) on a damaged item: the error keeps the ID exactly as data, but its `Display`
+/// and `Debug` show it only reduced to short printable ASCII.
+#[tokio::test]
+async fn hostile_item_id_is_not_shown_raw_in_errors() -> TestResult {
+    let (server, client, _) = setup().await;
+    let hostile = format!(
+        "{}\n2026-11-14 ERROR fake\u{1b}[31m?access_token=SECRETTOKEN{}",
+        "A".repeat(200),
+        "B".repeat(3000)
+    );
+    for get_root in [false, true] {
+        server.push(json(
+            "200 OK",
+            &[],
+            &serde_json::json!({"id": hostile, "size": "not a number"}).to_string(),
+        ));
+        let err = if get_root {
+            client.get_root(&drive()).await.unwrap_err()
+        } else {
+            client.get_item(&drive(), &item()).await.unwrap_err()
+        };
+        let GraphErrorKind::Model(ModelError::Item { id, reason }) = err.kind() else {
+            panic!("{err}");
+        };
+        assert_eq!(
+            id.as_str(),
+            hostile,
+            "the ID stays available exactly, as data"
+        );
+        assert!(reason.contains("size"));
+        for text in [
+            err.to_string(),
+            format!("{err:?}"),
+            format!("{:?}", err.kind()),
+        ] {
+            assert!(!text.contains('\n') && !text.contains('\u{1b}'), "{text:?}");
+            assert!(!text.contains("SECRETTOKEN"), "{text}");
+            assert!(text.len() < 1000, "{} characters", text.len());
+        }
+    }
+
+    // The operation's IDs are shown the same way.
+    let hostile_item = ItemId::new(hostile.clone())?;
+    server.push(json("404 Not Found", &[], "{}"));
+    let err = client.get_item(&drive(), &hostile_item).await.unwrap_err();
+    for text in [err.to_string(), format!("{err:?}")] {
+        assert!(
+            !text.contains('\n') && !text.contains("SECRETTOKEN"),
+            "{text:?}"
+        );
+        assert!(text.len() < 1000, "{} characters", text.len());
+    }
+    assert_eq!(
+        err.operation(),
+        &mydrive_graph::client::Operation::GetItem {
+            drive: drive(),
+            item: hostile_item
+        }
+    );
+    Ok(())
+}
+
+/// Any key repeated at page level fails the page, not only `value` and the links.
+#[tokio::test]
+async fn any_repeated_page_level_key_fails_the_page() -> TestResult {
+    let (server, client, _) = setup().await;
+    for body in [
+        r#"{"@odata.context":"a","@odata.context":"b","value":[],"@odata.deltaLink":"d"}"#,
+        r#"{"unknown":1,"value":[],"unknown":2,"@odata.deltaLink":"d"}"#,
+    ] {
+        server.push(json("200 OK", &[], body));
+        let err = client.delta_from_root(&drive()).await.unwrap_err();
+        assert!(
+            matches!(err.kind(), GraphErrorKind::Model(_)),
+            "{body}: {err}"
+        );
+    }
+    Ok(())
+}
+
+/// A `Content-Length` equal to the expected size does not verify the head when
+/// `Transfer-Encoding: chunked` is also present: a connection failing part-way is a
+/// `SizeMismatch`, never `Truncated`.
+#[tokio::test]
+async fn content_length_with_chunked_is_not_a_verified_head() -> TestResult {
+    let (server, client, _) = setup().await;
+    let mut partial = b"1000\r\n".to_vec();
+    partial.extend_from_slice(&[5u8; 100]);
+    server.push(response(
+        "200 OK",
+        &[("Content-Length", "4096"), ("Transfer-Encoding", "chunked")],
+        &partial,
+    ));
+    let download = client.download(&drive(), &item(), SIZE, None).await?;
+    assert!(!support::body_ref(&download).is_verified());
+    let (_, err) = fail_after(download).await;
+    assert!(
+        matches!(
+            err.kind(),
+            GraphErrorKind::SizeMismatch { expected: SIZE, .. }
+        ),
+        "{err}"
+    );
     Ok(())
 }

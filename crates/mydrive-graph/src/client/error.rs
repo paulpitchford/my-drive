@@ -11,10 +11,13 @@ use std::time::Duration;
 use mydrive_core::ids::{DriveId, ItemId};
 
 use crate::auth::TokenError;
-use crate::model::{DeltaLink, ModelError};
+use crate::model::{DeltaLink, ModelError, shown};
 
 /// What the client was doing when a call failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Drive and item IDs came from the server at some point, so `Display` and `Debug` show
+/// them only in their [`shown`] form; the fields keep them exactly.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Operation {
     /// `GET /drives/{drive}`.
     GetDrive {
@@ -49,15 +52,25 @@ pub enum Operation {
 
 impl fmt::Display for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let d = |drive: &DriveId| shown(drive.as_str());
+        let i = |item: &ItemId| shown(item.as_str());
         match self {
-            Self::GetDrive { drive } => write!(f, "reading drive {drive}"),
-            Self::GetRoot { drive } => write!(f, "reading the root of drive {drive}"),
-            Self::GetItem { drive, item } => write!(f, "reading item {item} of drive {drive}"),
-            Self::Delta { drive } => write!(f, "fetching a delta page of drive {drive}"),
+            Self::GetDrive { drive } => write!(f, "reading drive {}", d(drive)),
+            Self::GetRoot { drive } => write!(f, "reading the root of drive {}", d(drive)),
+            Self::GetItem { drive, item } => {
+                write!(f, "reading item {} of drive {}", i(item), d(drive))
+            }
+            Self::Delta { drive } => write!(f, "fetching a delta page of drive {}", d(drive)),
             Self::Download { drive, item } => {
-                write!(f, "downloading item {item} of drive {drive}")
+                write!(f, "downloading item {} of drive {}", i(item), d(drive))
             }
         }
+    }
+}
+
+impl fmt::Debug for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Operation({self})")
     }
 }
 
@@ -275,6 +288,10 @@ pub enum GraphErrorKind {
         /// The expected size.
         size: u64,
     },
+    /// The JSON body could not be used. [`ModelError::Item`] keeps the item's ID as data
+    /// for the engine; messages show it only in [`shown`] form.
+    #[error("unusable response: {0}")]
+    Model(#[source] ModelError),
     /// The response is not what Graph documents for this call.
     #[error("malformed response: {0}")]
     Malformed(String),
@@ -286,7 +303,7 @@ pub enum GraphErrorKind {
 
 impl From<ModelError> for GraphErrorKind {
     fn from(e: ModelError) -> Self {
-        Self::Malformed(e.to_string())
+        Self::Model(e)
     }
 }
 
