@@ -27,5 +27,17 @@ deny:
 docs-check:
     python3 scripts/check_docs.py
 
+# Check crate dependencies against the overview's crate diagram, and forbid(unsafe_code)
+arch-check:
+    python3 scripts/check_arch.py
+
+# List every ADR rule with the tests that name it (report only, never fails on coverage)
+rule-coverage:
+    python3 scripts/rule_coverage.py
+
+# Run the tests of the scripts in scripts/
+scripts-test:
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_*.py'
+
 # Everything CI runs
-check: fmt-check lint test deny docs-check
+check: fmt-check lint test deny docs-check arch-check scripts-test rule-coverage

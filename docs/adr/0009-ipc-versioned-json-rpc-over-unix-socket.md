@@ -1,6 +1,6 @@
 # ADR-0009: IPC is versioned JSON-RPC 2.0 over a Unix socket with a change stream
 
-- **Status:** Accepted
+- **Status:** Accepted; rule R7 replaced by ADR-0019
 - **Date:** 2026-11-14
 - **Depends on gates:** none (see `docs/architecture/overview.md`)
 
