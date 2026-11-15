@@ -47,8 +47,16 @@ def defined_ids():
         "ADR": stems("docs/adr", r"(\d{4})-"),
         "J": stems("docs/journeys", r"J(\d{2})-"),
         "F": stems("docs/flows", r"F(\d{2})-"),
-        "WP": stems("docs/backlog", r"WP-(\d{3})-"),
+        "WP": stems("docs/backlog", r"WP-(\d{3})-") | planned_packages(),
     }
+
+
+def planned_packages():
+    """Package numbers the backlog index lists as planned but that have no file yet."""
+    index = ROOT / "docs" / "backlog" / "README.md"
+    if not index.is_file():
+        return set()
+    return set(re.findall(r"^\| (\d{3}) \|", index.read_text(encoding="utf-8"), re.MULTILINE))
 
 
 def main():

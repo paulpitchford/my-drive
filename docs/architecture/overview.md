@@ -58,7 +58,7 @@ flowchart TB
         auth["Auth and token store"]
     end
 
-    backing[("Backing directories<br/>sparse files + xattrs")]
+    backing[("Backing directories<br/>content files by local ID")]
     keyring[("Secret Service<br/>(gnome-keyring, KWallet)")]
     msgraph[("Microsoft Graph")]
     apps["Any application<br/>(editor, terminal, file manager)"]
@@ -106,7 +106,7 @@ flowchart TB
 
 | Crate | Owns | Must not |
 |---|---|---|
-| `mydrive-core` | Domain types, state model, name validation, traits (`Hydrator`, `Clock`), errors | Do I/O |
+| `mydrive-core` | Domain types, state model, name validation, hashing, the `Clock` trait and conflict naming (M1), the traits the VFS uses to reach the engine (M2), errors | Do I/O |
 | `mydrive-graph` | Auth, HTTP, Graph request/response types, throttling signals | Know about the local filesystem or SQLite |
 | `mydrive-store` | SQLite schema, migrations, queries | Make network calls |
 | `mydrive-engine` | Delta processing, upload/download, reconciliation, scheduler, conflict rules | Speak FUSE or IPC |
@@ -128,7 +128,7 @@ Use these words, in code and prose, with exactly these meanings.
 | **Mount** | A drive (or a folder within one) attached to a local path. Has its own delta token. The unit of sync. Identified by `mount_id`. |
 | **Item** | A file or folder in a drive. Identified by (`drive_id`, `item_id`), never by path. |
 | **Mount point** | The path the user sees, e.g. `~/OneDrive`. A FUSE mount. |
-| **Backing directory** | The hidden real directory that holds a mount's sparse files and xattrs. |
+| **Backing directory** | The hidden real directory that holds a mount's content files, one per file that has local content, named by local ID (ADR-0021). It does not mirror names or folders. |
 | **Placeholder** | An item present locally with metadata but no content. |
 | **Hydrate** | Fetch content into the backing file. |
 | **Dehydrate** | Release local content, keeping the placeholder. |
@@ -204,6 +204,25 @@ Recorded here so documents agree. Each is small enough not to need its own ADR.
   delta has been applied, and its mount point is not mounted until then.
 - **Blocked mounts.** While a mount is `blocked`, writes into it are refused; changes already
   pending are kept and resume when the block lifts.
+- **Sign-in never creates a mount.** The client shows which account was signed in and asks
+  before creating one. On a machine shared with other users this is what stops a planted
+  sign-in from silently attaching someone else's account.
+- **Download and upload before the filesystem exists (M1).** `item.hydrate` fetches content
+  into the backing directory; `item.export` and `item.import` copy a file out to, or in from,
+  an ordinary path. Import and export are advertised as a capability so they can be withdrawn.
+- **Local deletes are not sent to the server until M2**, when the mass-delete guard exists.
+- **Replacing an existing file always uses an upload session**, where the "only if unchanged"
+  check is documented, until a real-account experiment shows the simple upload honours it.
+- **An upload link is never written to the state store.** An interrupted session restarts.
+- **M1 mounts drive roots only.** A link to a folder inside a library mounts the library.
+- **Content-change detection without a hash** uses the cTag when the server sends one and the
+  eTag otherwise. This is the one place a cTag is read; where a hash exists, only the hash
+  decides (clarifies ADR-0011 R4).
+- **Change notifications are deferred.** M1 polls. The push protocol is undocumented and waits
+  for observation on a real account.
+- **Conflict copy names** replace characters the server forbids with `_`; a host name with no
+  usable characters becomes `device`; a taken name gets `-2`, `-3`.
+- **A `429` with no `Retry-After`** holds the tenant for a fixed 10 seconds.
 - **Stale mounts.** After a crash a mount point may report "Transport endpoint is not
   connected" until unmounted. The daemon unmounts stale mounts on start, and the systemd unit
   does so on stop.
@@ -214,7 +233,7 @@ Recorded here so documents agree. Each is small enough not to need its own ADR.
 |---|---|
 | Config | `$XDG_CONFIG_HOME/mydrive/config.toml` |
 | State store | `$XDG_STATE_HOME/mydrive/state.db` |
-| Backing directories | `$XDG_DATA_HOME/mydrive/mounts/<mount_id>/` |
+| Backing directories | `$XDG_DATA_HOME/mydrive/mounts/<mount_id>/content/<local_id>` |
 | Logs | journald, via the systemd user unit |
 | Socket | `$XDG_RUNTIME_DIR/mydrive/daemon.sock` |
 | Tokens | Secret Service (never on disk in plain text) |
@@ -280,6 +299,9 @@ Each row is an ADR in `docs/adr/`. The ADR is authoritative for detail.
 | 0018 | Development process: work packages built by agents, reviewed independently, gated by CI |
 | 0019 | Protocol v1 paginates large results and declares which value sets are open (amends 0009) |
 | 0020 | Every protocol message is bounded; cursors stay correct while a directory changes (extends 0019) |
+| 0021 | Content files in the backing directory are keyed by a stable local ID (amends 0005) |
+| 0022 | A delta run is staged durably, then applied when its delta link arrives (refines 0011) |
+| 0023 | The daemon reaches the store and Graph only through the engine facade |
 
 ## Validation gates
 
@@ -299,7 +321,7 @@ that must pass before the dependent work starts. If a gate fails, the ADR is rev
 | Milestone | Outcome |
 |---|---|
 | M0 Foundations | Workspace builds, CI green, Graph simulator skeleton, gates G1 and G5 answered |
-| M1 Engine | Sign in; mirror metadata for a personal drive and one library into the store; CLI can list, download, upload |
+| M1 Engine | Sign in; mirror metadata for a personal drive and one library into the store; CLI can list, hydrate, export and import single files. No mounted folder yet |
 | M2 On-demand | FUSE mount with placeholders, hydration, pin, dehydrate, safe write path |
 | M3 Omarchy | Files plugin, tray, notifications, AUR package |
 | M4 Onboarding | First-run UI, library picker, settings, activity |

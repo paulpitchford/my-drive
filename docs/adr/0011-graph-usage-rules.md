@@ -1,6 +1,6 @@
 # ADR-0011: Graph usage rules: items by ID, quickXorHash, one request scheduler per tenant, Retry-After only
 
-- **Status:** Accepted
+- **Status:** Accepted; R2 refined by ADR-0022, R4 clarified in the overview
 - **Date:** 2026-11-14
 - **Depends on gates:** G1 for ranged reads (see `docs/architecture/overview.md`)
 

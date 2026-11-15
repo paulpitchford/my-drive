@@ -1,6 +1,6 @@
 # ADR-0005: On-demand files via FUSE over a separate backing directory
 
-- **Status:** Accepted
+- **Status:** Accepted; backing layout amended by ADR-0021
 - **Date:** 2026-11-14
 - **Depends on gates:** G1, G3 (see `docs/architecture/overview.md`)
 

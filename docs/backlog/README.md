@@ -44,10 +44,48 @@ From `docs/architecture/overview.md`. A gate is an experiment, not a code delive
 | G4 Per-file status in Files | Issue on omacom/folio | Owner approves the wording before it is posted | open |
 | G5 Device-code sign-in for personal accounts | WP-011 | App registration; owner signs in | open |
 
-## Milestone M1: Engine (draft plan)
+## Milestone M1: Engine
 
-A draft plan with the lead's rulings is in [drafts/M1-plan.md](drafts/M1-plan.md). It is not yet
-a set of work packages, and M1 needs the owner's go-ahead.
+Outcome: sign in; mirror the metadata of a personal drive and one library into the store; the
+CLI can list, hydrate, export and import single files. No mounted folder yet. Started
+2026-11-15 with the owner's go-ahead. The plan and the lead's rulings are in
+[drafts/M1-plan.md](drafts/M1-plan.md); packages are written one wave ahead, against the code
+as it then stands. Rows marked `planned` have no file yet.
+
+| WP | Title | Wave | Depends on | Status |
+|---|---|---|---|---|
+| [WP-014](WP-014-m1-shared-file-preparation.md) | M1 shared-file preparation | 5 | — | ready |
+| [WP-015](WP-015-core-clock-and-conflict-names.md) | Clock and conflict-copy names | 6 | WP-014 | blocked on WP-014 |
+| [WP-016](WP-016-ipc-protocol-m1-methods.md) | Protocol methods for M1 | 6 | WP-014 | blocked on WP-014 |
+| [WP-017](WP-017-store-schema-v2.md) | State store schema version 2 | 6 | WP-014 | blocked on WP-014 |
+| [WP-019](WP-019-sim-write-side.md) | Simulator write side | 6 | WP-014 | blocked on WP-014 |
+| [WP-023](WP-023-sim-identity-and-discovery.md) | Simulator identity and discovery | 6 | WP-014 | blocked on WP-014 |
+| 018 | Store schema version 3: pending operations | 7 | 017 | planned |
+| 025 | Graph client write side | 7 | 019 | planned |
+| 029 | Engine foundations and facade | 7 | 015, 017 | planned |
+| 030 | Request scheduler | 7 | 015 | planned |
+| 041 | IPC server and client | 7 | 016 | planned |
+| 020 | Simulator upload sessions | 8 | 019 | planned |
+| 021 | Simulator delta model 2 (resync, ancestors, packages) | 8 | 019 | planned |
+| 022 | Simulator throttling model | 8 | 023 | planned |
+| 027 | Graph client identity and discovery | 8 | 023 | planned |
+| 026 | Graph client upload sessions | 9 | 020, 025 | planned |
+| 031 | Engine delta apply | 9 | 017, 029, 030 | planned |
+| 032 | Engine accounts and sign-in | 9 | 027, 029, 030 | planned |
+| 034 | Engine download | 9 | 029, 030 | planned |
+| 043 | CLI | 9 | 016, 041 | planned |
+| 033 | Engine mount manager | 10 | 031, 032 | planned |
+| 035 | Engine upload | 10 | 018, 025, 026, 029, 030 | planned |
+| 036 | Engine conflicts | 11 | 018, 031, 035 | planned |
+| 037 | Engine resync | 11 | 021, 031, 033 | planned |
+| 039 | Engine libraries | 11 | 027, 033 | planned |
+| 042 | Daemon | 11 | 041, 032, 033, 034, 035 | planned |
+| 038 | Engine recovery | 12 | 035, 036, 037 | planned |
+| 044 | M1 acceptance | 12 | all | planned |
+
+Deferred out of M1: change notifications over the push protocol (plan packages 024, 028,
+040), until the protocol has been observed on a real account. No wave has more than five
+packages or more than two foundation packages.
 
 ## Later milestones (outline, not yet specified)
 
