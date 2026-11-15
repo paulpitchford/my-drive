@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parent.parent
-SKIP_DIRS = {"target", ".git", "research_notes", "reports", "node_modules", "drafts"}
+SKIP_DIRS = {"target", ".git", "research_notes", "reports", "node_modules", "drafts", "worktrees"}
 
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 FENCE = re.compile(r"^(```|~~~)")
