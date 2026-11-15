@@ -55,8 +55,10 @@ memory; mount removal refusal bounded and with a typed "kept elsewhere" argument
 
 ## Running the work
 
-- Run at most two agents at a time on a machine with 8 cores and 8 GB: seven parallel Rust
-  builds overloaded it. Give each its own `CARGO_TARGET_DIR`.
+- The owner's dedicated build machine has 20 cores and 64 GB: a full wave (five implementers,
+  or their reviewers and verifiers) can run in parallel there. On the original 8-core, 8 GB
+  machine seven parallel Rust builds overloaded it; run at most two there. Give each agent
+  its own `CARGO_TARGET_DIR`.
 - The app registration is managed with a separate Azure CLI profile that exists only on the
   original machine. On another machine, sign in again with a profile kept apart from any
   work login. Nothing in the build needs it.
