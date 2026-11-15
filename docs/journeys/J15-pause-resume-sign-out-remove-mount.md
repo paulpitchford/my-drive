@@ -27,7 +27,7 @@ copies.
 | 4 | `mydrive status` | Paused, with the resume time; one change waiting | |
 | 5 | Back on office Wi-Fi early: `mydrive resume` | Syncing resumed | Mounts `active`; the queued upload starts |
 | 6 | `mydrive mount list` | The four mounts with their IDs | |
-| 7 | `mydrive mount remove <mount_id of Project Atlas>` | Confirmation that syncing stopped; nothing was deleted online; where the local copies are | Worker stops; FUSE filesystem unmounted; mount record removed. No delete request is sent. Content of the 140 local files is kept |
+| 7 | `mydrive mount remove <mount_id of Project Atlas>` | Confirmation that syncing stopped; nothing was deleted online; where the local copies are | Worker stops; FUSE filesystem unmounted; each of the 140 fully local files is written into the now-plain mount-point directory at its path, then the backing directory and the mount record are removed (ADR-0021, F12). No delete request is sent |
 | 8 | Opens the Project Atlas library on SharePoint | Everything is still there | |
 | 9 | Later, leaving the job: `mydrive logout priya@contoso.com` | Signed out; local files stay | The account's Secret Service entry is removed. No delete request is sent |
 | 10 | `mydrive status` | No Contoso account | |
@@ -84,9 +84,9 @@ copies.
 
 ## Open questions
 
-1. After `mydrive mount remove`, where are the local copies: left in the mount point as
-   ordinary files, left in the backing directory, or moved elsewhere? What happens to the
-   placeholders (files never downloaded)?
+1. After `mydrive mount remove`, where are the local copies? Answered by ADR-0021: each fully
+   local file is written into the mount-point directory at its path, since the backing directory
+   is not browsable; placeholders and partly downloaded files are not written.
 2. If a mount or account has pending uploads, does remove or logout refuse, upload first, or
    ask?
 3. After `mydrive logout`, do the account's mounts stay mounted (readable local content,

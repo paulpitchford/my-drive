@@ -25,9 +25,9 @@ scripts can rely on.
 | # | User does | User sees | System does |
 |---|---|---|---|
 | 1 | `mydrive doctor` | FUSE, keyring and network checks pass | Checks `fusermount3`, the Secret Service on D-Bus, and Graph reachability |
-| 2 | `mydrive login --headless` | A sign-in URL and an instruction: open it in a browser on any device, sign in, then paste the full address the browser ends up on. A prompt waits for input | Daemon creates PKCE values and `state`, builds an authorization URL with a `http://localhost:<port>` redirect. It does not try to open a browser |
-| 3 | Opens the URL on the laptop and signs in | The laptop's browser ends on `http://localhost:<port>/?code=...&state=...` and says the page cannot be reached. This is expected | Nothing on the laptop is listening |
-| 4 | Copies that address and pastes it at the prompt | `Signed in as sam@outlook.com (personal)` | Daemon checks `state`, extracts the code, exchanges it, stores tokens in the Secret Service. Mount `~/OneDrive` is created and enumerated (J01) |
+| 2 | `mydrive login --headless` | A sign-in URL and an instruction: open it in a browser on any device, sign in, then paste the full address the browser ends up on. A prompt waits for input | Daemon creates PKCE values and `state`, builds an authorization URL with the headless redirect URI. That URI is a parameter of the sign-in, not chosen by the code: the native-client address or `http://localhost:<port>`, whichever is settled with the app registration (Q30, F01 step 8). It does not try to open a browser |
+| 3 | Opens the URL on the laptop and signs in | The laptop's browser ends on the redirect address, which holds `code=...&state=...`: a blank page for the native-client address, or a "cannot be reached" page for `http://localhost:<port>`. Either is expected | Nothing on the laptop is listening |
+| 4 | Copies that address, pastes it at the prompt, then confirms adding his OneDrive | `Signed in as sam@outlook.com (personal)`, then a question whether to add his OneDrive at `~/OneDrive`; after he confirms, a line saying it is being prepared | Daemon checks that the address is a redirect to the attempt's URI and that `state` matches, extracts the code, exchanges it, stores tokens in the Secret Service. Sign-in creates no mount; the confirmation sends a separate mount add, and `~/OneDrive` is created and enumerated (J01) |
 | 5 | `mydrive mount list --json \| jq '.'` | Valid JSON describing the mount | |
 | 6 | `mydrive status ~/OneDrive/Documents/budget.xlsx --json` | JSON with hydration `placeholder`, pin `inherit`, sync `in-sync`, display status `online-only` | Wire forms from the overview |
 | 7 | `mydrive pin ~/OneDrive/Backups/configs` | Pinned; files download | J06 |
@@ -46,12 +46,15 @@ scripts can rely on.
   start it; `~/OneDrive` is an empty directory.
 - **V5 Device-code sign-in.** Offered only if gate G5 shows it works for personal accounts.
 - **V6 Work account.** Same steps; the conditional-access rules of the tenant apply (J13).
+- **V7 Sam declines the mount.** At step 4 he answers no. The account is signed in with no mount;
+  `mydrive mount add` adds the drive later (J01 V10).
 
 ## Acceptance criteria
 
 - **J14-AC1** Given `mydrive login --headless` runs with a fake `xdg-open` on `PATH`, when it
   prints its URL, then the fake `xdg-open` is never invoked and the printed URL is an
-  authorization URL with a `http://localhost:<port>` redirect and an `S256` code challenge.
+  authorization URL whose `redirect_uri` is the configured headless redirect URI (Q30) and which
+  carries an `S256` code challenge.
 - **J14-AC2** Given the printed URL, when the simulator's authorize step is completed and the
   resulting redirect URL is written to the command's standard input, then the command exits 0
   and `mydrive status --json` lists the account as `signed-in`.
@@ -71,6 +74,9 @@ scripts can rely on.
   network and policy checks with a pass or fail result.
 - **J14-AC9** Given a headless sign-in, when terminal output and the journal are searched,
   then neither contains the access token, refresh token or PKCE verifier.
+- **J14-AC10** Given a headless sign-in has completed, when the user declines adding the own
+  drive, then `mydrive mount list --json` lists no mount, the account is `signed-in`, and the
+  simulator received no delta request for the drive.
 
 ## Must never happen
 
@@ -92,3 +98,7 @@ scripts can rely on.
    standard error?
 6. Is the `--json` schema versioned and stable before 1.0, given the IPC protocol may change
    (ADR-0016)?
+7. Which headless redirect URI the app registration uses, the native-client address or
+   `http://localhost:<port>`, is Q30 (F01 step 8). Steps 2 and 3 hold for either.
+8. How the CLI asks about adding the mount when standard input is not a terminal or `--json` is
+   given, without creating a mount unasked or waiting forever (F01 new question 5).

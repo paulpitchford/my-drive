@@ -25,12 +25,12 @@ never sees placeholders read as zeros, and everything carries on by itself after
 | 1 | (The daemon crashes) | mpv stops with a read error. `ls ~/OneDrive` reports "Transport endpoint is not connected" | The FUSE connection is gone; the kernel fails requests on the stale mount |
 | 2 | Waits a few seconds | `ls ~/OneDrive` works again | systemd restarts `mydrived`. The daemon unmounts the stale mount, runs the recovery scan of each backing directory against the store, then mounts again |
 | 3 | `mydrive status ~/OneDrive/Documents/thesis.docx` | `syncing`, then `local` | The `PendingUpload` record was committed before the close returned; the upload runs after restart |
-| 4 | `mydrive activity` | The zip upload continuing | Upload session resumed from `nextExpectedRanges`, or restarted if the session expired |
+| 4 | `mydrive activity` | The zip upload running again from the start | The upload link is never written to the state store (overview "Rulings on details"), so the interrupted session restarts; that costs a re-upload and loses nothing |
 | 5 | Plays the video again | It plays | Recorded extents are served locally; missing ranges are fetched |
 | 6 | `mydrive activity` | The 340-item deletion is still waiting for confirmation | Held deletes are kept across restart |
 | 7 | Later, the laptop loses power during another upload | — | — |
 | 8 | Boots and logs in | `~/OneDrive` is an empty directory for a moment, then the files are there | The user unit starts with the session; same recovery as step 2 |
-| 9 | `mydrive status` | Uploads that were pending before the power cut are running or done | Every `PendingUpload` and `Uploading` item is resumed (ADR-0012) |
+| 9 | `mydrive status` | Uploads that were pending before the power cut are running or done | Every dirty item, whether `PendingUpload` or `Uploading`, is uploaded again (ADR-0012 R11) |
 
 ## Variations
 
@@ -42,7 +42,10 @@ never sees placeholders read as zeros, and everything carries on by itself after
   upload gets 412; conflict rules apply (J10).
 - **V4 Crash during free up space or a conflict split.** On restart the item is in a
   consistent state: either before or after the operation, never with content missing that
-  was not on the server.
+  was not on the server. A conflict split is one store transaction (ADR-0021).
+- **V5 Crash during a delta run.** On restart the run resumes from where its pages were staged,
+  or its staged set is applied again; nothing the run had not finished is treated as current
+  (ADR-0022).
 
 ## Acceptance criteria
 

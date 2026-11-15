@@ -12,8 +12,9 @@ changes that have not been uploaded.
 
 ## Preconditions
 
-- `~/OneDrive` is mounted and active; the machine is online; change notification
-  (`subscriptions/socketIo`) is connected.
+- `~/OneDrive` is mounted and active; the machine is online; the mount's wake-up source is
+  running (polling; push notifications are deferred until their protocol has been observed,
+  overview "Rulings on details").
 - `~/OneDrive/Documents/budget.xlsx`, 48,213 bytes, local (`Full`), unpinned, in sync, not
   open in any program.
 - `~/OneDrive/Documents/Taxes/` is pinned and fully downloaded.
@@ -25,13 +26,13 @@ changes that have not been uploaded.
 | # | User does | User sees | System does |
 |---|---|---|---|
 | 1 | Edits `budget.xlsx` in Excel on his phone; it grows to 51,002 bytes | — | OneDrive stores a new version |
-| 2 | On the laptop, runs `ls -l ~/OneDrive/Documents/budget.xlsx` shortly after | `51002` and the new modification time | The socket notification wakes the mount's worker, which calls delta. The item's eTag, size and hash changed and nothing is pending locally, so its local content is released: hydration `Placeholder` (F13) |
+| 2 | On the laptop, runs `ls -l ~/OneDrive/Documents/budget.xlsx` shortly after | `51002` and the new modification time | The mount's wake-up source wakes the mount's worker, which runs delta (F05). The item's eTag, size and hash changed and nothing is pending locally, so its local content is released: hydration `Placeholder` (F13) |
 | 3 | `mydrive status ~/OneDrive/Documents/budget.xlsx` | `online-only` | |
 | 4 | Opens `budget.xlsx` | The phone's edits are there | Hydration on read fetches the new version (J03) |
 | 5 | Takes a photo that the phone uploads to `Pictures/2026/IMG_2045.jpg` | `IMG_2045.jpg` appears in the folder, `online-only` | New placeholder from delta; nothing downloaded |
 | 6 | Renames `Pictures/2026` to `Pictures/2026 Holidays` on onedrive.com | The folder has the new name on the laptop; files inside keep their status | Delta reports the folder with a new name; items are tracked by ID, so children move with it and nothing is downloaded again |
 | 7 | Deletes `Documents/old-draft.docx` on onedrive.com | It disappears from `~/OneDrive/Documents` | Delta reports the delete; nothing is pending locally, so the local item and its backing file are removed. The server keeps it in the recycle bin |
-| 8 | Edits `Taxes/2026/w2.pdf` on the web | `mydrive status` on it shows `syncing`, then `pinned` | Pinned item changed: the new version is downloaded to a staging file, verified, and swapped in whole |
+| 8 | Edits `Taxes/2026/w2.pdf` on the web | `mydrive status` on it shows `syncing`, then `pinned` | Pinned item changed: the new version is downloaded and verified before the item shows `pinned` again. Whether the old content stays readable meanwhile is F05 new question 5 |
 | 9 | Restores `old-draft.docx` from the recycle bin on the web | It reappears in `~/OneDrive/Documents` as `online-only` | Delta reports it again |
 
 ## Variations
@@ -44,8 +45,8 @@ changes that have not been uploaded.
   What LibreOffice sees in the meantime is an open question.
 - **V4 Laptop asleep or offline.** Changes made meanwhile arrive in one delta catch-up when it
   is back (J09).
-- **V5 Notifications unavailable.** The socket is down; the mount falls back to slow polling.
-  Changes still arrive, later.
+- **V5 Notifications unavailable.** Without push notifications the mount polls. Changes still
+  arrive, within the polling interval.
 - **V6 Resync (`410 Gone`).** The server tells the client to resync. The mount shows
   `resyncing`; the user sees no change in their files except that new remote changes may take
   longer. Where the client cannot tell which side is newer, it keeps both copies.

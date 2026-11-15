@@ -9,8 +9,11 @@ show. Every other flow refers to these transitions.
 - The state model, wire forms, and account and mount states of `docs/architecture/overview.md`,
   and ADR-0008.
 - The State store is the source of truth (ADR-0006). The five `user.mydrive.*` xattrs are served
-  from it. The State store's hydrated-range map, not the sparse holes, says which bytes are local
-  (ADR-0006 R6).
+  from it and are not written on content files. The State store's hydrated-range map, not the
+  sparse holes, says which bytes are local (ADR-0006 R6).
+- On disk, a file that has or has had local content has one content file in the backing
+  directory, named by its local ID; a never-hydrated placeholder has none, and folders have no
+  on-disk form (ADR-0021).
 
 Names in prose and diagrams are the Rust names (`PendingUpload`). On the wire (IPC, xattrs,
 CLI `--json`, store columns) the same values are lowercase kebab-case (`pending-upload`); the
@@ -39,16 +42,16 @@ stateDiagram-v2
 
 | Event | From | To | Flow | Rule | Side effects |
 |---|---|---|---|---|---|
-| Delta reports a new file with size > 0 | — | `Placeholder` (`placeholder`) | F02, F05 | ADR-0005 R8 | Sparse backing file with `st_size` = cloud size, `st_blocks` = 0 |
+| Delta reports a new file with size > 0 | — | `Placeholder` (`placeholder`) | F02, F05 | ADR-0005 R8, ADR-0021 R4 | No content file; the VFS reports `st_size` = cloud size and `st_blocks` = 0 from the store |
 | Local create, or remote file of size 0 | — | `Full` (`full`) | F04, F02 | | Nothing to fetch |
-| Read needs a range that is not local and the fetch succeeds | `Placeholder`, `Partial` | `Partial` (`partial`) | F03 | ADR-0005 R5 | Extent recorded after the bytes are durable |
+| Read needs a range that is not local and the fetch succeeds | `Placeholder`, `Partial` | `Partial` (`partial`) | F03 | ADR-0005 R5 | Content file created sparse at the cloud size on first hydration; range recorded after the bytes are durable |
 | Last missing range lands and the whole-file quickXorHash equals `server_hash` | `Partial` | `Full` | F03 | | On mismatch every extent is dropped: `Placeholder`, sync `Error` |
 | Whole file fetched (small file, pin, `mydrive hydrate`, `200` to a ranged request) | `Placeholder`, `Partial` | `Full` | F03, F06 | ADR-0011 R11 | Hash verified as above |
 | Open with `O_TRUNC` | any | `Full` | F04 | ADR-0012 R2 | Old extents dropped, no download |
 | First partial write to a non-`Full` file | `Placeholder`, `Partial` | `Full` | F04 | ADR-0005 R7, ADR-0012 R1 | The write waits until the missing ranges are fetched |
-| Free up space accepted | `Partial`, `Full` | `Placeholder` | F06 | ADR-0008 R5 | Holes punched, extents deleted |
-| Remote content change, no local change pending, effective pin not `Pinned` | `Partial`, `Full` | `Placeholder` | F05 | ADR-0012 R8 | Deferred while handles are open; kernel cache invalidated |
-| Remote content change, effective pin `Pinned` | `Full` | `Full` | F05 | ADR-0008 R6 | New version fetched to a staging file, swapped in atomically |
+| Free up space accepted | `Partial`, `Full` | `Placeholder` | F06 | ADR-0008 R5 | Ranges cleared in the store, then holes punched in the content file |
+| Remote content change, item not dirty, effective pin not `Pinned` | `Partial`, `Full` | `Placeholder` | F05 | ADR-0012 R8 | Ranges cleared in the same operation that records the new version; the content file is then removed or ignored; kernel cache invalidated (M2). What open handles see is Q34 |
+| Remote content change, item not dirty, effective pin `Pinned` | `Partial`, `Full` | `Placeholder`, then `Full` again | F05, F06 | ADR-0008 R6 | As above, then sync `PendingDownload` and the new version is fetched (F05 new question 5) |
 
 ## Sync axis
 
@@ -59,7 +62,8 @@ stateDiagram-v2
     InSync --> PendingUpload : first local modification, committed before it is applied
     PendingUpload --> PendingUpload : more local changes, quiet timer restarts
     PendingUpload --> Uploading : quiet period over, request dispatched
-    Uploading --> InSync : server accepted, hashes and eTag stored
+    Uploading --> InSync : upload completed, Synced
+    Uploading --> PendingDownload : upload completed, server moved on
     Uploading --> PendingUpload : new local write, transient failure, or restart
     Uploading --> Conflict : 412, or 409 on create
     PendingUpload --> Conflict : delta shows a remote content change
@@ -82,10 +86,11 @@ stateDiagram-v2
 | Event | From | To | Flow | Rule |
 |---|---|---|---|---|
 | Delta reports an item and nothing is pending locally | — | `InSync` (`in-sync`) | F02, F05 | |
-| First write, truncate, create, mkdir, rename, move, unlink or rmdir. The record is committed **before** the change touches the backing directory | `InSync` | `PendingUpload` (`pending-upload`) | F04, F12 | ADR-0012 R3 |
+| First write, truncate, create, mkdir, rename, move, or (M2) unlink or rmdir. The dirty mark or record is committed **before** the change touches the backing directory | `InSync` | `PendingUpload` (`pending-upload`) | F04, F12 | ADR-0012 R3 |
 | Quiet period (default 2 s after the last close) ends and the request is dispatched | `PendingUpload` | `Uploading` (`uploading`) | F04 | ADR-0012 R4 |
-| Server returns the new driveItem | `Uploading` | `InSync` | F04 | ADR-0012 R8 |
-| Write while the upload is in flight | `Uploading` | `PendingUpload` once the request ends | F04 | ADR-0012 R4 |
+| Upload completed for the generation that was read before the snapshot, and the server did not move on (`Synced`) | `Uploading` | `InSync` | F04 | ADR-0012 R8 |
+| Upload completed, but a different remote change was reported meanwhile (`UploadedButRemoteMovedOn`) | `Uploading` | `PendingDownload`; metadata refetched and applied | F04, F05 | ADR-0012 R8 |
+| Write while the upload is in flight (`LocalChangedSince`) | `Uploading` | `PendingUpload` once the request ends | F04 | ADR-0012 R4 |
 | Network error, 5xx, 429, daemon restart | `Uploading` | `PendingUpload` | F04, F08, F10 | ADR-0012 R11 |
 | `412`, or `409 nameAlreadyExists` on create | `Uploading` | `Conflict` (`conflict`) | F07 | ADR-0012 R7 |
 | Delta reports a content change for an item with a pending content operation | `PendingUpload`, `Uploading` | `Conflict` | F07 | ADR-0012 R11 |
@@ -95,8 +100,8 @@ stateDiagram-v2
 | Download finished and verified | `PendingDownload` | `InSync` | F06 | |
 | Organisation policy refuses the item, or the item's mount enters `blocked` | `InSync`, `PendingUpload`, `PendingDownload`, `Error` | `Blocked` (`blocked`) | F09 | ADR-0015 R4 |
 | Mount leaves `blocked` | `Blocked` | `PendingUpload` if pending operation records exist, else `InSync` (then delta) | F09 | ADR-0006 R8 |
-| Remote delete applied (never to an item with a pending local change) | `InSync` | removed | F05 | ADR-0012 R11 |
-| Remote delete confirmed for a local delete | `PendingUpload` | removed | F12 | ADR-0012 R10 |
+| Remote delete applied (never to a dirty item) | `InSync` | removed | F05 | ADR-0012 R11 |
+| Remote delete confirmed for a local delete (M2) | `PendingUpload` | removed | F12 | ADR-0012 R10 |
 
 Interactive reads (F03) do not use `PendingDownload`; they move only the hydration axis, so
 opening a file does not show sync arrows.
@@ -106,9 +111,13 @@ opening a file does not show sync arrows.
 The sync axis is a single value, so some facts live in separate State store records and survive
 every transition, including `Error`, `Conflict` and `Blocked`:
 
+- **The dirty mark** (`local_dirty`), the **local generation** and, for a dirty item,
+  **`remote_changed`** and the last remote identity the server reported (store-schema "`items`").
+  Every guard against losing local content keys on the dirty mark, never on the sync value, so
+  leaving `Error` or `Blocked` cannot forget a local change (principle 1).
 - **Pending operation records** (create, update content, move, delete), each with the base eTag it
-  was made against. Leaving `Error` or `Blocked` re-derives `PendingUpload` from them, so a local
-  change is never forgotten (principle 1).
+  was made against. The store as built does not have them yet; local moves and deletes need them
+  (Q28).
 - **Hash baseline**: `local_hash` and `server_hash` (ADR-0012 "Two hashes").
 - **Error or block reason** and retry count, for `mydrive activity` and `mydrive status <path>`.
 
@@ -123,7 +132,7 @@ From the overview. They are not item states, but they drive item transitions:
 | Mount | `active` | — |
 | Mount | `paused` | `mydrive pause`. Reads still hydrate; uploads, deletes and background downloads queue |
 | Mount | `blocked` (with a reason) | Every item of the mount moves to sync `Blocked`; pending operation records stay. A tenant-wide refusal blocks every mount of the account; a per-site policy blocks one |
-| Mount | `resyncing` | `410 Gone` resync (F05), and, in these flows, the first enumeration before the mount point is mounted (F02) |
+| Mount | `resyncing` | `410 Gone` resync (F05), and the first enumeration until its first full delta has been applied, before the mount point is mounted (F02, overview "Rulings on details") |
 
 Read-only is a property of the mount (or item), not a state: it produces the `read-only`
 modifier and `EROFS` for writes (ADR-0015 R5).
@@ -166,14 +175,18 @@ Modifiers, independent of the status: `read-only` (mount or item is read-only) a
 
 - The three axes are stored in separate columns; only display collapses them (ADR-0008 R1).
 - Hydration never moves towards `Placeholder`, and content is never overwritten by a download,
-  while the item has a pending content operation (ADR-0008 R7).
+  while the item is dirty (ADR-0008 R7).
+- No file or directory exists in the backing directory for a folder or a never-hydrated
+  placeholder (ADR-0021 R4).
 - The `PendingUpload` record is durable before any local byte differs from the server's
   (ADR-0012 R3).
 - An extent is recorded only for bytes that are durable in the backing file.
 - `Full` is set only after a whole-file quickXorHash match, or for content that originated
   locally.
 - Bytes from two server versions are never mixed in one backing file.
-- No transition discards a pending operation record except the server confirming it.
+- No transition discards a pending operation record except the server confirming it, and no
+  transition clears the dirty mark except an upload completion of the current generation or an
+  explicit discard (store-schema invariant 5).
 
 ## Open questions
 
@@ -187,21 +200,24 @@ New:
    folders show `pinned` if effectively pinned, `error` or `syncing` if any descendant does,
    `local` if every descendant file is `Full`, else `online-only`, from per-folder counters in
    the store. Needs a ruling in ADR-0008.
-2. **Mount state during the first enumeration.** The overview has no `initialising` mount state.
-   These flows use `resyncing` for the first enumeration (the mount point is not yet mounted). If
-   the lead prefers a separate `initialising` state, the overview needs it (J01 asks the same).
+2. **Mount state during the first enumeration.** Closed by the overview ruling "First
+   enumeration": a new mount is `resyncing` until its first full delta has been applied, and its
+   mount point is not mounted until then.
 3. **Mount-level `blocked` written into every item.** ADR-0008 R2 derives display from the item's
    axes only, so this file moves every item of a blocked mount to sync `Blocked` and relies on
    pending operation records to restore `PendingUpload` afterwards. The alternative (leave item
    values alone and let the mount state override display) would need the derivation function to
-   take the mount state.
-4. **Locally created items have no `item_id`** until the server assigns one, while the store is
-   keyed by (`drive_id`, `item_id`) (ADR-0006 R4). The store needs a provisional local key
-   replaced on upload.
+   take the mount state. The lead's ruling D3 on the M1 plan chooses the alternative (store facts,
+   derive the state, never write `Blocked` into every item), but neither the overview nor
+   ADR-0008 records it yet, so this file is unchanged until they do.
+4. **Locally created items have no `item_id`.** Closed by the store as built: a provisional item
+   (`is_provisional`, always dirty) has an engine-generated key, which `rekey_item` or
+   `complete_upload` replaces with the server's ID; its `local_id`, and so its content file, does
+   not change (ADR-0021 R2).
 
 ## Related
 
 - Journeys: J02, J03, J04, J06, J07, J08, J10, J12, J13, J17.
-- ADRs: 0005, 0006, 0008, 0010, 0012, 0015.
+- ADRs: 0005, 0006, 0008, 0010, 0012, 0015, 0021.
 - Gates: G2 (what policy refusals look like).
 - Flows: all; F03, F04, F05, F06, F07 and F09 drive these transitions.

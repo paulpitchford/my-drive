@@ -47,7 +47,7 @@ sequenceDiagram
     Sched->>GraphC: dispatch
     GraphC->>Graph: durable redeem
     Graph-->>GraphC: driveItem
-    Engine->>Store: insert mount for drive_id, read-only flag
+    Engine->>Store: insert mount for drive_id and its root, read-only flag
     Engine->>Engine: initial sync as F02
     Engine-->>CLI: mounted at ~/ORG/SITE - LIBRARY
 ```
@@ -62,7 +62,8 @@ flowchart TD
     B -->|"403 or 404 other"| NA["no access to this link, nothing changed"]
     B -->|"driveItem"| C{"driveType documentLibrary?"}
     C -->|"no, a folder in someone's OneDrive"| SH["refuse: shared folders come with shortcuts in M5"]
-    C -->|yes| D{"same root already mounted, or mount point nested?"}
+    C -->|yes| DR["mount the library's drive root, even for a link to a folder in it"]
+    DR --> D{"same root already mounted, or mount point nested?"}
     D -->|yes| DUP["refuse, name the existing mount"]
     D -->|no| E{"read-only signals?"}
     E -->|yes| RO["preview says read-only, mount gets the read-only flag"]
@@ -81,8 +82,8 @@ flowchart TD
    `Prefer: redeemSharingLinkIfNecessary`, which grants access only for that request and leaves
    the user's permissions unchanged (ADR-0015 R2).
 2. Step 8: `parentReference.driveId` names the library; `driveType` must be `documentLibrary`.
-   A link to a folder inside a library mounts the whole library, and the preview says so (a mount
-   of one folder is Q10).
+   M1 mounts drive roots only (overview "Rulings on details"): a link to a folder inside a library
+   mounts the whole library, and the preview says so. A mount of one folder is Q10, after M1.
 3. Steps 10 to 14: the preview gathers the library and site names (for the mount point
    `~/<Org>/<Site> - <Library>`), size and item count. The item count is shown, and the CLI warns
    when the total across all mounts would exceed the configured threshold near 300,000
@@ -158,7 +159,7 @@ flowchart TD
 
 ## Open questions
 
-Existing: Q10 (mounting one folder of a library), Q11 (scope for browsing Teams), Q12 (detecting
+Existing: Q10 (mounting one folder of a library; not in M1, which mounts drive roots only), Q11 (scope for browsing Teams), Q12 (detecting
 read-only libraries), Q13 (policy errors, gate G2), Q14 (two accounts in one tenant).
 
 New:

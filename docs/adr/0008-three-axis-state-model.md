@@ -1,6 +1,6 @@
 # ADR-0008: Three-axis state model with a derived display status
 
-- **Status:** Accepted
+- **Status:** Accepted; R6 wording on notifications overtaken by the overview's rulings
 - **Date:** 2026-11-14
 - **Depends on gates:** none (see `docs/architecture/overview.md`)
 
