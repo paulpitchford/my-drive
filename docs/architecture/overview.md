@@ -323,6 +323,7 @@ that must pass before the dependent work starts. If a gate fails, the ADR is rev
 | G3 | What did abraunegg's FUSE ADR (PR #3600) conclude, and why is it on hold? Answered 2026-11-15: pass with changes, see `docs/gates/G3.md` | ADR-0005 |
 | G4 | Will Files (`folio`) accept a per-file status hook? | ADR-0014 status icons on Omarchy |
 | G5 | Does device-code sign-in work for personal accounts? | ADR-0010 headless flow |
+| G6 | How does the service behave on writes: when does a SharePoint rewrite of an upload become visible, what do `If-Match` and conflict behaviour do on each route, and how are names, IDs and times treated? | ADR-0012 uploads and conflicts (open question Q42) |
 
 ## Milestones
 
