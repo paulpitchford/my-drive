@@ -10,6 +10,10 @@ user's confirmation.
 | Milestone | M2 |
 | Related flows | F04 local write and upload, F12 delete safety, F05 remote change (for restores), F13 state machines |
 
+Local deletes are not sent to the server until M2, when the mass-delete guard exists (overview
+"Rulings on details"). The delete steps (5 to 9), variations V1, V2, V7 and V9, and J05-AC4 to
+J05-AC8 and J05-AC10 are M2 behaviour; no earlier milestone sends a `DELETE` for a local change.
+
 ## Preconditions
 
 - `~/OneDrive` is mounted and active, about 14,000 items; the machine is online.
@@ -25,13 +29,13 @@ user's confirmation.
 |---|---|---|---|
 | 1 | `mkdir -p ~/OneDrive/Documents/Taxes/2026` | The folders exist at once | A pending create record per folder is committed before the change is applied locally; the folders are created on the server, parent first |
 | 2 | `cp ~/Downloads/receipt-0412.pdf ~/OneDrive/Documents/Taxes/2026/` | Copy completes | Upload after close plus 2 s (J04) |
-| 3 | `mv ~/OneDrive/Documents/Taxes/2026/receipt-0412.pdf ~/OneDrive/Documents/Taxes/2026/dentist-2026-04.pdf` | Renamed at once | One rename request; the item keeps its `item_id`; no content is uploaded |
-| 4 | `mv ~/OneDrive/Documents/Taxes ~/OneDrive/Archive/` | Moved at once | One move request for the folder. Children keep their `item_id`, hydration and pin; nothing downloads or uploads |
-| 5 | `rm ~/OneDrive/Documents/old-draft.docx` | The file is gone | Delete request; the item goes to the OneDrive recycle bin |
+| 3 | `mv ~/OneDrive/Documents/Taxes/2026/receipt-0412.pdf ~/OneDrive/Documents/Taxes/2026/dentist-2026-04.pdf` | Renamed at once | One rename request; the item keeps its `item_id`; no content is uploaded. Locally only the store changes; no file is renamed on disk (ADR-0021) |
+| 4 | `mv ~/OneDrive/Documents/Taxes ~/OneDrive/Archive/` | Moved at once | One move request for the folder. Children keep their `item_id`, hydration and pin; nothing downloads or uploads, and nothing on disk moves |
+| 5 | `rm ~/OneDrive/Documents/old-draft.docx` | The file is gone | (M2) Delete request; the item goes to the OneDrive recycle bin |
 | 6 | Opens the recycle bin on onedrive.com | `old-draft.docx` is there and can be restored | — |
-| 7 | `rm -r ~/OneDrive/Projects/old-site` | `rm` finishes. A notification (M3) and `mydrive activity` say a deletion of 340 items in `Projects/old-site` is waiting for confirmation; `mydrive status` shows the mount `paused` | The delete batch exceeds 200 items, so the mass-delete guard holds it and no delete is sent (ADR-0012) |
-| 8 | Confirms the deletion | `mydrive activity` shows the 340 items deleted; the mount is `active` again | Deletes sent; all 340 items go to the recycle bin |
-| 9 | `mv ~/OneDrive/Videos/holiday-2026.mp4 ~/Videos/` | `mv` takes as long as downloading 2.3 GiB, then finishes | The kernel returns `EXDEV` for a cross-filesystem rename, so `mv` copies and then unlinks. The copy reads the file, which hydrates it; the unlink sends the item to the recycle bin |
+| 7 | `rm -r ~/OneDrive/Projects/old-site` | (M2) `rm` finishes. A notification (M3) and `mydrive activity` say a deletion of 340 items in `Projects/old-site` is waiting for confirmation; `mydrive status` shows the mount `paused` | The delete batch exceeds 200 items, so the mass-delete guard holds it and no delete is sent (ADR-0012) |
+| 8 | Confirms the deletion | (M2) `mydrive activity` shows the 340 items deleted; the mount is `active` again | Deletes sent; all 340 items go to the recycle bin |
+| 9 | `mv ~/OneDrive/Videos/holiday-2026.mp4 ~/Videos/` | (M2) `mv` takes as long as downloading 2.3 GiB, then finishes | The kernel returns `EXDEV` for a cross-filesystem rename, so `mv` copies and then unlinks. The copy reads the file, which hydrates it; the unlink sends the item to the recycle bin |
 
 ## Variations
 

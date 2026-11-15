@@ -93,6 +93,7 @@ flowchart TB
     daemon["mydrive-daemon (bin: mydrived)"] --> ipc
     daemon --> vfs
     daemon --> engine
+    daemon --> core
     vfs["mydrive-vfs"] --> core
     engine["mydrive-engine"] --> store
     engine --> graphcrate
@@ -223,6 +224,13 @@ Recorded here so documents agree. Each is small enough not to need its own ADR.
 - **Conflict copy names** replace characters the server forbids with `_`; a host name with no
   usable characters becomes `device`; a taken name gets `-2`, `-3`.
 - **A `429` with no `Retry-After`** holds the tenant for a fixed 10 seconds.
+- **A blocked mount is a fact about the mount, not about each item.** `Blocked` is not written
+  into every item's sync state; the display status of items in a blocked mount is computed
+  as `blocked` when status is derived. Items keep their own state, so nothing is lost when
+  the block lifts.
+- **A delta run that restarts from the beginning discards its staged set first.**
+- **A conflict split keeps the local bytes where they are** (ADR-0021): the existing row
+  becomes the copy; a new row represents the server's version.
 - **Stale mounts.** After a crash a mount point may report "Transport endpoint is not
   connected" until unmounted. The daemon unmounts stale mounts on start, and the systemd unit
   does so on stop.
