@@ -69,9 +69,9 @@ pub mod method {
     /// Stop syncing a mount. Never deletes remote content.
     pub const MOUNT_REMOVE: &str = "mount.remove";
     /// Pause syncing.
-    pub const SYNC_PAUSE: &str = "sync.pause";
+    pub const MOUNT_PAUSE: &str = "mount.pause";
     /// Resume syncing.
-    pub const SYNC_RESUME: &str = "sync.resume";
+    pub const MOUNT_RESUME: &str = "mount.resume";
     /// Copy a local file into a mount (capability `item-import-export`).
     pub const ITEM_IMPORT: &str = "item.import";
     /// Copy a file out of a mount (capability `item-import-export`).
@@ -95,8 +95,8 @@ pub mod method {
         MOUNT_ADD_PREVIEW,
         MOUNT_ADD_CONFIRM,
         MOUNT_REMOVE,
-        SYNC_PAUSE,
-        SYNC_RESUME,
+        MOUNT_PAUSE,
+        MOUNT_RESUME,
         ITEM_IMPORT,
         ITEM_EXPORT,
     ];
@@ -290,6 +290,12 @@ pub struct MountInfo {
     /// first enumeration, the items listed so far. Absent when not known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_count: Option<u64>,
+    /// When the mount's pause ends, in whole seconds since the Unix epoch (UTC), as in the
+    /// `mount.pause` result. Present whenever the mount is paused with an end, whatever
+    /// `state` shows (a paused mount that is also blocked shows `blocked`). Absent when the
+    /// mount is not paused, or is paused until `mount.resume`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_until: Option<u64>,
 }
 
 /// `mount.list` result: one page, in byte order of `mount_id`.
@@ -803,8 +809,8 @@ pub const MAX_SHARING_LINK_BYTES: usize = 4096;
 /// a verifier, code or token.
 pub const MAX_CONFIRMATION_TOKEN_BYTES: usize = 40;
 
-/// The longest pause `sync.pause` accepts, in seconds: 7 days. A longer pause is a pause with
-/// no duration, ended by `sync.resume`.
+/// The longest pause `mount.pause` accepts, in seconds: 7 days. A longer pause is a pause with
+/// no duration, ended by `mount.resume`.
 pub const MAX_PAUSE_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Query parameters an authorisation URL must never carry: each is a credential or would make
@@ -1525,28 +1531,28 @@ pub struct MountRemoveResult {
     pub unsynced_files: u64,
 }
 
-/// `sync.pause` parameters.
+/// `mount.pause` parameters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "SyncPauseWire", into = "SyncPauseWire")]
-pub struct SyncPauseParams {
+#[serde(try_from = "MountPauseWire", into = "MountPauseWire")]
+pub struct MountPauseParams {
     /// The mount to pause; absent for every mount.
     pub mount_id: Option<MountId>,
-    /// How long, 1 to [`MAX_PAUSE_SECS`] seconds; absent to pause until `sync.resume`.
+    /// How long, 1 to [`MAX_PAUSE_SECS`] seconds; absent to pause until `mount.resume`.
     pub duration_secs: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct SyncPauseWire {
+struct MountPauseWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mount_id: Option<MountId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     duration_secs: Option<u64>,
 }
 
-impl TryFrom<SyncPauseWire> for SyncPauseParams {
+impl TryFrom<MountPauseWire> for MountPauseParams {
     type Error = String;
 
-    fn try_from(wire: SyncPauseWire) -> Result<Self, String> {
+    fn try_from(wire: MountPauseWire) -> Result<Self, String> {
         if let Some(secs) = wire.duration_secs.filter(|&s| s == 0 || s > MAX_PAUSE_SECS) {
             return Err(format!(
                 "duration_secs is {secs}; give 1 to {MAX_PAUSE_SECS} seconds, or leave it out \
@@ -1560,8 +1566,8 @@ impl TryFrom<SyncPauseWire> for SyncPauseParams {
     }
 }
 
-impl From<SyncPauseParams> for SyncPauseWire {
-    fn from(params: SyncPauseParams) -> Self {
+impl From<MountPauseParams> for MountPauseWire {
+    fn from(params: MountPauseParams) -> Self {
         Self {
             mount_id: params.mount_id,
             duration_secs: params.duration_secs,
@@ -1569,28 +1575,28 @@ impl From<SyncPauseParams> for SyncPauseWire {
     }
 }
 
-/// `sync.pause` result.
+/// `mount.pause` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncPauseResult {
+pub struct MountPauseResult {
     /// How many mounts this request paused.
     pub paused_mounts: u64,
     /// When the pause ends, in whole seconds since the Unix epoch (UTC); absent for a pause
-    /// until `sync.resume`.
+    /// until `mount.resume`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_until: Option<u64>,
 }
 
-/// `sync.resume` parameters.
+/// `mount.resume` parameters.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncResumeParams {
+pub struct MountResumeParams {
     /// The mount to resume; absent for every mount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mount_id: Option<MountId>,
 }
 
-/// `sync.resume` result.
+/// `mount.resume` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncResumeResult {
+pub struct MountResumeResult {
     /// How many paused mounts this request resumed.
     pub resumed_mounts: u64,
 }
@@ -1740,10 +1746,10 @@ pub enum MethodCall {
     MountAddConfirm(MountAddConfirmParams),
     /// `mount.remove`.
     MountRemove(MountRemoveParams),
-    /// `sync.pause`.
-    SyncPause(SyncPauseParams),
-    /// `sync.resume`.
-    SyncResume(SyncResumeParams),
+    /// `mount.pause`.
+    MountPause(MountPauseParams),
+    /// `mount.resume`.
+    MountResume(MountResumeParams),
     /// `item.import`.
     ItemImport(ItemImportParams),
     /// `item.export`.
@@ -1784,8 +1790,8 @@ impl MethodCall {
                 Self::MountAddConfirm(decode_redacted(method, params, CONFIRM_SHAPE)?)
             }
             method::MOUNT_REMOVE => Self::MountRemove(decode(method, params)?),
-            method::SYNC_PAUSE => Self::SyncPause(decode(method, params)?),
-            method::SYNC_RESUME => Self::SyncResume(decode(method, params)?),
+            method::MOUNT_PAUSE => Self::MountPause(decode(method, params)?),
+            method::MOUNT_RESUME => Self::MountResume(decode(method, params)?),
             method::ITEM_IMPORT => Self::ItemImport(decode(method, params)?),
             method::ITEM_EXPORT => Self::ItemExport(decode(method, params)?),
             other => return Err(RpcError::method_not_found(other)),
@@ -1822,8 +1828,8 @@ impl MethodCall {
             Self::MountAddPreview(_) => method::MOUNT_ADD_PREVIEW,
             Self::MountAddConfirm(_) => method::MOUNT_ADD_CONFIRM,
             Self::MountRemove(_) => method::MOUNT_REMOVE,
-            Self::SyncPause(_) => method::SYNC_PAUSE,
-            Self::SyncResume(_) => method::SYNC_RESUME,
+            Self::MountPause(_) => method::MOUNT_PAUSE,
+            Self::MountResume(_) => method::MOUNT_RESUME,
             Self::ItemImport(_) => method::ITEM_IMPORT,
             Self::ItemExport(_) => method::ITEM_EXPORT,
         }
@@ -1851,8 +1857,8 @@ impl MethodCall {
             Self::MountAddPreview(p) => serde_json::to_value(p)?,
             Self::MountAddConfirm(p) => serde_json::to_value(p)?,
             Self::MountRemove(p) => serde_json::to_value(p)?,
-            Self::SyncPause(p) => serde_json::to_value(p)?,
-            Self::SyncResume(p) => serde_json::to_value(p)?,
+            Self::MountPause(p) => serde_json::to_value(p)?,
+            Self::MountResume(p) => serde_json::to_value(p)?,
             Self::ItemImport(p) => serde_json::to_value(p)?,
             Self::ItemExport(p) => serde_json::to_value(p)?,
         };
@@ -2181,11 +2187,11 @@ mod tests {
                 mount_id: MountId::new("personal").unwrap(),
                 dry_run: false,
             }),
-            MethodCall::SyncPause(SyncPauseParams {
+            MethodCall::MountPause(MountPauseParams {
                 mount_id: None,
                 duration_secs: Some(7_200),
             }),
-            MethodCall::SyncResume(SyncResumeParams {
+            MethodCall::MountResume(MountResumeParams {
                 mount_id: Some(MountId::new("personal").unwrap()),
             }),
             MethodCall::ItemImport(ItemImportParams {
@@ -2262,7 +2268,7 @@ mod tests {
         // Other methods do not depend on the capability.
         assert!(
             without
-                .admit(&MethodCall::SyncResume(SyncResumeParams::default()))
+                .admit(&MethodCall::MountResume(MountResumeParams::default()))
                 .is_ok()
         );
         let result = Session::new()
@@ -2349,8 +2355,8 @@ mod tests {
             ),
             (method::MOUNT_REMOVE, json!({"mount_id": "Not A Mount Id"})),
             (method::MOUNT_REMOVE, json!({"mount_id": "m", "dry_run": 1})),
-            (method::SYNC_PAUSE, json!({"mount_id": "UPPER"})),
-            (method::SYNC_RESUME, json!({"mount_id": ""})),
+            (method::MOUNT_PAUSE, json!({"mount_id": "UPPER"})),
+            (method::MOUNT_RESUME, json!({"mount_id": ""})),
             (method::ACCOUNT_LOGIN_FINISH, json!({})),
             (
                 method::ACCOUNT_LOGIN_FINISH,
@@ -2363,7 +2369,7 @@ mod tests {
             assert!(err.message.contains(m), "{}", err.message);
         }
         // Positional parameters are refused for the new methods too.
-        for m in [method::SYNC_PAUSE, method::ACCOUNT_LOGIN_FINISH] {
+        for m in [method::MOUNT_PAUSE, method::ACCOUNT_LOGIN_FINISH] {
             let err = MethodCall::parse(m, Some(&json!(["x"]))).unwrap_err();
             assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{m}");
         }
@@ -2380,7 +2386,7 @@ mod tests {
         assert!(err.message.contains("browser, headless"), "{}", err.message);
     }
 
-    /// `sync.pause` takes 1 to `MAX_PAUSE_SECS` seconds, or no duration; and absent `mount_id`
+    /// `mount.pause` takes 1 to `MAX_PAUSE_SECS` seconds, or no duration; and absent `mount_id`
     /// means every mount, for pause and resume alike.
     #[test]
     fn pause_duration_is_bounded() {
@@ -2390,8 +2396,8 @@ mod tests {
             json!({"duration_secs": MAX_PAUSE_SECS}),
             json!({"duration_secs": null, "mount_id": null}),
         ] {
-            let call = MethodCall::parse(method::SYNC_PAUSE, Some(&ok)).unwrap();
-            let MethodCall::SyncPause(p) = call else {
+            let call = MethodCall::parse(method::MOUNT_PAUSE, Some(&ok)).unwrap();
+            let MethodCall::MountPause(p) = call else {
                 panic!("not a pause");
             };
             assert_eq!(p.mount_id, None, "{ok}");
@@ -2405,11 +2411,11 @@ mod tests {
             json!({"duration_secs": "2h"}),
             json!({"duration_secs": u64::MAX}),
         ] {
-            let err = MethodCall::parse(method::SYNC_PAUSE, Some(&bad)).unwrap_err();
+            let err = MethodCall::parse(method::MOUNT_PAUSE, Some(&bad)).unwrap_err();
             assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{bad}");
         }
-        let call = MethodCall::parse(method::SYNC_RESUME, None).unwrap();
-        assert_eq!(call, MethodCall::SyncResume(SyncResumeParams::default()));
+        let call = MethodCall::parse(method::MOUNT_RESUME, None).unwrap();
+        assert_eq!(call, MethodCall::MountResume(MountResumeParams::default()));
     }
 
     /// WP-016 AC8, ADR-0009 R8: the local side of `item.import` and `item.export` is spelled
@@ -2537,6 +2543,41 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(r.unsynced_files, 2);
+    }
+
+    /// `mount.list` tells "not paused", "paused with an end" and "paused until resumed"
+    /// apart from `state` and `paused_until`; `paused_until` is absent unless there is an
+    /// end, and uses the same representation as the `mount.pause` result.
+    #[test]
+    fn paused_until_distinguishes_pauses() {
+        let base = json!({"mount_id": "m", "account_id": "a", "drive_id": "d",
+                          "mount_point": "/m", "state": "active", "read_only": false});
+        let active: MountInfo = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(
+            (active.state.clone(), active.paused_until),
+            (MountState::Active, None)
+        );
+        let mut paused = base.clone();
+        paused["state"] = json!("paused");
+        let forever: MountInfo = serde_json::from_value(paused.clone()).unwrap();
+        assert_eq!(
+            (forever.state.clone(), forever.paused_until),
+            (MountState::Paused, None)
+        );
+        paused["paused_until"] = json!(1_794_790_800_u64);
+        let until: MountInfo = serde_json::from_value(paused.clone()).unwrap();
+        assert_eq!(until.paused_until, Some(1_794_790_800));
+        assert_eq!(serde_json::to_value(&until).unwrap(), paused);
+        assert!(
+            serde_json::to_value(&active)
+                .unwrap()
+                .get("paused_until")
+                .is_none()
+        );
+        let pause: MountPauseResult =
+            serde_json::from_value(json!({"paused_mounts": 1, "paused_until": 1_794_790_800_u64}))
+                .unwrap();
+        assert_eq!(pause.paused_until, until.paused_until);
     }
 
     /// A test challenge: 43 base64url characters, as an S256 digest is.

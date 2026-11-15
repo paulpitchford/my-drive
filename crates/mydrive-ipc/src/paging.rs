@@ -1942,6 +1942,7 @@ mod tests {
             read_only: true,
             drive_type: Some(crate::values::DriveType::DocumentLibrary),
             item_count: Some(u64::MAX),
+            paused_until: Some(u64::MAX),
         }
     }
 

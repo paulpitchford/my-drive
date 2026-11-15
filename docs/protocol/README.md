@@ -372,8 +372,8 @@ if __name__ == "__main__":
 | [`mount.add.preview`](#mountaddpreview) | Show what adding a mount would mount; changes nothing |
 | [`mount.add.confirm`](#mountaddconfirm) | Add the mount a preview showed |
 | [`mount.remove`](#mountremove) | Stop syncing a mount; never deletes remote content |
-| [`sync.pause`](#syncpause) | Pause syncing, for every mount or one, for a time or until resumed |
-| [`sync.resume`](#syncresume) | Resume syncing |
+| [`mount.pause`](#mountpause) | Pause syncing, for every mount or one, for a time or until resumed |
+| [`mount.resume`](#mountresume) | Resume syncing |
 | [`item.status`](#itemstatus) | State of a batch of paths, or of a directory and every child |
 | [`item.pin`](#item-actions) | Always keep on this device |
 | [`item.unpin`](#item-actions) | Clear the pin, back to `inherit` |
@@ -704,8 +704,16 @@ Parameters: optional `cursor`. Result: `mounts`, in byte order of `mount_id`, ea
 and, only when `blocked`, `blocked_reason` (a code, open) and `blocked_message` (text for
 people, at most 1 KiB); when known, `drive_type` (`personal`, `business` or
 `document-library`, open) and `item_count` (the items of the drive the daemon knows; while
-the mount is `resyncing` for its first enumeration, the items listed so far); and
-`next_cursor` while more remain ([pagination](#pagination)).
+the mount is `resyncing` for its first enumeration, the items listed so far);
+`paused_until`, when the mount's pause ends, in seconds since the Unix epoch (UTC), as in
+the [`mount.pause`](#mountpause) result; and `next_cursor` while more remain
+([pagination](#pagination)).
+
+`paused_until` is present whenever the mount is paused with an end, and absent when it is
+not paused or is paused until `mount.resume`. So a mount whose `state` is `paused` and has
+no `paused_until` is paused until resumed. `state` shows `blocked` over `paused`: a blocked
+mount that is also paused shows its `paused_until` if the pause has an end, but a blocked
+mount paused until resumed cannot be told from a blocked mount that is not paused.
 
 <!-- example: request -->
 ```json
@@ -727,6 +735,7 @@ the mount is `resyncing` for its first enumeration, the items listed so far); an
 <!-- example: response mount.list -->
 ```json
 {"jsonrpc": "2.0", "id": 5, "result": {"mounts": [
+  {"mount_id": "example-team-files", "account_id": "acct-work-1", "drive_id": "b!teamdriveid", "mount_point": "/home/user/Example/Team - Files", "state": "paused", "read_only": false, "drive_type": "document-library", "item_count": 1900, "paused_until": 1794790800},
   {"mount_id": "personal", "account_id": "acct-personal-1", "drive_id": "0123456789abcdef", "mount_point": "/home/user/OneDrive", "state": "active", "read_only": false, "drive_type": "personal", "item_count": 14000}
 ]}}
 ```
@@ -923,35 +932,36 @@ decided by F12; it never drops them silently.
 | `not-ready` | The daemon is starting | Retry shortly |
 | `internal` | A daemon fault | Report it |
 
-### sync.pause
+### mount.pause
 
 Parameters, both optional: `mount_id`, the mount to pause (absent for every mount), and
 `duration_secs`, how long, from 1 to 604,800 seconds (7 days; absent to pause until
-`sync.resume`). A longer pause is a pause with no duration. Pausing a paused mount replaces
+`mount.resume`). A longer pause is a pause with no duration. Pausing a paused mount replaces
 its end time. While paused, a mount sends no uploads or deletes and runs no delta; reading
 and hydrating still work, and local changes are kept for later (J15).
 
 Result: `paused_mounts`, how many mounts this request paused, and `paused_until`, when the
 pause ends, in seconds since the Unix epoch (UTC), absent for a pause with no duration.
+[`mount.list`](#mountlist) shows the same `paused_until` on each paused mount.
 
 <!-- example: request -->
 ```json
-{"jsonrpc": "2.0", "id": 49, "method": "sync.pause", "params": {"duration_secs": 7200}}
+{"jsonrpc": "2.0", "id": 49, "method": "mount.pause", "params": {"duration_secs": 7200}}
 ```
 
-<!-- example: response sync.pause -->
+<!-- example: response mount.pause -->
 ```json
 {"jsonrpc": "2.0", "id": 49, "result": {"paused_mounts": 4, "paused_until": 1794790800}}
 ```
 
 <!-- example: request rejected -->
 ```json
-{"jsonrpc": "2.0", "id": 50, "method": "sync.pause", "params": {"duration_secs": 0}}
+{"jsonrpc": "2.0", "id": 50, "method": "mount.pause", "params": {"duration_secs": 0}}
 ```
 
 <!-- example: error -->
 ```json
-{"jsonrpc": "2.0", "id": 50, "error": {"code": -32602, "message": "invalid params for sync.pause: duration_secs is 0; give 1 to 604800 seconds, or leave it out to pause until resumed"}}
+{"jsonrpc": "2.0", "id": 50, "error": {"code": -32602, "message": "invalid params for mount.pause: duration_secs is 0; give 1 to 604800 seconds, or leave it out to pause until resumed"}}
 ```
 
 | Error | When | What the client does |
@@ -962,7 +972,7 @@ pause ends, in seconds since the Unix epoch (UTC), absent for a pause with no du
 | `not-ready` | The daemon is starting | Retry shortly |
 | `internal` | A daemon fault | Report it |
 
-### sync.resume
+### mount.resume
 
 Parameters: optional `mount_id`, the mount to resume (absent for every mount). Result:
 `resumed_mounts`, how many paused mounts this request resumed. Resuming a mount that is not
@@ -970,17 +980,17 @@ paused does nothing and is not an error.
 
 <!-- example: request -->
 ```json
-{"jsonrpc": "2.0", "id": 51, "method": "sync.resume", "params": {}}
+{"jsonrpc": "2.0", "id": 51, "method": "mount.resume", "params": {}}
 ```
 
-<!-- example: response sync.resume -->
+<!-- example: response mount.resume -->
 ```json
 {"jsonrpc": "2.0", "id": 51, "result": {"resumed_mounts": 4}}
 ```
 
 <!-- example: request -->
 ```json
-{"jsonrpc": "2.0", "id": 52, "method": "sync.resume", "params": {"mount_id": "no-such-mount"}}
+{"jsonrpc": "2.0", "id": 52, "method": "mount.resume", "params": {"mount_id": "no-such-mount"}}
 ```
 
 <!-- example: error -->
@@ -1451,8 +1461,8 @@ repeated below.
 | `mount.add.preview` | `invalid-params`, `unknown-account`, `needs-sign-in`, `blocked-by-policy`, `refused`, `offline`, `hello-required`, `not-ready`, `internal` | — |
 | `mount.add.confirm` | `invalid-params`, `unknown-account`, `needs-sign-in`, `blocked-by-policy`, `refused`, `offline`, `hello-required`, `not-ready`, `internal` | — |
 | `mount.remove` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
-| `sync.pause` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
-| `sync.resume` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.pause` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.resume` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
 | `item.status` | `invalid-params`, `not-in-a-mount`, `unknown-path`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `internal` |
 | `item.pin` | `invalid-params`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `refused`, `needs-sign-in`, `blocked-by-policy`, `read-only`, `offline`, `internal` |
 | `item.unpin` | `invalid-params`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `refused`, `needs-sign-in`, `blocked-by-policy`, `read-only`, `offline`, `internal` |

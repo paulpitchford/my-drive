@@ -22,9 +22,9 @@ use mydrive_ipc::methods::{
     MAX_AUTHORIZATION_URL_BYTES, MAX_PASTED_URL_BYTES, MAX_PAUSE_SECS, MAX_SHARING_LINK_BYTES,
     MAX_STATUS_PATH_BYTES, MAX_STATUS_PATHS, MethodCall, MountAddConfirmParams,
     MountAddConfirmResult, MountAddPreviewParams, MountAddPreviewResult, MountInfo,
-    MountRemoveParams, MountRemoveResult, MountSource, MountTarget, PastedRedirect, ProposedMount,
-    SUPPORTED_VERSIONS, Session, SharingLink, SkippedItem, StatusSubscribeParams,
-    StatusSubscribeResult, SyncPauseParams, SyncPauseResult, SyncResumeParams, SyncResumeResult,
+    MountPauseParams, MountPauseResult, MountRemoveParams, MountRemoveResult, MountResumeParams,
+    MountResumeResult, MountSource, MountTarget, PastedRedirect, ProposedMount, SUPPORTED_VERSIONS,
+    Session, SharingLink, SkippedItem, StatusSubscribeParams, StatusSubscribeResult,
     encoded_path_bytes, method,
 };
 use mydrive_ipc::paging::{
@@ -211,6 +211,7 @@ fn worst_mount_list() {
             read_only: true,
             drive_type: Some(DriveType::Other("\"".repeat(200))),
             item_count: Some(u64::MAX),
+            paused_until: Some(u64::MAX),
         })
         .collect();
     let mut source = VecSource {
@@ -431,6 +432,7 @@ fn worst_mount_info() -> MountInfo {
         read_only: true,
         drive_type: Some(DriveType::Other("\"".repeat(200))),
         item_count: Some(u64::MAX),
+        paused_until: Some(u64::MAX),
     }
 }
 
@@ -614,32 +616,32 @@ fn worst_mount_remove() {
 }
 
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
-fn worst_pause_resume() {
+fn worst_mount_pause_resume() {
     assert_request_fits(
-        &MethodCall::SyncPause(SyncPauseParams {
+        &MethodCall::MountPause(MountPauseParams {
             mount_id: Some(MountId::new("m".repeat(64)).unwrap()),
             duration_secs: Some(MAX_PAUSE_SECS),
         }),
-        method::SYNC_PAUSE,
+        method::MOUNT_PAUSE,
     );
     assert_request_fits(
-        &MethodCall::SyncResume(SyncResumeParams {
+        &MethodCall::MountResume(MountResumeParams {
             mount_id: Some(MountId::new("m".repeat(64)).unwrap()),
         }),
-        method::SYNC_RESUME,
+        method::MOUNT_RESUME,
     );
     assert_result_fits(
-        &SyncPauseResult {
+        &MountPauseResult {
             paused_mounts: u64::MAX,
             paused_until: Some(u64::MAX),
         },
-        method::SYNC_PAUSE,
+        method::MOUNT_PAUSE,
     );
     assert_result_fits(
-        &SyncResumeResult {
+        &MountResumeResult {
             resumed_mounts: u64::MAX,
         },
-        method::SYNC_RESUME,
+        method::MOUNT_RESUME,
     );
 }
 
@@ -707,8 +709,8 @@ fn variant_name(call: &MethodCall) -> &'static str {
         MethodCall::MountAddPreview(_) => "MountAddPreview",
         MethodCall::MountAddConfirm(_) => "MountAddConfirm",
         MethodCall::MountRemove(_) => "MountRemove",
-        MethodCall::SyncPause(_) => "SyncPause",
-        MethodCall::SyncResume(_) => "SyncResume",
+        MethodCall::MountPause(_) => "MountPause",
+        MethodCall::MountResume(_) => "MountResume",
         MethodCall::ItemImport(_) => "ItemImport",
         MethodCall::ItemExport(_) => "ItemExport",
     }
@@ -766,8 +768,8 @@ fn one_call_per_variant() -> Vec<MethodCall> {
             mount_id: MountId::new("m").unwrap(),
             dry_run: false,
         }),
-        MethodCall::SyncPause(SyncPauseParams::default()),
-        MethodCall::SyncResume(SyncResumeParams::default()),
+        MethodCall::MountPause(MountPauseParams::default()),
+        MethodCall::MountResume(MountResumeParams::default()),
         MethodCall::ItemImport(ItemImportParams {
             source: LocalPath::new("/a").unwrap(),
             destination: ProtocolPath::new("/m/a").unwrap(),
@@ -854,7 +856,7 @@ fn every_method_and_notification_is_bounded() {
             method::MOUNT_ADD_PREVIEW => worst_mount_add_preview(),
             method::MOUNT_ADD_CONFIRM => worst_mount_add_confirm(),
             method::MOUNT_REMOVE => worst_mount_remove(),
-            method::SYNC_PAUSE | method::SYNC_RESUME => worst_pause_resume(),
+            method::MOUNT_PAUSE | method::MOUNT_RESUME => worst_mount_pause_resume(),
             method::ITEM_IMPORT | method::ITEM_EXPORT => worst_import_export(),
             method::STATUS_CHANGED => worst_status_changed(),
             other => panic!("{other} has no worst-case bound; add one before adding the method"),

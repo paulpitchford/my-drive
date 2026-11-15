@@ -16,9 +16,9 @@ use mydrive_ipc::error::RpcError;
 use mydrive_ipc::methods::{
     AccountInfo, AttemptId, AuthorizationUrl, ConfirmationToken, HelloParams, ItemExportResult,
     ItemImportResult, ItemInfo, LocalPath, LoginFinishResult, LoginStartResult, LogoutResult,
-    MethodCall, MountAddConfirmResult, MountAddPreviewResult, MountInfo, MountRemoveResult,
-    MountSource, MountTarget, PastedRedirect, ProposedMount, SUPPORTED_VERSIONS, Session,
-    SharingLink, SyncPauseResult, SyncResumeResult, method,
+    MethodCall, MountAddConfirmResult, MountAddPreviewResult, MountInfo, MountPauseResult,
+    MountRemoveResult, MountResumeResult, MountSource, MountTarget, PastedRedirect, ProposedMount,
+    SUPPORTED_VERSIONS, Session, SharingLink, method,
 };
 use mydrive_ipc::paging::ConfirmationLedger;
 use mydrive_ipc::path::ProtocolPath;
@@ -205,6 +205,7 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
         read_only: false,
         drive_type: Some(DriveType::DocumentLibrary),
         item_count: Some(0),
+        paused_until: None,
     };
     let mut ledger = ConfirmationLedger::new();
     let token = ledger.issue(&link_target(), "payload", 0).unwrap();
@@ -259,11 +260,11 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
                 kept_files: 140,
                 unsynced_files: 0,
             }),
-            method::SYNC_PAUSE => result_line(&SyncPauseResult {
+            method::MOUNT_PAUSE => result_line(&MountPauseResult {
                 paused_mounts: 4,
                 paused_until: Some(1_794_790_800),
             }),
-            method::SYNC_RESUME => result_line(&SyncResumeResult { resumed_mounts: 4 }),
+            method::MOUNT_RESUME => result_line(&MountResumeResult { resumed_mounts: 4 }),
             method::ITEM_IMPORT => result_line(&ItemImportResult {
                 path: ProtocolPath::new("/home/user/OneDrive/a.pdf").unwrap(),
                 item: item(),
