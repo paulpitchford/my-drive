@@ -1,5 +1,7 @@
 //! Bounded results: pages of `item.status`, `mount.list` and `account.list`, and action
-//! results and change notifications that each fit one line (ADR-0020).
+//! results and change notifications that each fit one line (ADR-0020). Also the confirmation
+//! tokens of `mount.add.preview`, which are bound to their request the way cursors are
+//! ([`ConfirmationLedger`]).
 //!
 //! # Cursors
 //!
@@ -30,11 +32,12 @@ use crate::codec::MAX_LINE_BYTES;
 use crate::envelope::{Id, Notification, SuccessResponse};
 use crate::error::{ErrorCode, RpcError, truncate_to};
 use crate::methods::{
-    AccountInfo, AccountListResult, ActionOutcome, ItemActionEntry, ItemActionResult,
-    ItemStatusEntry, ItemStatusResult, MountInfo, MountListResult, SkippedItem,
-    StatusChangedParams, method,
+    AccountInfo, AccountListResult, ActionOutcome, ConfirmationToken, ItemActionEntry,
+    ItemActionResult, ItemStatusEntry, ItemStatusResult, MountInfo, MountListResult, MountSource,
+    MountTarget, SkippedItem, StatusChangedParams, method,
 };
 use crate::path::ProtocolPath;
+use crate::values::MountTargetKind;
 
 /// How many rows the pagers ask a source for at a time.
 const CHUNK: usize = 256;
@@ -561,6 +564,190 @@ pub fn action_result(id: &Id, reports: Vec<ActionReport>) -> Result<ItemActionRe
 fn capped(mut error: RpcError, max: usize) -> RpcError {
     error.message = truncate_to(&error.message, max);
     error
+}
+
+/// Confirms that a single (unpaged) result fits one line with the response for request `id`
+/// (ADR-0020 R4), returning it unchanged.
+///
+/// Every text field a result carries for display is capped at 1 KiB, but the identifiers
+/// inside it (`account_id`, `tenant_id`, `drive_id`) have no protocol length limit. A result
+/// that would not fit is never sent; the daemon answers `internal` instead.
+///
+/// # Errors
+///
+/// `internal` if the encoded response is over the line limit, or cannot be encoded.
+pub fn fit_result<R: Serialize>(id: &Id, result: R) -> Result<R, RpcError> {
+    checked(id, result)
+}
+
+/// How long a preview's confirmation token stays valid, in seconds.
+pub const PREVIEW_LIFETIME_SECS: u64 = 600;
+
+/// The most previews awaiting confirmation at once. Issuing one more forgets the oldest, whose
+/// token is then refused with `restart-preview`.
+pub const MAX_PENDING_PREVIEWS: usize = 32;
+
+struct PendingPreview<T> {
+    nonce: u64,
+    binding: String,
+    issued_at: u64,
+    payload: T,
+}
+
+/// The previews awaiting `mount.add.confirm` (WP-016 AC6).
+///
+/// [`ConfirmationLedger::issue`] gives a token bound to the preview's target;
+/// [`ConfirmationLedger::redeem`] accepts it once, with the same target, within
+/// [`PREVIEW_LIFETIME_SECS`]. Anything else is `invalid-params` with reason
+/// `restart-preview`: a token used twice, with another target, after it expired, after the
+/// ledger forgot it, or one this ledger did not issue (including one from before a daemon
+/// restart).
+///
+/// A token is `c1.` + a 16-hex-digit sequence number + `.` + 16 hex digits of a SHA-256
+/// binding over the number and the target. It holds no daemon state and nothing readable of
+/// the target: a sharing link enters only the hash (ADR-0010 R6). It is not a secret: it only
+/// stops a confirmation from attaching something the user was not shown.
+///
+/// `payload` is whatever the engine needs to finish the mount (the resolved drive); `now_secs`
+/// comes from the daemon's clock, so the ledger itself reads no clock.
+pub struct ConfirmationLedger<T> {
+    next: u64,
+    pending: VecDeque<PendingPreview<T>>,
+}
+
+impl<T> std::fmt::Debug for ConfirmationLedger<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfirmationLedger")
+            .field("next", &self.next)
+            .field("pending", &self.pending.len())
+            .finish()
+    }
+}
+
+impl<T> Default for ConfirmationLedger<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn target_binding(nonce: u64, target: &MountTarget) -> String {
+    let nonce = format!("{nonce:016x}");
+    let (kind, value) = match &target.source {
+        MountSource::OwnDrive => (MountTargetKind::OwnDrive, ""),
+        MountSource::Drive(drive) => (MountTargetKind::DriveId, drive.as_str()),
+        MountSource::SharingLink(link) => (MountTargetKind::SharingLink, link.expose()),
+    };
+    let mut bound = binding(
+        "mount-target",
+        &[&nonce, target.account_id.as_str(), kind.as_str(), value],
+    );
+    bound.truncate(16);
+    bound
+}
+
+fn confirmation_token(nonce: u64, binding: &str) -> Result<ConfirmationToken, RpcError> {
+    ConfirmationToken::new(format!("c1.{nonce:016x}.{binding}"))
+        .map_err(|e| internal("cannot build a confirmation token", e))
+}
+
+/// The sequence number and binding a token names, accepting only the exact form issued.
+fn parse_token(token: &ConfirmationToken) -> Option<(u64, &str)> {
+    let rest = token.as_str().strip_prefix("c1.")?;
+    let (nonce, bound) = rest.split_once('.')?;
+    let lower_hex =
+        |s: &str| s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !lower_hex(nonce) || !lower_hex(bound) {
+        return None;
+    }
+    u64::from_str_radix(nonce, 16).ok().map(|n| (n, bound))
+}
+
+impl<T> ConfirmationLedger<T> {
+    /// An empty ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next: 0,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// How many previews await confirmation.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// True when no preview awaits confirmation.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn forget_expired(&mut self, now_secs: u64) {
+        self.pending
+            .retain(|p| now_secs.saturating_sub(p.issued_at) < PREVIEW_LIFETIME_SECS);
+    }
+
+    /// Records a preview of `target` and returns its token.
+    ///
+    /// # Errors
+    ///
+    /// `internal` only if the token cannot be built, which its fixed form rules out.
+    pub fn issue(
+        &mut self,
+        target: &MountTarget,
+        payload: T,
+        now_secs: u64,
+    ) -> Result<ConfirmationToken, RpcError> {
+        self.forget_expired(now_secs);
+        while self.pending.len() >= MAX_PENDING_PREVIEWS {
+            self.pending.pop_front();
+        }
+        let nonce = self.next;
+        self.next = self.next.wrapping_add(1);
+        let binding = target_binding(nonce, target);
+        let token = confirmation_token(nonce, &binding)?;
+        self.pending.push_back(PendingPreview {
+            nonce,
+            binding,
+            issued_at: now_secs,
+            payload,
+        });
+        Ok(token)
+    }
+
+    /// Accepts `token` for `target` once, returning the preview's payload.
+    ///
+    /// A token offered with another target is refused and stays valid for its own target,
+    /// since nothing happened. A redeemed or expired token is forgotten.
+    ///
+    /// # Errors
+    ///
+    /// `invalid-params` with reason `restart-preview` for anything but an outstanding token
+    /// issued for `target`. The error repeats neither the token nor the target.
+    pub fn redeem(
+        &mut self,
+        token: &ConfirmationToken,
+        target: &MountTarget,
+        now_secs: u64,
+    ) -> Result<T, RpcError> {
+        self.forget_expired(now_secs);
+        let refused = || RpcError::restart_preview(method::MOUNT_ADD_CONFIRM);
+        let (nonce, bound) = parse_token(token).ok_or_else(refused)?;
+        let index = self
+            .pending
+            .iter()
+            .position(|p| p.nonce == nonce && p.binding == bound)
+            .ok_or_else(refused)?;
+        if target_binding(nonce, target) != bound {
+            return Err(refused());
+        }
+        self.pending
+            .remove(index)
+            .map(|p| p.payload)
+            .ok_or_else(refused)
+    }
 }
 
 /// Splits one change, at change sequence number `seq`, into `status.changed` notifications
@@ -1582,6 +1769,166 @@ mod tests {
         }
     }
 
+    fn mount_target(source: crate::methods::MountSource) -> MountTarget {
+        MountTarget {
+            account_id: mydrive_core::ids::AccountId::new("acct-work-1").unwrap(),
+            source,
+        }
+    }
+
+    const LINK: &str = "https://example.sharepoint.com/:f:/s/Finance/EjK3pQ2-planted-link";
+
+    fn link(text: &str) -> MountTarget {
+        mount_target(crate::methods::MountSource::SharingLink(
+            crate::methods::SharingLink::new(text).unwrap(),
+        ))
+    }
+
+    fn drive(id: &str) -> MountTarget {
+        mount_target(crate::methods::MountSource::Drive(
+            mydrive_core::ids::DriveId::new(id).unwrap(),
+        ))
+    }
+
+    fn is_restart_preview(err: &RpcError) -> bool {
+        err.kind() == Some(ErrorCode::InvalidParams)
+            && err.invalid_params_reason()
+                == Some(crate::values::InvalidParamsReason::RestartPreview)
+    }
+
+    /// WP-016 AC6: a confirmation token is accepted once, for the target it was issued for;
+    /// used twice, or with a different target, it is refused with `invalid-params`.
+    #[test]
+    fn confirmation_tokens_are_single_use_and_bound_to_their_target() {
+        let mut ledger = ConfirmationLedger::new();
+        let own = mount_target(crate::methods::MountSource::OwnDrive);
+        let token = ledger.issue(&link(LINK), "finance", 100).unwrap();
+        // Another target of every kind, another account, another link: refused, and the
+        // token stays valid for its own target.
+        let other_account = MountTarget {
+            account_id: mydrive_core::ids::AccountId::new("acct-work-2").unwrap(),
+            ..link(LINK)
+        };
+        for wrong in [
+            own.clone(),
+            drive("b!finance"),
+            link(&format!("{LINK}x")),
+            other_account,
+        ] {
+            let err = ledger.redeem(&token, &wrong, 101).unwrap_err();
+            assert!(is_restart_preview(&err), "{err}");
+        }
+        assert_eq!(ledger.redeem(&token, &link(LINK), 102), Ok("finance"));
+        // Twice: refused.
+        let err = ledger.redeem(&token, &link(LINK), 103).unwrap_err();
+        assert!(is_restart_preview(&err), "{err}");
+        assert!(ledger.is_empty());
+
+        // Two previews of the same target get different tokens, each usable once.
+        let a = ledger.issue(&own, "a", 0).unwrap();
+        let b = ledger.issue(&own, "b", 0).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(ledger.redeem(&b, &own, 1), Ok("b"));
+        assert_eq!(ledger.redeem(&a, &own, 1), Ok("a"));
+    }
+
+    /// WP-016 AC6: the token is opaque and does not encode the sharing link readably: it is
+    /// short, of a fixed form, and holds none of the link's text.
+    #[test]
+    fn confirmation_tokens_do_not_encode_the_link() {
+        let mut ledger = ConfirmationLedger::new();
+        let token = ledger.issue(&link(LINK), (), 0).unwrap();
+        let text = token.as_str();
+        assert_eq!(text.len(), 36, "{text}");
+        assert!(text.starts_with("c1.0000000000000000."), "{text}");
+        let hex_link = to_hex(LINK.as_bytes());
+        for needle in ["planted", "sharepoint", "Finance", &hex_link[..16]] {
+            assert!(!text.contains(needle), "{text} contains {needle}");
+        }
+        assert!(text.len() <= crate::methods::MAX_CONFIRMATION_TOKEN_BYTES);
+    }
+
+    /// A forged, altered or foreign token, an expired one, and one forgotten because too many
+    /// previews followed it, are all refused with `restart-preview`.
+    #[test]
+    fn stale_forged_and_forgotten_tokens_are_refused() {
+        let own = mount_target(crate::methods::MountSource::OwnDrive);
+        let mut ledger = ConfirmationLedger::new();
+        let token = ledger.issue(&own, 1, 1_000).unwrap();
+        let text = token.as_str().to_owned();
+        let mut forged = vec![
+            text.replacen("c1.", "c2.", 1),
+            text.replacen("c1.", "C1.", 1),
+            format!("{text}0"),
+            text[..text.len() - 1].to_owned(),
+            "c1.0000000000000001".to_owned(),
+            "x".to_owned(),
+        ];
+        // Flip each hex digit of the binding in turn.
+        for i in 20..36 {
+            let mut bytes = text.clone().into_bytes();
+            bytes[i] = if bytes[i] == b'0' { b'1' } else { b'0' };
+            forged.push(String::from_utf8(bytes).unwrap());
+        }
+        for bad in forged {
+            let Ok(bad) = ConfirmationToken::new(bad.clone()) else {
+                continue;
+            };
+            let err = ledger.redeem(&bad, &own, 1_001).unwrap_err();
+            assert!(is_restart_preview(&err), "{bad:?}");
+        }
+        // A fresh ledger (a restarted daemon) did not issue it.
+        let mut restarted: ConfirmationLedger<i32> = ConfirmationLedger::new();
+        assert!(is_restart_preview(
+            &restarted.redeem(&token, &own, 1_001).unwrap_err()
+        ));
+        // Expired: refused at the lifetime, accepted just before it.
+        let mut ledger = ConfirmationLedger::new();
+        let token = ledger.issue(&own, 2, 1_000).unwrap();
+        let late = 1_000 + PREVIEW_LIFETIME_SECS;
+        assert!(is_restart_preview(
+            &ledger.redeem(&token, &own, late).unwrap_err()
+        ));
+        let token = ledger.issue(&own, 3, 1_000).unwrap();
+        assert_eq!(ledger.redeem(&token, &own, late - 1), Ok(3));
+        // Forgotten: the oldest preview goes when the ledger is full.
+        let mut ledger = ConfirmationLedger::new();
+        let first = ledger.issue(&own, 0, 0).unwrap();
+        for i in 1..=MAX_PENDING_PREVIEWS {
+            ledger.issue(&own, i, 0).unwrap();
+        }
+        assert_eq!(ledger.len(), MAX_PENDING_PREVIEWS);
+        assert!(is_restart_preview(
+            &ledger.redeem(&first, &own, 0).unwrap_err()
+        ));
+    }
+
+    /// The refusal repeats neither the token nor the target, which may be a sharing link.
+    #[test]
+    fn confirmation_refusals_repeat_nothing() {
+        let mut ledger = ConfirmationLedger::new();
+        let token = ledger.issue(&link(LINK), (), 0).unwrap();
+        let err = ledger
+            .redeem(&token, &link(&format!("{LINK}-other")), 0)
+            .unwrap_err();
+        let text = serde_json::to_string(&err).unwrap();
+        assert!(!text.contains("planted"), "{text}");
+        assert!(!text.contains(token.as_str()), "{text}");
+        assert!(!format!("{ledger:?}").contains("planted"));
+    }
+
+    /// ADR-0020 R4: a single result that cannot fit one line is refused with `internal`
+    /// rather than sent.
+    #[test]
+    fn oversize_single_results_are_internal_errors() {
+        let mut mount = worst_mount(1);
+        let id = Id::Number(1);
+        assert!(fit_result(&id, mount.clone()).is_ok());
+        mount.drive_id = mydrive_core::ids::DriveId::new("d".repeat(MAX_LINE_BYTES)).unwrap();
+        let err = fit_result(&id, mount).unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::Internal));
+    }
+
     fn worst_mount(i: usize) -> MountInfo {
         use mydrive_core::ids::{AccountId, DriveId, MountId};
         MountInfo {
@@ -1593,6 +1940,8 @@ mod tests {
             blocked_reason: Some(crate::values::BlockedReason::OrganisationPolicy),
             blocked_message: Some("\u{1}".repeat(100_000)),
             read_only: true,
+            drive_type: Some(crate::values::DriveType::DocumentLibrary),
+            item_count: Some(u64::MAX),
         }
     }
 
@@ -1636,6 +1985,8 @@ mod tests {
                 kind: crate::values::AccountKind::Work,
                 tenant_id: Some(TenantId::new("\"".repeat(400)).unwrap()),
                 state: crate::values::AccountState::NeedsSignIn,
+                user_name: Some(format!("user{i}@example.com")),
+                display_name: Some("Example User".into()),
             })
             .collect();
         let mut source = AccountSource(accounts.clone());

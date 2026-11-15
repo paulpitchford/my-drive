@@ -167,6 +167,127 @@ open_enum! {
         RemoteChanged => "remote-changed",
         /// The content does not fit on the backing filesystem (F06).
         InsufficientSpace => "insufficient-space",
+        /// `item.import` with mode `create`: an item already exists at the destination.
+        AlreadyExists => "already-exists",
+        /// The item is a folder where a file is needed (`item.import` with mode `replace`,
+        /// `item.export`).
+        NotAFile => "not-a-file",
+        /// The name cannot exist on the server (`item.import`).
+        NameNotAllowed => "name-not-allowed",
+        /// `mount.add.confirm`: the mount point exists and is not an empty directory (F02).
+        MountPointNotEmpty => "mount-point-not-empty",
+        /// `mount.add.confirm`: the mount point is inside another mount or the daemon's data
+        /// directory, or contains a mount (overview "Nested and overlapping mounts").
+        MountPointOverlaps => "mount-point-overlaps",
+        /// `mount.add.*`: the drive is already mounted; `data.mount_id` names that mount
+        /// (ADR-0007 R4).
+        AlreadyMounted => "already-mounted",
+        /// `mount.add.*`: the account cannot open this link or drive (F09 "no access").
+        NoAccess => "no-access",
+        /// `mount.add.*`: the target is not something this version can mount, for example a
+        /// shared folder in another person's OneDrive (F09).
+        UnsupportedTarget => "unsupported-target",
+    }
+}
+
+open_enum! {
+    /// Why a sign-in failed (error code `sign-in-failed`). Open set. Each reason says whether
+    /// the attempt is still pending; a client treats an unknown reason as "the attempt is
+    /// gone, start again".
+    pub enum SignInFailure, kind = "sign-in failure" {
+        /// No pending attempt has this ID: it never existed, finished, or was cancelled or
+        /// discarded. Start again.
+        AttemptNotFound => "attempt-not-found",
+        /// The attempt ran out of time (10 minutes, F01 step 3) and was discarded. Start again.
+        AttemptExpired => "attempt-expired",
+        /// The redirect's `state` does not belong to the attempt; the attempt is cancelled
+        /// (ADR-0010 R10, F01 step 8). Start again.
+        StateMismatch => "state-mismatch",
+        /// The pasted address is not a redirect to the attempt's redirect URI, or is
+        /// malformed. The attempt is still pending: paste again.
+        NotARedirect => "not-a-redirect",
+        /// The identity platform put an error in the redirect (for example consent refused).
+        /// The attempt is still pending: paste again or start again.
+        AuthorizationError => "authorization-error",
+        /// The identity platform refused to exchange the code (for example it expired). The
+        /// attempt is gone. Start again.
+        CodeRejected => "code-rejected",
+        /// No Secret Service is available; nothing was persisted. The message names
+        /// `mydrive doctor` (ADR-0010 R7). The attempt is gone.
+        NoSecretService => "no-secret-service",
+        /// The loopback listener could not be bound (browser mode). Use headless mode.
+        LoopbackUnavailable => "loopback-unavailable",
+    }
+}
+
+open_enum! {
+    /// Why a local path given to `item.import` or `item.export` could not be used (error code
+    /// `local-file-error`). Open set.
+    pub enum LocalFileReason, kind = "local file reason" {
+        /// Nothing exists at the path, or a directory leading to it is missing.
+        NotFound => "not-found",
+        /// The path names a directory or another non-regular file.
+        NotAFile => "not-a-file",
+        /// The daemon may not read or write the path.
+        PermissionDenied => "permission-denied",
+        /// `item.export` with mode `create`: something already exists at the path.
+        AlreadyExists => "already-exists",
+        /// The path, once resolved, is under a mount point or the daemon's data directory.
+        InsideMount => "inside-mount",
+        /// The local filesystem is full.
+        NoSpace => "no-space",
+        /// Any other read or write failure.
+        IoError => "io-error",
+    }
+}
+
+open_enum! {
+    /// The type of a drive, as Graph's `driveType` reports it, in kebab-case. Open set.
+    pub enum DriveType, kind = "drive type" {
+        /// A personal OneDrive.
+        Personal => "personal",
+        /// A OneDrive for Business.
+        Business => "business",
+        /// A SharePoint document library.
+        DocumentLibrary => "document-library",
+    }
+}
+
+open_enum! {
+    /// How `account.login.start` signs in (ADR-0010). Open set: a later daemon may add a mode
+    /// (device code, gate G5). A request with a mode this daemon does not know is refused with
+    /// `invalid-params`; it is never replaced by a default.
+    pub enum LoginMode, kind = "login mode" {
+        /// The system browser with a loopback redirect.
+        Browser => "browser",
+        /// The user opens the URL on any device and pastes the address the browser ends on.
+        Headless => "headless",
+    }
+}
+
+open_enum! {
+    /// What `mount.add.preview` and `mount.add.confirm` mount. Open set: a later daemon may add
+    /// a kind (a Teams channel, F09). An unknown kind in a request is refused with
+    /// `invalid-params`.
+    pub enum MountTargetKind, kind = "mount target" {
+        /// The signed-in account's own drive.
+        OwnDrive => "own-drive",
+        /// A drive named by `drive_id`.
+        DriveId => "drive-id",
+        /// The drive a sharing link points into, named by `sharing_link`.
+        SharingLink => "sharing-link",
+    }
+}
+
+open_enum! {
+    /// What `item.import` and `item.export` do about the destination. Open set; an unknown
+    /// mode in a request is refused with `invalid-params`. There is no default: a client
+    /// always says whether it means to replace.
+    pub enum TransferMode, kind = "transfer mode" {
+        /// The destination must not exist.
+        Create => "create",
+        /// The destination must exist and is replaced.
+        Replace => "replace",
     }
 }
 
@@ -210,8 +331,19 @@ open_enum! {
         /// daemon does not issue: start the listing again from the first page, without a
         /// cursor.
         RestartListing => "restart-listing",
+        /// The confirmation token is unknown, already used, expired, or was issued for other
+        /// parameters: call `mount.add.preview` again.
+        RestartPreview => "restart-preview",
     }
 }
+
+/// The capability `hello` advertises when the daemon offers `item.import` and `item.export`.
+/// A daemon may withdraw it in a later release; without it both methods get
+/// `method-not-found`.
+pub const CAPABILITY_IMPORT_EXPORT: &str = "item-import-export";
+
+/// Every capability this build knows.
+pub const CAPABILITIES: &[&str] = &[CAPABILITY_IMPORT_EXPORT];
 
 /// Implements conversion between a closed `mydrive-core` axis and its open wire type.
 macro_rules! wire_axis {
@@ -434,6 +566,46 @@ pub const VALUE_SETS: &[ValueSet] = &[
         known: Some(InvalidParamsReason::KNOWN),
     },
     ValueSet {
+        fields: &["sign-in-failed.data.reason"],
+        type_name: "SignInFailure",
+        open: true,
+        known: Some(SignInFailure::KNOWN),
+    },
+    ValueSet {
+        fields: &["local-file-error.data.reason"],
+        type_name: "LocalFileReason",
+        open: true,
+        known: Some(LocalFileReason::KNOWN),
+    },
+    ValueSet {
+        fields: &[
+            "mount.drive_type",
+            "mount.add.preview.drive_type",
+            "account.login.finish.proposed_mount.drive_type",
+        ],
+        type_name: "DriveType",
+        open: true,
+        known: Some(DriveType::KNOWN),
+    },
+    ValueSet {
+        fields: &["account.login.start.mode"],
+        type_name: "LoginMode",
+        open: true,
+        known: Some(LoginMode::KNOWN),
+    },
+    ValueSet {
+        fields: &["mount.add.preview.target", "mount.add.confirm.target"],
+        type_name: "MountTargetKind",
+        open: true,
+        known: Some(MountTargetKind::KNOWN),
+    },
+    ValueSet {
+        fields: &["item.import.mode", "item.export.mode"],
+        type_name: "TransferMode",
+        open: true,
+        known: Some(TransferMode::KNOWN),
+    },
+    ValueSet {
         fields: &["error.code"],
         type_name: "i64",
         open: true,
@@ -443,7 +615,7 @@ pub const VALUE_SETS: &[ValueSet] = &[
         fields: &["hello.capabilities"],
         type_name: "String",
         open: true,
-        known: None,
+        known: Some(CAPABILITIES),
     },
 ];
 
@@ -499,6 +671,12 @@ mod tests {
         open_round_trip::<WirePin>();
         open_round_trip::<WireEffectivePin>();
         open_round_trip::<WireSync>();
+        open_round_trip::<SignInFailure>();
+        open_round_trip::<LocalFileReason>();
+        open_round_trip::<DriveType>();
+        open_round_trip::<LoginMode>();
+        open_round_trip::<MountTargetKind>();
+        open_round_trip::<TransferMode>();
         assert_eq!(
             MountState::from_wire("frozen"),
             MountState::Other("frozen".into())

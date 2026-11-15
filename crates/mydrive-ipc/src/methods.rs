@@ -21,8 +21,9 @@ use crate::envelope::{Id, Request};
 use crate::error::{ErrorCode, RpcError, cap_message, serialize_capped_opt};
 use crate::path::ProtocolPath;
 use crate::values::{
-    AccountKind, AccountState, BlockedReason, ItemReason, MountState, WireEffectivePin,
-    WireHydration, WireModifiers, WirePin, WireSync,
+    AccountKind, AccountState, BlockedReason, CAPABILITY_IMPORT_EXPORT, DriveType, ItemReason,
+    LoginMode, MountState, MountTargetKind, TransferMode, WireEffectivePin, WireHydration,
+    WireModifiers, WirePin, WireSync,
 };
 
 /// The protocol major version this build speaks.
@@ -55,6 +56,26 @@ pub mod method {
     pub const STATUS_SUBSCRIBE: &str = "status.subscribe";
     /// Notification sent on a subscribed connection when item state changes.
     pub const STATUS_CHANGED: &str = "status.changed";
+    /// Begin signing an account in.
+    pub const ACCOUNT_LOGIN_START: &str = "account.login.start";
+    /// Complete a sign-in begun with `account.login.start`.
+    pub const ACCOUNT_LOGIN_FINISH: &str = "account.login.finish";
+    /// Sign an account out.
+    pub const ACCOUNT_LOGOUT: &str = "account.logout";
+    /// Show what adding a mount would mount, without changing anything.
+    pub const MOUNT_ADD_PREVIEW: &str = "mount.add.preview";
+    /// Add the mount a preview showed.
+    pub const MOUNT_ADD_CONFIRM: &str = "mount.add.confirm";
+    /// Stop syncing a mount. Never deletes remote content.
+    pub const MOUNT_REMOVE: &str = "mount.remove";
+    /// Pause syncing.
+    pub const SYNC_PAUSE: &str = "sync.pause";
+    /// Resume syncing.
+    pub const SYNC_RESUME: &str = "sync.resume";
+    /// Copy a local file into a mount (capability `item-import-export`).
+    pub const ITEM_IMPORT: &str = "item.import";
+    /// Copy a file out of a mount (capability `item-import-export`).
+    pub const ITEM_EXPORT: &str = "item.export";
 
     /// Every request method in protocol version 1.
     pub const ALL: &[&str] = &[
@@ -68,7 +89,25 @@ pub mod method {
         ITEM_HYDRATE,
         ITEM_DEHYDRATE,
         STATUS_SUBSCRIBE,
+        ACCOUNT_LOGIN_START,
+        ACCOUNT_LOGIN_FINISH,
+        ACCOUNT_LOGOUT,
+        MOUNT_ADD_PREVIEW,
+        MOUNT_ADD_CONFIRM,
+        MOUNT_REMOVE,
+        SYNC_PAUSE,
+        SYNC_RESUME,
+        ITEM_IMPORT,
+        ITEM_EXPORT,
     ];
+
+    /// The methods offered only while `hello` advertises
+    /// [`crate::values::CAPABILITY_IMPORT_EXPORT`].
+    pub const IMPORT_EXPORT: &[&str] = &[ITEM_IMPORT, ITEM_EXPORT];
+
+    /// The methods whose parameters may hold a credential or a sharing link. Their
+    /// `invalid-params` messages never repeat a parameter value (ADR-0010 R6).
+    pub const REDACTED: &[&str] = &[ACCOUNT_LOGIN_FINISH, MOUNT_ADD_PREVIEW, MOUNT_ADD_CONFIRM];
 
     /// Every notification method in protocol version 1.
     pub const NOTIFICATIONS: &[&str] = &[STATUS_CHANGED];
@@ -191,6 +230,21 @@ pub struct AccountInfo {
     pub tenant_id: Option<TenantId>,
     /// Signed in, or needing sign-in. Open set.
     pub state: AccountState,
+    /// The name the account signs in with, as Graph reports it (`userPrincipalName`, often an
+    /// email address). For display; never a credential. Capped at 1 KiB like every message.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_capped_opt"
+    )]
+    pub user_name: Option<String>,
+    /// The person's name, as Graph reports it. For display; capped at 1 KiB.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_capped_opt"
+    )]
+    pub display_name: Option<String>,
 }
 
 /// `account.list` result: one page, in byte order of `account_id`.
@@ -229,6 +283,13 @@ pub struct MountInfo {
     pub blocked_message: Option<String>,
     /// True for a read-only library.
     pub read_only: bool,
+    /// The drive's type, when known. Open set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drive_type: Option<DriveType>,
+    /// How many items of the drive the daemon knows: while the mount is `resyncing` for its
+    /// first enumeration, the items listed so far. Absent when not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<u64>,
 }
 
 /// `mount.list` result: one page, in byte order of `mount_id`.
@@ -720,6 +781,928 @@ pub struct StatusChangedParams {
     pub refresh: Vec<ProtocolPath>,
 }
 
+// ---------------------------------------------------------------------------------------
+// Methods added for M1 (WP-016): sign-in, mounts, pause, import and export.
+// ---------------------------------------------------------------------------------------
+
+/// The longest [`AttemptId`], in bytes. Shorter than the shortest PKCE verifier (43
+/// characters, RFC 7636), and far shorter than any authorisation code or token, so an attempt
+/// ID cannot carry one (ADR-0010 R6).
+pub const MAX_ATTEMPT_ID_BYTES: usize = 40;
+
+/// The longest authorisation URL `account.login.start` returns, in bytes.
+pub const MAX_AUTHORIZATION_URL_BYTES: usize = 4096;
+
+/// The longest redirect address `account.login.finish` accepts, in bytes.
+pub const MAX_PASTED_URL_BYTES: usize = 8192;
+
+/// The longest sharing link `mount.add.preview` and `mount.add.confirm` accept, in bytes.
+pub const MAX_SHARING_LINK_BYTES: usize = 4096;
+
+/// The longest confirmation token, in bytes. Like [`MAX_ATTEMPT_ID_BYTES`], too short to hold
+/// a verifier, code or token.
+pub const MAX_CONFIRMATION_TOKEN_BYTES: usize = 40;
+
+/// The longest pause `sync.pause` accepts, in seconds: 7 days. A longer pause is a pause with
+/// no duration, ended by `sync.resume`.
+pub const MAX_PAUSE_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Query parameters an authorisation URL must never carry: each is a credential or would make
+/// one travel to the browser (ADR-0010 R6). Compared case-insensitively.
+const FORBIDDEN_URL_PARAMS: &[&str] = &[
+    "code",
+    "code_verifier",
+    "client_secret",
+    "client_assertion",
+    "assertion",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "token",
+    "password",
+];
+
+/// Why a sign-in or mount-target value was refused. The message never repeats the value,
+/// because the value may be a credential or a sharing link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct ValueRejected(&'static str);
+
+impl ValueRejected {
+    /// What was wrong, without the value.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        self.0
+    }
+}
+
+/// Implements `serde` for a validated string newtype through its `new` constructor.
+macro_rules! validated_string_serde {
+    ($ty:ident) => {
+        impl Serialize for $ty {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let raw = String::deserialize(deserializer)?;
+                Self::new(raw).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+const ATTEMPT_ID_RULE: &str = "an attempt ID is 1 to 40 characters from a-z, 0-9 and '-'";
+
+/// A sign-in attempt, as `account.login.start` names it: 1 to [`MAX_ATTEMPT_ID_BYTES`]
+/// characters from `a-z`, `0-9` and `-`. Opaque to clients.
+///
+/// The length and alphabet are a structural guard: no PKCE verifier, authorisation code or
+/// token fits, so an implementation cannot hand one out as an attempt ID (ADR-0010 R6).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AttemptId(String);
+
+impl AttemptId {
+    /// Checks and wraps an attempt ID.
+    ///
+    /// # Errors
+    ///
+    /// [`ValueRejected`] if it is empty, too long or has a character outside the alphabet.
+    /// The error does not repeat the value.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueRejected> {
+        let value = value.into();
+        let ok = !value.is_empty()
+            && value.len() <= MAX_ATTEMPT_ID_BYTES
+            && value
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'));
+        if ok {
+            Ok(Self(value))
+        } else {
+            Err(ValueRejected(ATTEMPT_ID_RULE))
+        }
+    }
+
+    /// The ID as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+validated_string_serde!(AttemptId);
+
+/// The URL a client opens to sign in, from `account.login.start`. It is the only sign-in
+/// datum a client receives (WP-016 AC3).
+///
+/// It carries the PKCE `code_challenge` (with method `S256`, ADR-0010 R1) and `state`, never
+/// the verifier: the challenge is a SHA-256 digest of the verifier, from which the verifier
+/// cannot be recovered. With method `plain` the challenge would *be* the verifier, so a URL
+/// without `code_challenge_method=S256` is refused here. The constructor also refuses what
+/// can be checked without knowing the authority:
+///
+/// - anything but `https://`, or `http://` to a loopback host (the simulator's authority in
+///   tests);
+/// - user information in the authority (`user:pass@host`);
+/// - a character outside printable ASCII, or a space;
+/// - a fragment;
+/// - a query parameter named like a credential (`code`, `code_verifier`, `client_secret`,
+///   `access_token`, `refresh_token`, `id_token`, `token`, `password`, `assertion`,
+///   `client_assertion`), a parameter name that is percent-encoded or empty, or a repeated
+///   parameter;
+/// - a `code_challenge` that is not 43 base64url characters (the S256 digest), or more than
+///   [`MAX_AUTHORIZATION_URL_BYTES`] bytes in all.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AuthorizationUrl(String);
+
+impl AuthorizationUrl {
+    /// Checks and wraps an authorisation URL.
+    ///
+    /// # Errors
+    ///
+    /// [`ValueRejected`] naming the rule broken; the error does not repeat the URL.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueRejected> {
+        let value = value.into();
+        match authorization_url_problem(&value) {
+            None => Ok(Self(value)),
+            Some(problem) => Err(ValueRejected(problem)),
+        }
+    }
+
+    /// The URL as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+validated_string_serde!(AuthorizationUrl);
+
+const PKCE_RULE: &str = "an authorisation URL carries a PKCE code_challenge with method S256";
+
+fn authorization_url_problem(url: &str) -> Option<&'static str> {
+    if url.is_empty() || url.len() > MAX_AUTHORIZATION_URL_BYTES {
+        return Some("an authorisation URL is 1 to 4096 bytes");
+    }
+    if !url.bytes().all(|b| b.is_ascii_graphic()) {
+        return Some("an authorisation URL is printable ASCII with no spaces");
+    }
+    if url.contains('#') {
+        return Some("an authorisation URL has no fragment");
+    }
+    let (rest, secure) = if let Some(rest) = url.strip_prefix("https://") {
+        (rest, true)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (rest, false)
+    } else {
+        return Some("an authorisation URL starts with https://");
+    };
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Some("an authorisation URL names a host and no user information");
+    }
+    if !secure && !is_loopback_authority(authority) {
+        return Some("an authorisation URL uses https://, or http:// only to a loopback host");
+    }
+    let Some((_, query)) = rest.split_once('?') else {
+        return Some(PKCE_RULE);
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut challenge_ok = false;
+    let mut method_ok = false;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.');
+        if name.is_empty() || !name.bytes().all(plain) {
+            return Some("an authorisation URL's parameter names are plain, not percent-encoded");
+        }
+        let lower = name.to_ascii_lowercase();
+        if FORBIDDEN_URL_PARAMS.contains(&lower.as_str()) {
+            return Some("an authorisation URL never carries a code, verifier, secret or token");
+        }
+        if seen.contains(&lower) {
+            return Some("an authorisation URL names each parameter once");
+        }
+        match lower.as_str() {
+            "code_challenge" => {
+                challenge_ok = value.len() == 43
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+            }
+            "code_challenge_method" => method_ok = value == "S256",
+            _ => {}
+        }
+        seen.push(lower);
+    }
+    if challenge_ok && method_ok {
+        None
+    } else {
+        Some(PKCE_RULE)
+    }
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// True for an empty, over-long value or one with whitespace or a control character.
+fn opaque_text_bad(value: &str, max: usize) -> bool {
+    value.is_empty()
+        || value.len() > max
+        || value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+const PASTED_RULE: &str =
+    "the pasted address must be 1 to 8192 bytes with no spaces or control characters";
+
+/// The address the browser ended on, pasted by the user for a headless sign-in
+/// (`account.login.finish`). It holds the authorisation code, so it is a credential.
+///
+/// It travels only from client to daemon. No result, notification or error carries it, and
+/// its `Debug` form is redacted, so it cannot reach a log by accident (WP-016 AC4,
+/// ADR-0010 R6). Checked here only for size and for characters no URL contains: 1 to
+/// [`MAX_PASTED_URL_BYTES`] bytes with no whitespace or control character. It is never
+/// trimmed or repaired; whether it is a redirect to the attempt's URI with the right `state`
+/// is the daemon's check.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PastedRedirect(String);
+
+impl PastedRedirect {
+    /// Checks and wraps a pasted address.
+    ///
+    /// # Errors
+    ///
+    /// [`ValueRejected`]; the error does not repeat the address.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueRejected> {
+        let value = value.into();
+        if opaque_text_bad(&value, MAX_PASTED_URL_BYTES) {
+            Err(ValueRejected(PASTED_RULE))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// The address. Named so that every use of the credential is visible in review.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PastedRedirect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PastedRedirect(<redacted>)")
+    }
+}
+
+validated_string_serde!(PastedRedirect);
+
+const LINK_RULE: &str = "a sharing link is an https:// address of at most 4096 bytes with no \
+                         spaces or control characters";
+
+/// A sharing link given to `mount.add.preview` and `mount.add.confirm`. Whoever holds a
+/// link may be able to open what it points to, so it is treated like a credential: no result,
+/// notification or error repeats it, the confirmation token does not encode it readably, and
+/// its `Debug` form is redacted.
+///
+/// Checked here for form only: `https://` (the scheme in any case) and a host, at most
+/// [`MAX_SHARING_LINK_BYTES`] bytes, no whitespace or control character. It is never trimmed
+/// or repaired.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SharingLink(String);
+
+impl SharingLink {
+    /// Checks and wraps a sharing link.
+    ///
+    /// # Errors
+    ///
+    /// [`ValueRejected`]; the error does not repeat the link.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueRejected> {
+        let value = value.into();
+        let scheme_ok = value
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("https://"));
+        let host_ok = value
+            .get(8..)
+            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'));
+        if opaque_text_bad(&value, MAX_SHARING_LINK_BYTES) || !scheme_ok || !host_ok {
+            Err(ValueRejected(LINK_RULE))
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// The link. Named so that every use of it is visible in review.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SharingLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharingLink(<redacted>)")
+    }
+}
+
+validated_string_serde!(SharingLink);
+
+/// The token `mount.add.preview` returns and `mount.add.confirm` takes. Opaque: clients never
+/// parse, build or change it. At most [`MAX_CONFIRMATION_TOKEN_BYTES`] characters from `a-z`,
+/// `0-9` and `.`. Issued and checked by [`crate::paging::ConfirmationLedger`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConfirmationToken(String);
+
+impl ConfirmationToken {
+    /// Checks and wraps a token.
+    ///
+    /// # Errors
+    ///
+    /// [`ValueRejected`] if it is empty, too long or has another character.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValueRejected> {
+        let value = value.into();
+        let ok = !value.is_empty()
+            && value.len() <= MAX_CONFIRMATION_TOKEN_BYTES
+            && value
+                .bytes()
+                .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.'));
+        if ok {
+            Ok(Self(value))
+        } else {
+            Err(ValueRejected(
+                "a confirmation token is 1 to 40 characters from a-z, 0-9 and '.'",
+            ))
+        }
+    }
+
+    /// The token as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+validated_string_serde!(ConfirmationToken);
+
+/// A path on the local filesystem, outside every mount: the source of `item.import` and the
+/// destination of `item.export`.
+///
+/// Spelled by the same rule as a [`ProtocolPath`]: absolute, canonical (no `.` or `..`
+/// component, no empty component, no trailing slash other than `/` itself), UTF-8, no NUL
+/// byte, at most 4,096 bytes. A path that breaks the rule is refused with `invalid-params`,
+/// never repaired (WP-016 AC8). The rule is lexical: this type cannot see symbolic links.
+/// The daemon resolves the path and refuses one whose resolved location is under a mount
+/// point or the daemon's data directory (`local-file-error`, reason `inside-mount`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LocalPath(String);
+
+impl LocalPath {
+    /// Checks and wraps a local path.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::path::PathError`] for a path that breaks the protocol path rule.
+    pub fn new(path: impl Into<String>) -> Result<Self, crate::path::PathError> {
+        ProtocolPath::new(path).map(|p| Self(p.as_str().to_owned()))
+    }
+
+    /// The path as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for LocalPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+validated_string_serde!(LocalPath);
+
+/// Refuses a value of an open request set that this build does not know. A request is never
+/// given a default in place of a value it did not understand.
+fn known_value(value: &impl std::fmt::Display, field: &str, known: &[&str]) -> Result<(), String> {
+    let text = value.to_string();
+    if known.contains(&text.as_str()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown {field} {:?}; this daemon accepts {}",
+            crate::error::truncate_to(&text, 64),
+            known.join(", ")
+        ))
+    }
+}
+
+/// `account.login.start` parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "LoginStartWire", into = "LoginStartWire")]
+pub struct LoginStartParams {
+    /// How to sign in. Never [`LoginMode::Other`]: an unknown mode is refused when decoded.
+    pub mode: LoginMode,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LoginStartWire {
+    mode: LoginMode,
+}
+
+impl TryFrom<LoginStartWire> for LoginStartParams {
+    type Error = String;
+
+    fn try_from(wire: LoginStartWire) -> Result<Self, String> {
+        known_value(&wire.mode, "mode", LoginMode::KNOWN)?;
+        Ok(Self { mode: wire.mode })
+    }
+}
+
+impl From<LoginStartParams> for LoginStartWire {
+    fn from(params: LoginStartParams) -> Self {
+        Self { mode: params.mode }
+    }
+}
+
+/// `account.login.start` result: the attempt and the URL to open. Nothing else about the
+/// sign-in reaches the client (ADR-0010 R6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginStartResult {
+    /// Names the attempt in `account.login.finish`.
+    pub attempt_id: AttemptId,
+    /// The URL to open in a browser.
+    pub authorization_url: AuthorizationUrl,
+}
+
+/// `account.login.finish` parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginFinishParams {
+    /// The attempt from `account.login.start`.
+    pub attempt_id: AttemptId,
+    /// For a headless attempt, the address the browser ended on; absent for a browser
+    /// attempt. A credential: never repeated in any response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_url: Option<PastedRedirect>,
+}
+
+/// The mount `account.login.finish` proposes for the account's own drive. Nothing is created;
+/// the client asks the user, then calls `mount.add.preview` with target `own-drive`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposedMount {
+    /// The account's own drive.
+    pub drive_id: DriveId,
+    /// Its type. Open set.
+    pub drive_type: DriveType,
+    /// The default mount point: `~/OneDrive` or `~/OneDrive - <Org>`.
+    pub mount_point: ProtocolPath,
+}
+
+/// `account.login.finish` result: who signed in. It creates no mount (overview "Sign-in never
+/// creates a mount").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginFinishResult {
+    /// The signed-in account, with `user_name` so the client can show it before asking.
+    pub account: AccountInfo,
+    /// The proposed mount for the own drive; absent when that drive is already mounted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_mount: Option<ProposedMount>,
+}
+
+/// `account.logout` parameters. There is no parameter that could delete anything, local or
+/// remote (WP-016 AC7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogoutParams {
+    /// The account to sign out.
+    pub account_id: AccountId,
+    /// True to report what signing out would find, changing nothing.
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        deserialize_with = "null_as_default"
+    )]
+    pub dry_run: bool,
+}
+
+/// `account.logout` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogoutResult {
+    /// The account.
+    pub account_id: AccountId,
+    /// True when the account was signed out; false for a dry run.
+    pub signed_out: bool,
+    /// Files in the account's mounts with changes not yet on the server. They are kept and
+    /// upload after the account signs in again (F01 "Sign-out").
+    pub unsynced_files: u64,
+}
+
+/// What a mount is to be made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountSource {
+    /// The account's own drive.
+    OwnDrive,
+    /// A drive named by ID.
+    Drive(DriveId),
+    /// The drive a sharing link points into. M1 mounts the drive root, even for a link to a
+    /// folder inside it (overview "M1 mounts drive roots only").
+    SharingLink(SharingLink),
+}
+
+/// The target of `mount.add.preview` and `mount.add.confirm`: which account, and what to
+/// mount with it.
+///
+/// On the wire: `account_id`, `target` (`own-drive`, `drive-id` or `sharing-link`), and
+/// `drive_id` exactly when the target is `drive-id`, `sharing_link` exactly when it is
+/// `sharing-link`. Any other combination, and an unknown target, is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountTarget {
+    /// The account whose access is used.
+    pub account_id: AccountId,
+    /// What to mount.
+    pub source: MountSource,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MountTargetWire {
+    account_id: AccountId,
+    target: MountTargetKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drive_id: Option<DriveId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sharing_link: Option<SharingLink>,
+}
+
+impl MountTargetWire {
+    fn into_target(self) -> Result<MountTarget, String> {
+        let source = match (&self.target, self.drive_id, self.sharing_link) {
+            (MountTargetKind::OwnDrive, None, None) => MountSource::OwnDrive,
+            (MountTargetKind::DriveId, Some(drive), None) => MountSource::Drive(drive),
+            (MountTargetKind::SharingLink, None, Some(link)) => MountSource::SharingLink(link),
+            _ => {
+                return Err("give target own-drive alone, drive-id with drive_id, or \
+                            sharing-link with sharing_link"
+                    .into());
+            }
+        };
+        Ok(MountTarget {
+            account_id: self.account_id,
+            source,
+        })
+    }
+
+    fn from_target(target: MountTarget) -> Self {
+        let (kind, drive_id, sharing_link) = match target.source {
+            MountSource::OwnDrive => (MountTargetKind::OwnDrive, None, None),
+            MountSource::Drive(d) => (MountTargetKind::DriveId, Some(d), None),
+            MountSource::SharingLink(l) => (MountTargetKind::SharingLink, None, Some(l)),
+        };
+        Self {
+            account_id: target.account_id,
+            target: kind,
+            drive_id,
+            sharing_link,
+        }
+    }
+}
+
+/// `mount.add.preview` parameters. The preview never changes the user's access (ADR-0015 R2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MountTargetWire", into = "MountTargetWire")]
+pub struct MountAddPreviewParams {
+    /// What to preview.
+    pub target: MountTarget,
+}
+
+impl TryFrom<MountTargetWire> for MountAddPreviewParams {
+    type Error = String;
+
+    fn try_from(wire: MountTargetWire) -> Result<Self, String> {
+        wire.into_target().map(|target| Self { target })
+    }
+}
+
+impl From<MountAddPreviewParams> for MountTargetWire {
+    fn from(params: MountAddPreviewParams) -> Self {
+        Self::from_target(params.target)
+    }
+}
+
+/// `mount.add.preview` result: what confirming would mount. Nothing is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountAddPreviewResult {
+    /// Pass this to `mount.add.confirm` with the same target parameters.
+    pub confirmation_token: ConfirmationToken,
+    /// The account.
+    pub account_id: AccountId,
+    /// The drive that would be mounted (its root, in M1).
+    pub drive_id: DriveId,
+    /// Its type. Open set.
+    pub drive_type: DriveType,
+    /// The drive's name as Graph reports it (for a library, the library's name). For display
+    /// only; capped at 1 KiB like every message.
+    #[serde(serialize_with = "crate::error::serialize_capped")]
+    pub drive_name: String,
+    /// For a library, the site's name as Graph reports it. For display only; capped at
+    /// 1 KiB.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_capped_opt"
+    )]
+    pub site_name: Option<String>,
+    /// How many items the drive holds, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<u64>,
+    /// True when the mount would be read-only.
+    pub read_only: bool,
+    /// The proposed mount point.
+    pub mount_point: ProtocolPath,
+}
+
+/// `mount.add.confirm` parameters: the preview's target parameters again, the token, and
+/// optionally another mount point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MountAddConfirmWire", into = "MountAddConfirmWire")]
+pub struct MountAddConfirmParams {
+    /// The same target as the preview; a token used with another target is refused.
+    pub target: MountTarget,
+    /// The preview's token. Single use.
+    pub confirmation_token: ConfirmationToken,
+    /// A mount point other than the proposed one.
+    pub mount_point: Option<ProtocolPath>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MountAddConfirmWire {
+    account_id: AccountId,
+    target: MountTargetKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drive_id: Option<DriveId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sharing_link: Option<SharingLink>,
+    confirmation_token: ConfirmationToken,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mount_point: Option<ProtocolPath>,
+}
+
+impl TryFrom<MountAddConfirmWire> for MountAddConfirmParams {
+    type Error = String;
+
+    fn try_from(wire: MountAddConfirmWire) -> Result<Self, String> {
+        let target = MountTargetWire {
+            account_id: wire.account_id,
+            target: wire.target,
+            drive_id: wire.drive_id,
+            sharing_link: wire.sharing_link,
+        }
+        .into_target()?;
+        Ok(Self {
+            target,
+            confirmation_token: wire.confirmation_token,
+            mount_point: wire.mount_point,
+        })
+    }
+}
+
+impl From<MountAddConfirmParams> for MountAddConfirmWire {
+    fn from(params: MountAddConfirmParams) -> Self {
+        let target = MountTargetWire::from_target(params.target);
+        Self {
+            account_id: target.account_id,
+            target: target.target,
+            drive_id: target.drive_id,
+            sharing_link: target.sharing_link,
+            confirmation_token: params.confirmation_token,
+            mount_point: params.mount_point,
+        }
+    }
+}
+
+/// `mount.add.confirm` result: the new mount, in state `resyncing` until its first full
+/// delta has been applied (overview "First enumeration").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountAddConfirmResult {
+    /// The new mount.
+    pub mount: MountInfo,
+}
+
+/// `mount.remove` parameters. There is no parameter that could delete remote content:
+/// removing a mount never deletes anything on the server (ADR-0015, WP-016 AC7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountRemoveParams {
+    /// The mount to remove.
+    pub mount_id: MountId,
+    /// True to report what removal would find, changing nothing.
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        deserialize_with = "null_as_default"
+    )]
+    pub dry_run: bool,
+}
+
+/// `mount.remove` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MountRemoveResult {
+    /// The mount.
+    pub mount_id: MountId,
+    /// True when the mount was removed; false for a dry run.
+    pub removed: bool,
+    /// Where the local copies are (or would be) kept: the mount point, now a plain directory
+    /// (ADR-0021).
+    pub mount_point: ProtocolPath,
+    /// Fully local files whose content is (or would be) kept at the mount point.
+    pub kept_files: u64,
+    /// Files whose changes are not yet on the server. A client warns before removing a mount
+    /// that has any.
+    pub unsynced_files: u64,
+}
+
+/// `sync.pause` parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SyncPauseWire", into = "SyncPauseWire")]
+pub struct SyncPauseParams {
+    /// The mount to pause; absent for every mount.
+    pub mount_id: Option<MountId>,
+    /// How long, 1 to [`MAX_PAUSE_SECS`] seconds; absent to pause until `sync.resume`.
+    pub duration_secs: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SyncPauseWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mount_id: Option<MountId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    duration_secs: Option<u64>,
+}
+
+impl TryFrom<SyncPauseWire> for SyncPauseParams {
+    type Error = String;
+
+    fn try_from(wire: SyncPauseWire) -> Result<Self, String> {
+        if let Some(secs) = wire.duration_secs.filter(|&s| s == 0 || s > MAX_PAUSE_SECS) {
+            return Err(format!(
+                "duration_secs is {secs}; give 1 to {MAX_PAUSE_SECS} seconds, or leave it out \
+                 to pause until resumed"
+            ));
+        }
+        Ok(Self {
+            mount_id: wire.mount_id,
+            duration_secs: wire.duration_secs,
+        })
+    }
+}
+
+impl From<SyncPauseParams> for SyncPauseWire {
+    fn from(params: SyncPauseParams) -> Self {
+        Self {
+            mount_id: params.mount_id,
+            duration_secs: params.duration_secs,
+        }
+    }
+}
+
+/// `sync.pause` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncPauseResult {
+    /// How many mounts this request paused.
+    pub paused_mounts: u64,
+    /// When the pause ends, in whole seconds since the Unix epoch (UTC); absent for a pause
+    /// until `sync.resume`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_until: Option<u64>,
+}
+
+/// `sync.resume` parameters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncResumeParams {
+    /// The mount to resume; absent for every mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_id: Option<MountId>,
+}
+
+/// `sync.resume` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncResumeResult {
+    /// How many paused mounts this request resumed.
+    pub resumed_mounts: u64,
+}
+
+/// `item.import` parameters: copy a local file into a mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ImportWire", into = "ImportWire")]
+pub struct ItemImportParams {
+    /// The local file to copy.
+    pub source: LocalPath,
+    /// The file's path in the mount. Its parent folder must exist.
+    pub destination: ProtocolPath,
+    /// `create` for a new file, `replace` to replace the existing file. Never
+    /// [`TransferMode::Other`].
+    pub mode: TransferMode,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ImportWire {
+    source: LocalPath,
+    destination: ProtocolPath,
+    mode: TransferMode,
+}
+
+impl TryFrom<ImportWire> for ItemImportParams {
+    type Error = String;
+
+    fn try_from(wire: ImportWire) -> Result<Self, String> {
+        known_value(&wire.mode, "mode", TransferMode::KNOWN)?;
+        Ok(Self {
+            source: wire.source,
+            destination: wire.destination,
+            mode: wire.mode,
+        })
+    }
+}
+
+impl From<ItemImportParams> for ImportWire {
+    fn from(params: ItemImportParams) -> Self {
+        Self {
+            source: params.source,
+            destination: params.destination,
+            mode: params.mode,
+        }
+    }
+}
+
+/// `item.import` result: the item, which now has local changes to upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemImportResult {
+    /// The destination.
+    pub path: ProtocolPath,
+    /// Its state, normally sync `pending-upload`.
+    pub item: ItemInfo,
+    /// The bytes copied in.
+    pub bytes_copied: u64,
+}
+
+/// `item.export` parameters: copy a file out of a mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ExportWire", into = "ExportWire")]
+pub struct ItemExportParams {
+    /// The file in the mount.
+    pub source: ProtocolPath,
+    /// The local path to write.
+    pub destination: LocalPath,
+    /// `create` when nothing may exist at the destination, `replace` to replace what does.
+    /// Never [`TransferMode::Other`].
+    pub mode: TransferMode,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ExportWire {
+    source: ProtocolPath,
+    destination: LocalPath,
+    mode: TransferMode,
+}
+
+impl TryFrom<ExportWire> for ItemExportParams {
+    type Error = String;
+
+    fn try_from(wire: ExportWire) -> Result<Self, String> {
+        known_value(&wire.mode, "mode", TransferMode::KNOWN)?;
+        Ok(Self {
+            source: wire.source,
+            destination: wire.destination,
+            mode: wire.mode,
+        })
+    }
+}
+
+impl From<ItemExportParams> for ExportWire {
+    fn from(params: ItemExportParams) -> Self {
+        Self {
+            source: params.source,
+            destination: params.destination,
+            mode: params.mode,
+        }
+    }
+}
+
+/// `item.export` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemExportResult {
+    /// The file in the mount.
+    pub path: ProtocolPath,
+    /// Where it was written.
+    pub destination: LocalPath,
+    /// The bytes copied out.
+    pub bytes_copied: u64,
+}
+
 /// A request decoded into its typed parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MethodCall {
@@ -745,6 +1728,26 @@ pub enum MethodCall {
     ItemDehydrate(ItemPathsParams),
     /// `status.subscribe`.
     StatusSubscribe(StatusSubscribeParams),
+    /// `account.login.start`.
+    AccountLoginStart(LoginStartParams),
+    /// `account.login.finish`.
+    AccountLoginFinish(LoginFinishParams),
+    /// `account.logout`.
+    AccountLogout(LogoutParams),
+    /// `mount.add.preview`.
+    MountAddPreview(MountAddPreviewParams),
+    /// `mount.add.confirm`.
+    MountAddConfirm(MountAddConfirmParams),
+    /// `mount.remove`.
+    MountRemove(MountRemoveParams),
+    /// `sync.pause`.
+    SyncPause(SyncPauseParams),
+    /// `sync.resume`.
+    SyncResume(SyncResumeParams),
+    /// `item.import`.
+    ItemImport(ItemImportParams),
+    /// `item.export`.
+    ItemExport(ItemExportParams),
 }
 
 impl MethodCall {
@@ -769,6 +1772,22 @@ impl MethodCall {
             method::ITEM_HYDRATE => Self::ItemHydrate(decode_action(method, params)?),
             method::ITEM_DEHYDRATE => Self::ItemDehydrate(decode_action(method, params)?),
             method::STATUS_SUBSCRIBE => Self::StatusSubscribe(decode(method, params)?),
+            method::ACCOUNT_LOGIN_START => Self::AccountLoginStart(decode(method, params)?),
+            method::ACCOUNT_LOGIN_FINISH => {
+                Self::AccountLoginFinish(decode_redacted(method, params, FINISH_SHAPE)?)
+            }
+            method::ACCOUNT_LOGOUT => Self::AccountLogout(decode(method, params)?),
+            method::MOUNT_ADD_PREVIEW => {
+                Self::MountAddPreview(decode_redacted(method, params, TARGET_SHAPE)?)
+            }
+            method::MOUNT_ADD_CONFIRM => {
+                Self::MountAddConfirm(decode_redacted(method, params, CONFIRM_SHAPE)?)
+            }
+            method::MOUNT_REMOVE => Self::MountRemove(decode(method, params)?),
+            method::SYNC_PAUSE => Self::SyncPause(decode(method, params)?),
+            method::SYNC_RESUME => Self::SyncResume(decode(method, params)?),
+            method::ITEM_IMPORT => Self::ItemImport(decode(method, params)?),
+            method::ITEM_EXPORT => Self::ItemExport(decode(method, params)?),
             other => return Err(RpcError::method_not_found(other)),
         };
         Ok(call)
@@ -797,6 +1816,16 @@ impl MethodCall {
             Self::ItemHydrate(_) => method::ITEM_HYDRATE,
             Self::ItemDehydrate(_) => method::ITEM_DEHYDRATE,
             Self::StatusSubscribe(_) => method::STATUS_SUBSCRIBE,
+            Self::AccountLoginStart(_) => method::ACCOUNT_LOGIN_START,
+            Self::AccountLoginFinish(_) => method::ACCOUNT_LOGIN_FINISH,
+            Self::AccountLogout(_) => method::ACCOUNT_LOGOUT,
+            Self::MountAddPreview(_) => method::MOUNT_ADD_PREVIEW,
+            Self::MountAddConfirm(_) => method::MOUNT_ADD_CONFIRM,
+            Self::MountRemove(_) => method::MOUNT_REMOVE,
+            Self::SyncPause(_) => method::SYNC_PAUSE,
+            Self::SyncResume(_) => method::SYNC_RESUME,
+            Self::ItemImport(_) => method::ITEM_IMPORT,
+            Self::ItemExport(_) => method::ITEM_EXPORT,
         }
     }
 
@@ -816,6 +1845,16 @@ impl MethodCall {
             | Self::ItemHydrate(p)
             | Self::ItemDehydrate(p) => serde_json::to_value(p)?,
             Self::StatusSubscribe(p) => serde_json::to_value(p)?,
+            Self::AccountLoginStart(p) => serde_json::to_value(p)?,
+            Self::AccountLoginFinish(p) => serde_json::to_value(p)?,
+            Self::AccountLogout(p) => serde_json::to_value(p)?,
+            Self::MountAddPreview(p) => serde_json::to_value(p)?,
+            Self::MountAddConfirm(p) => serde_json::to_value(p)?,
+            Self::MountRemove(p) => serde_json::to_value(p)?,
+            Self::SyncPause(p) => serde_json::to_value(p)?,
+            Self::SyncResume(p) => serde_json::to_value(p)?,
+            Self::ItemImport(p) => serde_json::to_value(p)?,
+            Self::ItemExport(p) => serde_json::to_value(p)?,
         };
         Ok(Some(value))
     }
@@ -835,8 +1874,6 @@ impl MethodCall {
     }
 }
 
-/// Decodes action parameters and enforces [`Limits::V1`] (ADR-0020 R5): a request over a
-/// limit is refused as a whole, before anything is done.
 /// Decodes `item.status` parameters and enforces the batch limits of [`Limits::V1`], sized so
 /// that the request plus the longest cursor always fits in one line (ADR-0020 R4).
 fn decode_status(method: &str, params: Option<&Value>) -> Result<ItemStatusParams, RpcError> {
@@ -865,6 +1902,8 @@ fn decode_status(method: &str, params: Option<&Value>) -> Result<ItemStatusParam
     Ok(params)
 }
 
+/// Decodes action parameters and enforces [`Limits::V1`] (ADR-0020 R5): a request over a
+/// limit is refused as a whole, before anything is done.
 fn decode_action(method: &str, params: Option<&Value>) -> Result<ItemPathsParams, RpcError> {
     let params: ItemPathsParams = decode(method, params)?;
     if params.paths.len() > MAX_ACTION_PATHS as usize {
@@ -900,6 +1939,36 @@ pub fn encoded_path_bytes(paths: &[ProtocolPath]) -> u64 {
         .sum()
 }
 
+const FINISH_SHAPE: &str =
+    "attempt_id (an attempt ID) and, for a headless attempt, redirect_url (the pasted address)";
+
+const TARGET_SHAPE: &str = "account_id, and target own-drive alone, drive-id with drive_id, or \
+                            sharing-link with sharing_link (an https:// address)";
+
+const CONFIRM_SHAPE: &str = "the preview's account_id, target and drive_id or sharing_link, \
+                             confirmation_token, and optionally mount_point (an absolute, \
+                             canonical path)";
+
+/// Decodes the parameters of a method in [`method::REDACTED`]. On failure the message says
+/// what shape was expected and repeats nothing from the request: `serde` errors can quote a
+/// value, and here a value may be a pasted redirect address (holding an authorisation code) or
+/// a sharing link (ADR-0010 R6, WP-016 AC4).
+fn decode_redacted<P: DeserializeOwned>(
+    method: &str,
+    params: Option<&Value>,
+    expected: &str,
+) -> Result<P, RpcError> {
+    decode(method, params).map_err(|_| {
+        RpcError::invalid_params(
+            method,
+            format!(
+                "expected an object with {expected}; the values given are not repeated here \
+                 because they may hold a credential or a sharing link"
+            ),
+        )
+    })
+}
+
 fn decode<P: DeserializeOwned>(method: &str, params: Option<&Value>) -> Result<P, RpcError> {
     let empty = Value::Object(serde_json::Map::new());
     let params = match params {
@@ -933,6 +2002,8 @@ pub enum Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Session {
     phase: Phase,
+    /// Whether `hello` advertised [`CAPABILITY_IMPORT_EXPORT`].
+    import_export: bool,
 }
 
 impl Default for Session {
@@ -947,6 +2018,7 @@ impl Session {
     pub const fn new() -> Self {
         Self {
             phase: Phase::AwaitingHello,
+            import_export: false,
         }
     }
 
@@ -962,7 +2034,8 @@ impl Session {
     ///
     /// `hello-required` for anything but `hello` before `hello` has succeeded (ADR-0009 R3,
     /// ADR-0019 R5); `invalid-request` for a second `hello`, and for any request on a
-    /// subscribed connection.
+    /// subscribed connection; `method-not-found` for `item.import` and `item.export` when
+    /// `hello` did not advertise [`CAPABILITY_IMPORT_EXPORT`].
     pub fn admit(&self, call: &MethodCall) -> Result<(), RpcError> {
         match (self.phase, call) {
             (Phase::AwaitingHello, MethodCall::Hello(_)) => Ok(()),
@@ -977,6 +2050,18 @@ impl Session {
                 ErrorCode::InvalidRequest,
                 "hello refused: this connection has already completed hello",
             )),
+            (Phase::Ready(_), MethodCall::ItemImport(_) | MethodCall::ItemExport(_))
+                if !self.import_export =>
+            {
+                Err(RpcError::new(
+                    ErrorCode::MethodNotFound,
+                    format!(
+                        "method {:?} is not offered by this daemon: hello did not advertise \
+                         the capability {CAPABILITY_IMPORT_EXPORT}",
+                        call.method()
+                    ),
+                ))
+            }
             (Phase::Ready(_), _) => Ok(()),
             (Phase::Subscribed(_), other) => Err(RpcError::new(
                 ErrorCode::InvalidRequest,
@@ -990,7 +2075,9 @@ impl Session {
     }
 
     /// Runs `hello` for this connection: negotiates a version against `daemon_supported` and,
-    /// on success, moves to [`Phase::Ready`].
+    /// on success, moves to [`Phase::Ready`]. `capabilities` is what the result advertises;
+    /// the connection admits `item.import` and `item.export` only if it includes
+    /// [`CAPABILITY_IMPORT_EXPORT`].
     ///
     /// # Errors
     ///
@@ -1005,6 +2092,7 @@ impl Session {
         self.admit(&MethodCall::Hello(params.clone()))?;
         let version = negotiate(daemon_supported, &params.protocol_versions)?;
         self.phase = Phase::Ready(version);
+        self.import_export = capabilities.contains(&CAPABILITY_IMPORT_EXPORT);
         Ok(HelloResult {
             protocol_version: version,
             capabilities: capabilities.iter().map(|&c| c.to_owned()).collect(),
@@ -1045,6 +2133,535 @@ mod tests {
         ItemPathsParams {
             paths: list.iter().map(|s| p(s)).collect(),
         }
+    }
+
+    const LINK: &str = "https://example.sharepoint.com/:f:/s/Finance/EjK3pQ2-planted-link";
+
+    fn acct() -> AccountId {
+        AccountId::new("acct-work-1").unwrap()
+    }
+
+    fn target(source: MountSource) -> MountTarget {
+        MountTarget {
+            account_id: acct(),
+            source,
+        }
+    }
+
+    fn link_target() -> MountTarget {
+        target(MountSource::SharingLink(SharingLink::new(LINK).unwrap()))
+    }
+
+    /// One call of each method added by WP-016, in `method::ALL` order.
+    fn new_calls() -> Vec<MethodCall> {
+        vec![
+            MethodCall::AccountLoginStart(LoginStartParams {
+                mode: LoginMode::Headless,
+            }),
+            MethodCall::AccountLoginFinish(LoginFinishParams {
+                attempt_id: AttemptId::new("attempt-1").unwrap(),
+                redirect_url: Some(
+                    PastedRedirect::new("https://login.example/nativeclient?code=c&state=s")
+                        .unwrap(),
+                ),
+            }),
+            MethodCall::AccountLogout(LogoutParams {
+                account_id: acct(),
+                dry_run: true,
+            }),
+            MethodCall::MountAddPreview(MountAddPreviewParams {
+                target: link_target(),
+            }),
+            MethodCall::MountAddConfirm(MountAddConfirmParams {
+                target: target(MountSource::Drive(DriveId::new("b!abc").unwrap())),
+                confirmation_token: ConfirmationToken::new("c1.00.00").unwrap(),
+                mount_point: Some(p("/home/u/Example/Site - Documents")),
+            }),
+            MethodCall::MountRemove(MountRemoveParams {
+                mount_id: MountId::new("personal").unwrap(),
+                dry_run: false,
+            }),
+            MethodCall::SyncPause(SyncPauseParams {
+                mount_id: None,
+                duration_secs: Some(7_200),
+            }),
+            MethodCall::SyncResume(SyncResumeParams {
+                mount_id: Some(MountId::new("personal").unwrap()),
+            }),
+            MethodCall::ItemImport(ItemImportParams {
+                source: LocalPath::new("/home/u/Downloads/report.pdf").unwrap(),
+                destination: p("/home/u/OneDrive/Documents/report.pdf"),
+                mode: TransferMode::Create,
+            }),
+            MethodCall::ItemExport(ItemExportParams {
+                source: p("/home/u/OneDrive/Documents/report.pdf"),
+                destination: LocalPath::new("/home/u/Desktop/report.pdf").unwrap(),
+                mode: TransferMode::Replace,
+            }),
+        ]
+    }
+
+    fn ready_session(capabilities: &[&str]) -> Session {
+        let mut session = Session::new();
+        session
+            .hello(&hello(&[1]), SUPPORTED_VERSIONS, capabilities)
+            .unwrap();
+        session
+    }
+
+    /// WP-016 AC1, ADR-0009 R3, ADR-0019 R5: every new method is in the method list, parses,
+    /// and is refused before `hello` with `hello-required`, with no effect on the session.
+    #[test]
+    fn adr_0019_r5_new_methods_need_hello_first() {
+        let session = Session::new();
+        for call in new_calls() {
+            assert!(method::ALL.contains(&call.method()), "{}", call.method());
+            let req = call.to_request(5).unwrap();
+            assert_eq!(MethodCall::from_request(&req).unwrap(), call);
+            let err = session.admit(&call).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                Some(ErrorCode::HelloRequired),
+                "{}",
+                call.method()
+            );
+            assert_eq!(session.phase(), Phase::AwaitingHello);
+        }
+        let session = ready_session(&[CAPABILITY_IMPORT_EXPORT]);
+        for call in new_calls() {
+            assert!(session.admit(&call).is_ok(), "{}", call.method());
+        }
+    }
+
+    /// `item.import` and `item.export` are admitted only while `hello` advertised their
+    /// capability; otherwise they get `method-not-found`, as a method that does not exist.
+    #[test]
+    fn import_and_export_need_their_capability() {
+        let without = ready_session(&[]);
+        let with = ready_session(&[CAPABILITY_IMPORT_EXPORT]);
+        let transfers: Vec<MethodCall> = new_calls()
+            .into_iter()
+            .filter(|c| method::IMPORT_EXPORT.contains(&c.method()))
+            .collect();
+        assert_eq!(transfers.len(), 2);
+        for call in &transfers {
+            let err = without.admit(call).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                Some(ErrorCode::MethodNotFound),
+                "{}",
+                call.method()
+            );
+            assert!(
+                err.message.contains(CAPABILITY_IMPORT_EXPORT),
+                "{}",
+                err.message
+            );
+            assert!(with.admit(call).is_ok());
+        }
+        // Other methods do not depend on the capability.
+        assert!(
+            without
+                .admit(&MethodCall::SyncResume(SyncResumeParams::default()))
+                .is_ok()
+        );
+        let result = Session::new()
+            .hello(
+                &hello(&[1]),
+                SUPPORTED_VERSIONS,
+                &[CAPABILITY_IMPORT_EXPORT],
+            )
+            .unwrap();
+        assert_eq!(result.capabilities, [CAPABILITY_IMPORT_EXPORT]);
+    }
+
+    /// Leniency never guesses: an unknown mode, target kind or transfer mode in a request is
+    /// `invalid-params`, never replaced by a default; so are missing required values and
+    /// fields that do not match the target kind.
+    #[test]
+    fn unknown_or_mismatched_request_values_are_invalid_params() {
+        let cases = [
+            (method::ACCOUNT_LOGIN_START, json!({"mode": "device-code"})),
+            (method::ACCOUNT_LOGIN_START, json!({"mode": "Browser"})),
+            (method::ACCOUNT_LOGIN_START, json!({})),
+            (method::ACCOUNT_LOGIN_START, json!({"mode": null})),
+            (
+                method::MOUNT_ADD_PREVIEW,
+                json!({"account_id": "a", "target": "teams-channel"}),
+            ),
+            (method::MOUNT_ADD_PREVIEW, json!({"account_id": "a"})),
+            (method::MOUNT_ADD_PREVIEW, json!({"target": "own-drive"})),
+            (
+                method::MOUNT_ADD_PREVIEW,
+                json!({"account_id": "a", "target": "own-drive", "drive_id": "d"}),
+            ),
+            (
+                method::MOUNT_ADD_PREVIEW,
+                json!({"account_id": "a", "target": "drive-id"}),
+            ),
+            (
+                method::MOUNT_ADD_PREVIEW,
+                json!({"account_id": "a", "target": "drive-id", "sharing_link": LINK}),
+            ),
+            (
+                method::MOUNT_ADD_PREVIEW,
+                json!({"account_id": "a", "target": "sharing-link", "sharing_link": LINK,
+                       "drive_id": "d"}),
+            ),
+            (
+                method::MOUNT_ADD_PREVIEW,
+                json!({"account_id": "a", "target": "sharing-link",
+                       "sharing_link": "http://example.com/x"}),
+            ),
+            (
+                method::MOUNT_ADD_CONFIRM,
+                json!({"account_id": "a", "target": "own-drive"}),
+            ),
+            (
+                method::MOUNT_ADD_CONFIRM,
+                json!({"account_id": "a", "target": "own-drive", "confirmation_token": ""}),
+            ),
+            (
+                method::MOUNT_ADD_CONFIRM,
+                json!({"account_id": "a", "target": "own-drive",
+                       "confirmation_token": "c1.0.0", "mount_point": "~/OneDrive"}),
+            ),
+            (
+                method::ITEM_IMPORT,
+                json!({"source": "/a", "destination": "/m/a", "mode": "merge"}),
+            ),
+            (
+                method::ITEM_IMPORT,
+                json!({"source": "/a", "destination": "/m/a"}),
+            ),
+            (
+                method::ITEM_EXPORT,
+                json!({"source": "/m/a", "destination": "/a", "mode": "overwrite"}),
+            ),
+            (
+                method::ITEM_EXPORT,
+                json!({"source": "/m/a", "destination": "/a", "mode": ""}),
+            ),
+            (method::ACCOUNT_LOGOUT, json!({})),
+            (
+                method::ACCOUNT_LOGOUT,
+                json!({"account_id": "a", "dry_run": "yes"}),
+            ),
+            (method::MOUNT_REMOVE, json!({"mount_id": "Not A Mount Id"})),
+            (method::MOUNT_REMOVE, json!({"mount_id": "m", "dry_run": 1})),
+            (method::SYNC_PAUSE, json!({"mount_id": "UPPER"})),
+            (method::SYNC_RESUME, json!({"mount_id": ""})),
+            (method::ACCOUNT_LOGIN_FINISH, json!({})),
+            (
+                method::ACCOUNT_LOGIN_FINISH,
+                json!({"attempt_id": "Attempt_1"}),
+            ),
+        ];
+        for (m, params) in cases {
+            let err = MethodCall::parse(m, Some(&params)).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{m} {params}");
+            assert!(err.message.contains(m), "{}", err.message);
+        }
+        // Positional parameters are refused for the new methods too.
+        for m in [method::SYNC_PAUSE, method::ACCOUNT_LOGIN_FINISH] {
+            let err = MethodCall::parse(m, Some(&json!(["x"]))).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{m}");
+        }
+        // The open sets keep the unknown value on their own; only the request refuses it.
+        assert_eq!(
+            LoginMode::from_wire("device-code"),
+            LoginMode::Other("device-code".into())
+        );
+        let err = MethodCall::parse(
+            method::ACCOUNT_LOGIN_START,
+            Some(&json!({"mode": "device-code"})),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("browser, headless"), "{}", err.message);
+    }
+
+    /// `sync.pause` takes 1 to `MAX_PAUSE_SECS` seconds, or no duration; and absent `mount_id`
+    /// means every mount, for pause and resume alike.
+    #[test]
+    fn pause_duration_is_bounded() {
+        for ok in [
+            json!({}),
+            json!({"duration_secs": 1}),
+            json!({"duration_secs": MAX_PAUSE_SECS}),
+            json!({"duration_secs": null, "mount_id": null}),
+        ] {
+            let call = MethodCall::parse(method::SYNC_PAUSE, Some(&ok)).unwrap();
+            let MethodCall::SyncPause(p) = call else {
+                panic!("not a pause");
+            };
+            assert_eq!(p.mount_id, None, "{ok}");
+        }
+        assert_eq!(MAX_PAUSE_SECS, 604_800);
+        for bad in [
+            json!({"duration_secs": 0}),
+            json!({"duration_secs": MAX_PAUSE_SECS + 1}),
+            json!({"duration_secs": -1}),
+            json!({"duration_secs": 1.5}),
+            json!({"duration_secs": "2h"}),
+            json!({"duration_secs": u64::MAX}),
+        ] {
+            let err = MethodCall::parse(method::SYNC_PAUSE, Some(&bad)).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{bad}");
+        }
+        let call = MethodCall::parse(method::SYNC_RESUME, None).unwrap();
+        assert_eq!(call, MethodCall::SyncResume(SyncResumeParams::default()));
+    }
+
+    /// WP-016 AC8, ADR-0009 R8: the local side of `item.import` and `item.export` is spelled
+    /// by the protocol path rule: absolute and canonical. A relative or non-canonical path is
+    /// `invalid-params`, never repaired; so is the mount side.
+    #[test]
+    fn local_paths_are_absolute_and_canonical() {
+        let bad_paths = [
+            "",
+            "report.pdf",
+            "./report.pdf",
+            "~/Downloads/report.pdf",
+            "Downloads/../report.pdf",
+            "/home/u/Downloads/../.ssh/id_ed25519",
+            "/home/u/./Downloads/report.pdf",
+            "/home/u//Downloads/report.pdf",
+            "/home/u/Downloads/",
+            "/home/u/Downloads/.",
+            "/home/u/Downloads/..",
+            "/home/u/a\0b",
+        ];
+        let too_long = format!("/{}", "a".repeat(crate::path::MAX_PATH_BYTES));
+        for bad in bad_paths.iter().copied().chain([too_long.as_str()]) {
+            assert!(LocalPath::new(bad).is_err(), "{bad:?}");
+            let cases = [
+                (
+                    method::ITEM_IMPORT,
+                    json!({"source": bad, "destination": "/m/a", "mode": "create"}),
+                ),
+                (
+                    method::ITEM_EXPORT,
+                    json!({"source": "/m/a", "destination": bad, "mode": "create"}),
+                ),
+                (
+                    method::ITEM_IMPORT,
+                    json!({"source": "/a", "destination": bad, "mode": "create"}),
+                ),
+                (
+                    method::ITEM_EXPORT,
+                    json!({"source": bad, "destination": "/a", "mode": "create"}),
+                ),
+            ];
+            for (m, params) in cases {
+                let err = MethodCall::parse(m, Some(&params)).unwrap_err();
+                assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{m} {bad:?}");
+            }
+        }
+        // Names that only start with dots, spaces and non-ASCII are ordinary names, kept as
+        // given.
+        for ok in ["/home/u/.config/x", "/home/u/My Files/ü...txt", "/"] {
+            assert_eq!(LocalPath::new(ok).unwrap().as_str(), ok);
+        }
+    }
+
+    /// WP-016 AC7: `account.logout` and `mount.remove` have no parameter that could delete
+    /// remote content. Their parameters are exactly the ID and `dry_run`, and a field asking
+    /// for a delete is an unknown field: ignored, changing nothing in the decoded request.
+    #[test]
+    fn logout_and_remove_have_no_delete_parameter() {
+        let logout =
+            MethodCall::parse(method::ACCOUNT_LOGOUT, Some(&json!({"account_id": "a"}))).unwrap();
+        let remove =
+            MethodCall::parse(method::MOUNT_REMOVE, Some(&json!({"mount_id": "m"}))).unwrap();
+        for extra in [
+            "delete_remote",
+            "delete_local",
+            "purge",
+            "force",
+            "recursive",
+        ] {
+            let with = MethodCall::parse(
+                method::ACCOUNT_LOGOUT,
+                Some(&json!({"account_id": "a", (extra): true})),
+            )
+            .unwrap();
+            assert_eq!(with, logout, "{extra}");
+            let with = MethodCall::parse(
+                method::MOUNT_REMOVE,
+                Some(&json!({"mount_id": "m", (extra): true})),
+            )
+            .unwrap();
+            assert_eq!(with, remove, "{extra}");
+        }
+        let keys = |call: &MethodCall| {
+            let mut v: Vec<String> = call
+                .params()
+                .unwrap()
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            v.sort();
+            v
+        };
+        let logout = MethodCall::AccountLogout(LogoutParams {
+            account_id: acct(),
+            dry_run: true,
+        });
+        assert_eq!(keys(&logout), ["account_id", "dry_run"]);
+        let remove = MethodCall::MountRemove(MountRemoveParams {
+            mount_id: MountId::new("m").unwrap(),
+            dry_run: true,
+        });
+        assert_eq!(keys(&remove), ["dry_run", "mount_id"]);
+        // A dry run is explicit; absent and null mean "do it", never something destructive.
+        let MethodCall::MountRemove(p) = MethodCall::parse(
+            method::MOUNT_REMOVE,
+            Some(&json!({"mount_id": "m", "dry_run": null})),
+        )
+        .unwrap() else {
+            panic!("not a remove");
+        };
+        assert!(!p.dry_run);
+        // Both results report the unsynced count, so a client can warn first.
+        let r: LogoutResult = serde_json::from_value(
+            json!({"account_id": "a", "signed_out": false, "unsynced_files": 3}),
+        )
+        .unwrap();
+        assert_eq!(r.unsynced_files, 3);
+        let r: MountRemoveResult = serde_json::from_value(json!({
+            "mount_id": "m", "removed": false, "mount_point": "/home/u/OneDrive",
+            "kept_files": 140, "unsynced_files": 2
+        }))
+        .unwrap();
+        assert_eq!(r.unsynced_files, 2);
+    }
+
+    /// A test challenge: 43 base64url characters, as an S256 digest is.
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    fn auth_url(extra: &str) -> String {
+        format!(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x&\
+             response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A53211&state=st4te&\
+             code_challenge={CHALLENGE}&code_challenge_method=S256{extra}"
+        )
+    }
+
+    /// ADR-0010 R1, R6: the authorisation URL must carry an S256 challenge (with `plain` the
+    /// challenge would be the verifier) and no parameter named like a credential.
+    #[test]
+    fn adr_0010_r1_authorization_url_carries_s256_and_no_credential() {
+        assert!(AuthorizationUrl::new(auth_url("")).is_ok());
+        assert!(AuthorizationUrl::new(auth_url("&prompt=select_account")).is_ok());
+        // The simulator's authority, on loopback over plain HTTP.
+        for host in ["127.0.0.1:4100", "localhost:4100", "[::1]:4100"] {
+            let url = auth_url("").replace(
+                "https://login.microsoftonline.com",
+                &format!("http://{host}"),
+            );
+            assert!(AuthorizationUrl::new(url).is_ok(), "{host}");
+        }
+        let bad = [
+            auth_url("").replace("code_challenge_method=S256", "code_challenge_method=plain"),
+            auth_url("").replace("&code_challenge_method=S256", ""),
+            auth_url("").replace(&format!("code_challenge={CHALLENGE}&"), ""),
+            auth_url("").replace(CHALLENGE, "short"),
+            auth_url("").replace(CHALLENGE, &format!("{CHALLENGE}A")),
+            auth_url("&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            auth_url("&CODE_VERIFIER=x"),
+            auth_url("&code=M.C507_BAY.2.U.planted-code"),
+            auth_url("&client_secret=s"),
+            auth_url("&access_token=a"),
+            auth_url("&refresh_token=r"),
+            auth_url("&id_token=i"),
+            auth_url("&token=t"),
+            auth_url("&password=p"),
+            auth_url("&code%5Fverifier=x"),
+            auth_url("&=x"),
+            auth_url("&state=again"),
+            auth_url("#code=x"),
+            auth_url(" "),
+            auth_url("&login_hint=\u{e9}"),
+            auth_url("").replace("https://", "http://"),
+            auth_url("").replace("https://", "https://user:pass@"),
+            auth_url("").replace("https://", "ftp://"),
+            "https://".into(),
+            "https:///authorize?code_challenge_method=S256".into(),
+            auth_url(&"&x=y".repeat(MAX_AUTHORIZATION_URL_BYTES / 4)),
+            String::new(),
+        ];
+        for url in bad {
+            let err = AuthorizationUrl::new(url.clone()).unwrap_err();
+            assert!(!err.to_string().contains(&url) || url.is_empty(), "{err}");
+            let as_json = serde_json::to_value(&url).unwrap();
+            assert!(
+                serde_json::from_value::<AuthorizationUrl>(as_json).is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    /// ADR-0010 R6: an attempt ID and a confirmation token are too short, and in too small an
+    /// alphabet, to carry a PKCE verifier (43 to 128 characters), a code or a token.
+    #[test]
+    fn adr_0010_r6_ids_cannot_carry_a_verifier() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let lower_verifier = "dbjftjez4cvp-mb92k27uhbuju1p1r-ww1gfwfoejxk";
+        assert_eq!(verifier.len(), 43);
+        for secret in [verifier, lower_verifier] {
+            assert!(AttemptId::new(secret).is_err());
+            assert!(ConfirmationToken::new(secret).is_err());
+        }
+        assert!(AttemptId::new("a".repeat(MAX_ATTEMPT_ID_BYTES)).is_ok());
+        assert!(AttemptId::new("a".repeat(MAX_ATTEMPT_ID_BYTES + 1)).is_err());
+        for bad in ["", "A", "a_b", "a.b", "a b", "é"] {
+            assert!(AttemptId::new(bad).is_err(), "{bad:?}");
+        }
+        assert!(ConfirmationToken::new("c1.0123456789abcdef.0123456789abcdef").is_ok());
+        for bad in ["", "C1.00", "c1-00", "c1.00.00 ", "c1.00/00"] {
+            assert!(ConfirmationToken::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The pasted address and the sharing link never show in `Debug` output, so a log of a
+    /// decoded request cannot leak them; their errors do not repeat them either.
+    #[test]
+    fn credentials_are_redacted_in_debug_and_errors() {
+        let pasted = "https://login.example/nativeclient?code=PLANTED-CODE&state=s";
+        let call = MethodCall::AccountLoginFinish(LoginFinishParams {
+            attempt_id: AttemptId::new("a1").unwrap(),
+            redirect_url: Some(PastedRedirect::new(pasted).unwrap()),
+        });
+        let debug = format!("{call:?}");
+        assert!(!debug.contains("PLANTED-CODE"), "{debug}");
+        assert!(debug.contains("<redacted>"));
+        let call = MethodCall::MountAddPreview(MountAddPreviewParams {
+            target: link_target(),
+        });
+        let debug = format!("{call:?}");
+        assert!(!debug.contains("planted-link"), "{debug}");
+        for bad in [
+            format!("{pasted} "),
+            format!("{pasted}\n"),
+            "x".repeat(MAX_PASTED_URL_BYTES + 1),
+        ] {
+            let err = PastedRedirect::new(bad.clone()).unwrap_err();
+            assert!(!err.to_string().contains("PLANTED"), "{err}");
+        }
+        for bad in [
+            format!("http://{}", &LINK[8..]),
+            format!("{LINK} x"),
+            "https://".into(),
+            "https:///x".into(),
+            format!("{LINK}{}", "x".repeat(MAX_SHARING_LINK_BYTES)),
+        ] {
+            let err = SharingLink::new(bad).unwrap_err();
+            assert!(!err.to_string().contains("planted"), "{err}");
+        }
+        assert!(SharingLink::new(LINK.replace("https", "HTTPS")).is_ok());
     }
 
     /// WP-005 AC5: an unknown method gets JSON-RPC "method not found".
@@ -1143,6 +2760,7 @@ mod tests {
             MethodCall::ItemDehydrate(paths(&["/a"])),
             MethodCall::StatusSubscribe(StatusSubscribeParams::default()),
         ];
+        let calls = calls.into_iter().chain(new_calls());
         let mut seen = Vec::new();
         for call in calls {
             let req = call.to_request(1).unwrap();
