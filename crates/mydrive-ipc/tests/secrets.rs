@@ -145,8 +145,7 @@ fn mount() -> MountInfo {
         read_only: false,
         drive_type: Some(DriveType::DocumentLibrary),
         item_count: Some(0),
-        paused: false,
-        paused_until: None,
+        pause: None,
     }
 }
 

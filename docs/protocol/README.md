@@ -735,7 +735,8 @@ has `state` `blocked` and `paused` `true`; a client reads blocked from `state` a
 `paused`, and tells all four combinations apart. `paused_until` is when the pause ends, in
 seconds since the Unix epoch (UTC), as in the [`mount.pause`](#mountpause) result; with
 `paused` true and no `paused_until`, the mount is paused until `mount.resume`. A mount with
-`paused_until` and `paused` `false` is malformed, and the types refuse it.
+`paused_until` and `paused` `false` is malformed: the protocol types can neither build nor
+send one, and refuse one they receive.
 
 <!-- example: request -->
 ```json

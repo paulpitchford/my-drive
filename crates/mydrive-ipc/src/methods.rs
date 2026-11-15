@@ -258,13 +258,23 @@ pub struct AccountListResult {
     pub next_cursor: Option<String>,
 }
 
+/// How long a mount stays paused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PauseEnd {
+    /// Until `mount.resume`.
+    UntilResumed,
+    /// Until this time, in whole seconds since the Unix epoch (UTC).
+    At(u64),
+}
+
 /// One mount in `mount.list`.
 ///
-/// `paused` is always present and `paused_until` only with `paused` true: a mount with
-/// `paused_until` and `paused` false fails to deserialise rather than being read one way or
-/// the other.
+/// On the wire, `paused` is always present and `paused_until` only with `paused` true. Here
+/// both are one field, [`MountInfo::pause`], so a mount with an end time but not paused cannot
+/// be built, and so cannot be sent; one received from the wire fails to deserialise rather
+/// than being read one way or the other.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "MountInfoWire")]
+#[serde(try_from = "MountInfoWire", into = "MountInfoWire")]
 pub struct MountInfo {
     /// The mount's ID.
     pub mount_id: MountId,
@@ -277,53 +287,45 @@ pub struct MountInfo {
     /// Its state. Open set.
     pub state: MountState,
     /// Why it is blocked, as a code, when `state` is `blocked` (ADR-0019 R6). Open set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<BlockedReason>,
     /// A human-readable explanation of the block, for display only. Capped at 1 KiB on the
     /// wire, like every message.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        serialize_with = "serialize_capped_opt"
-    )]
     pub blocked_message: Option<String>,
     /// True for a read-only library.
     pub read_only: bool,
     /// The drive's type, when known. Open set.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drive_type: Option<DriveType>,
     /// How many items of the drive the daemon knows: while the mount is `resyncing` for its
     /// first enumeration, the items listed so far. Absent when not known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_count: Option<u64>,
-    /// True whenever the mount is paused, whatever `state` shows: a paused mount that is also
-    /// blocked shows `blocked` but still has `paused` true.
-    pub paused: bool,
-    /// When the mount's pause ends, in whole seconds since the Unix epoch (UTC), as in the
-    /// `mount.pause` result. Only with `paused` true; absent for a pause until
-    /// `mount.resume`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paused_until: Option<u64>,
+    /// `None` when the mount is not paused; otherwise how long the pause lasts. A mount is
+    /// paused whatever `state` shows: a paused mount that is also blocked shows `blocked`. On
+    /// the wire, `paused` and `paused_until` (as in the `mount.pause` result).
+    pub pause: Option<PauseEnd>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct MountInfoWire {
     mount_id: MountId,
     account_id: AccountId,
     drive_id: DriveId,
     mount_point: ProtocolPath,
     state: MountState,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_reason: Option<BlockedReason>,
-    #[serde(default)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_capped_opt"
+    )]
     blocked_message: Option<String>,
     read_only: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     drive_type: Option<DriveType>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     item_count: Option<u64>,
     paused: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     paused_until: Option<u64>,
 }
 
@@ -331,12 +333,17 @@ impl TryFrom<MountInfoWire> for MountInfo {
     type Error = String;
 
     fn try_from(wire: MountInfoWire) -> Result<Self, String> {
-        if wire.paused_until.is_some() && !wire.paused {
-            return Err(format!(
-                "mount {} has paused_until but paused is false",
-                wire.mount_id
-            ));
-        }
+        let pause = match (wire.paused, wire.paused_until) {
+            (false, None) => None,
+            (false, Some(_)) => {
+                return Err(format!(
+                    "mount {} has paused_until but paused is false",
+                    wire.mount_id
+                ));
+            }
+            (true, None) => Some(PauseEnd::UntilResumed),
+            (true, Some(t)) => Some(PauseEnd::At(t)),
+        };
         Ok(Self {
             mount_id: wire.mount_id,
             account_id: wire.account_id,
@@ -348,9 +355,30 @@ impl TryFrom<MountInfoWire> for MountInfo {
             read_only: wire.read_only,
             drive_type: wire.drive_type,
             item_count: wire.item_count,
-            paused: wire.paused,
-            paused_until: wire.paused_until,
+            pause,
         })
+    }
+}
+
+impl From<MountInfo> for MountInfoWire {
+    fn from(info: MountInfo) -> Self {
+        Self {
+            mount_id: info.mount_id,
+            account_id: info.account_id,
+            drive_id: info.drive_id,
+            mount_point: info.mount_point,
+            state: info.state,
+            blocked_reason: info.blocked_reason,
+            blocked_message: info.blocked_message,
+            read_only: info.read_only,
+            drive_type: info.drive_type,
+            item_count: info.item_count,
+            paused: info.pause.is_some(),
+            paused_until: match info.pause {
+                Some(PauseEnd::At(t)) => Some(t),
+                Some(PauseEnd::UntilResumed) | None => None,
+            },
+        }
     }
 }
 
@@ -2749,15 +2777,30 @@ mod tests {
             let info: MountInfo = serde_json::from_value(v.clone()).unwrap();
             assert_eq!(serde_json::to_value(&info).unwrap(), v, "{v}");
             let blocked = info.state == MountState::Blocked;
-            assert!(
-                seen.insert((blocked, info.paused, info.paused_until)),
-                "{v}"
-            );
+            assert_eq!(info.pause.is_some(), paused, "{v}");
+            assert!(seen.insert((blocked, info.pause)), "{v}");
         }
         // Each of the four blocked/paused combinations was read distinctly.
         let combos: std::collections::BTreeSet<(bool, bool)> =
-            seen.iter().map(|(b, p, _)| (*b, *p)).collect();
+            seen.iter().map(|(b, p)| (*b, p.is_some())).collect();
         assert_eq!(combos.len(), 4);
+        // Every value of `pause` serialises to a pair that deserialises back to it: there is
+        // no `MountInfo` whose wire form has `paused_until` without `paused`.
+        let base: MountInfo = serde_json::from_value(mount("active", false, None)).unwrap();
+        for pause in [None, Some(PauseEnd::UntilResumed), Some(PauseEnd::At(1))] {
+            let info = MountInfo {
+                pause,
+                ..base.clone()
+            };
+            let v = serde_json::to_value(&info).unwrap();
+            assert_eq!(v["paused"], json!(pause.is_some()), "{v}");
+            assert_eq!(
+                v.get("paused_until").is_some(),
+                matches!(pause, Some(PauseEnd::At(_))),
+                "{v}"
+            );
+            assert_eq!(serde_json::from_value::<MountInfo>(v).unwrap(), info);
+        }
         // `paused_until` without `paused`, and a missing `paused`, do not parse.
         for bad in [
             mount("active", false, Some(1)),
@@ -2775,7 +2818,7 @@ mod tests {
                 .unwrap();
         let info: MountInfo =
             serde_json::from_value(mount("paused", true, Some(1_794_790_800))).unwrap();
-        assert_eq!(pause.paused_until, info.paused_until);
+        assert_eq!(info.pause, pause.paused_until.map(PauseEnd::At));
     }
 
     /// A test challenge: 43 base64url characters, as an S256 digest is.

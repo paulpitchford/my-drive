@@ -25,9 +25,9 @@ use mydrive_ipc::methods::{
     MAX_STATUS_PATH_BYTES, MAX_STATUS_PATHS, MethodCall, MountAddConfirmParams,
     MountAddConfirmResult, MountAddPreviewParams, MountAddPreviewResult, MountInfo,
     MountPauseParams, MountPauseResult, MountRemoveParams, MountRemoveResult, MountResumeParams,
-    MountResumeResult, MountSource, MountTarget, PastedRedirect, ProposedMount, SUPPORTED_VERSIONS,
-    Session, SharingLink, SkippedItem, StatusSubscribeParams, StatusSubscribeResult,
-    encoded_path_bytes, method,
+    MountResumeResult, MountSource, MountTarget, PastedRedirect, PauseEnd, ProposedMount,
+    SUPPORTED_VERSIONS, Session, SharingLink, SkippedItem, StatusSubscribeParams,
+    StatusSubscribeResult, encoded_path_bytes, method,
 };
 use mydrive_ipc::paging::{
     ActionReport, ConfirmationLedger, KeysetSource, account_page, action_result, batch_page,
@@ -213,8 +213,7 @@ fn worst_mount_list() {
             read_only: true,
             drive_type: Some(DriveType::Other("\"".repeat(200))),
             item_count: Some(u64::MAX),
-            paused: true,
-            paused_until: Some(u64::MAX),
+            pause: Some(PauseEnd::At(u64::MAX)),
         })
         .collect();
     let mut source = VecSource {
@@ -435,8 +434,7 @@ fn worst_mount_info() -> MountInfo {
         read_only: true,
         drive_type: Some(DriveType::Other("\"".repeat(200))),
         item_count: Some(u64::MAX),
-        paused: true,
-        paused_until: Some(u64::MAX),
+        pause: Some(PauseEnd::At(u64::MAX)),
     }
 }
 

@@ -2120,8 +2120,7 @@ mod tests {
             read_only: true,
             drive_type: Some(crate::values::DriveType::DocumentLibrary),
             item_count: Some(u64::MAX),
-            paused: true,
-            paused_until: Some(u64::MAX),
+            pause: Some(crate::methods::PauseEnd::At(u64::MAX)),
         }
     }
 
