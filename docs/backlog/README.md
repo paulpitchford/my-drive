@@ -54,12 +54,12 @@ as it then stands. Rows marked `planned` have no file yet.
 
 | WP | Title | Wave | Depends on | Status |
 |---|---|---|---|---|
-| [WP-014](WP-014-m1-shared-file-preparation.md) | M1 shared-file preparation | 5 | — | ready |
-| [WP-015](WP-015-core-clock-and-conflict-names.md) | Clock and conflict-copy names | 6 | WP-014 | blocked on WP-014 |
-| [WP-016](WP-016-ipc-protocol-m1-methods.md) | Protocol methods for M1 | 6 | WP-014 | blocked on WP-014 |
-| [WP-017](WP-017-store-schema-v2.md) | State store schema version 2 | 6 | WP-014 | blocked on WP-014 |
-| [WP-019](WP-019-sim-write-side.md) | Simulator write side | 6 | WP-014 | blocked on WP-014 |
-| [WP-023](WP-023-sim-identity-and-discovery.md) | Simulator identity and discovery | 6 | WP-014 | blocked on WP-014 |
+| [WP-014](WP-014-m1-shared-file-preparation.md) | M1 shared-file preparation | 5 | — | done |
+| [WP-015](WP-015-core-clock-and-conflict-names.md) | Clock and conflict-copy names | 6 | WP-014 | ready |
+| [WP-016](WP-016-ipc-protocol-m1-methods.md) | Protocol methods for M1 | 6 | WP-014 | ready |
+| [WP-017](WP-017-store-schema-v2.md) | State store schema version 2 | 6 | WP-014 | ready |
+| [WP-019](WP-019-sim-write-side.md) | Simulator write side | 6 | WP-014 | ready |
+| [WP-023](WP-023-sim-identity-and-discovery.md) | Simulator identity and discovery | 6 | WP-014 | ready |
 | 018 | Store schema version 3: pending operations | 7 | 017 | planned |
 | 025 | Graph client write side | 7 | 019 | planned |
 | 029 | Engine foundations and facade | 7 | 015, 017 | planned |

@@ -2,12 +2,13 @@
 
 Side project. This file is the entry point: read it first when coming back.
 
-**Status (2026-11-14):** research complete; architecture decided and documented; project
+**Status (2026-11-15):** research complete; architecture decided and documented; project
 infrastructure in place; waves 1 to 3 of milestone M0 merged (core types, name validation,
 quickXorHash, FUSE test in CI, socket protocol, state store, Graph simulator, sign-in, Graph
-client, architecture checks). No daemon yet.
+client, architecture checks). Milestone M1, the sync engine, has started: its shared files
+are prepared (WP-014) and wave 6 is being built. No daemon yet.
 **Next action:** the Microsoft app registration (owner), which unblocks the experiments
-against a real account (WP-011); then milestone M1, the sync engine. Owner review of the
+against a real account (WP-011), the last open part of M0. Owner review of the
 decisions in `docs/architecture/open-questions.md` is still outstanding.
 
 ## Project documents
