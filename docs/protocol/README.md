@@ -75,8 +75,9 @@ below are run against a fake daemon by `crates/mydrive-ipc/tests/readme_examples
   follows a symbolic link at the last component: with mode `create` the link counts as
   existing, and with mode `replace` the link itself is replaced, not the file it points to.
 - **Durations and times** are integers in whole seconds: a duration is a field ending in
-  `_secs` (at most 604,800, 7 days), and a point in time is seconds since the Unix epoch,
-  UTC (`paused_until`). Both are always below 2^53.
+  `_secs`, from 1 to 604,800 (7 days), and a point in time is seconds since the Unix epoch,
+  UTC (`paused_until`). Both are always below 2^53. A request with a duration outside that
+  range is refused with `invalid-params`: it is never read as "no end", nor cut to the limit.
 - **Large integers.** `seq`, `skipped_count` and `bytes_freed` are unsigned 64-bit
   integers, and a client may receive values above 2^53 (9007199254740992), beyond which a
   double-precision float cannot hold every integer exactly. A client whose JSON parser
@@ -987,14 +988,25 @@ After the user confirms:
 ### mount.pause
 
 Parameters, both optional: `mount_id`, the mount to pause (absent for every mount), and
-`duration_secs`, how long, from 1 to 604,800 seconds (7 days; absent to pause until
-`mount.resume`). A longer pause is a pause with no duration. Pausing a paused mount replaces
-its end time. While paused, a mount sends no uploads or deletes and runs no delta; reading
-and hydrating still work, and local changes are kept for later (J15).
+`duration_secs`, how long, from 1 to 604,800 seconds (7 days); absent to pause until
+`mount.resume`. **A `duration_secs` of 0 or over 604,800 is refused with `invalid-params`,
+and nothing is paused**; it is never read as a pause with no end. While paused, a mount sends
+no uploads or deletes and runs no delta; reading and hydrating still work, and local changes
+are kept for later (J15).
 
-Result: `paused_mounts`, how many mounts this request paused, and `paused_until`, when the
-pause ends, in seconds since the Unix epoch (UTC), absent for a pause with no duration.
-[`mount.list`](#mountlist) shows the same `paused_until` on each paused mount.
+An already paused mount:
+
+- **A request naming the mount replaces its pause**, whether the new one ends sooner or
+  later, or has no end.
+- **A request for every mount never shortens or ends an existing pause.** A mount paused
+  until `mount.resume` stays so; a mount whose pause ends later than the requested end keeps
+  its end; otherwise the mount takes the requested pause.
+
+Result: `paused_mounts`, how many mounts are paused when the call returns (1 for a request
+naming a mount, every mount for a request for all of them), and `paused_until`, when the pause
+this request asked for ends, in seconds since the Unix epoch (UTC), absent when it asked for
+a pause with no end. [`mount.list`](#mountlist) shows each paused mount's own `paused_until`,
+which may be later, or absent, for a mount that kept a longer pause.
 
 <!-- example: request -->
 ```json

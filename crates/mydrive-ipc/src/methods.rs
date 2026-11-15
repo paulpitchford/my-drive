@@ -893,8 +893,9 @@ pub const MAX_SHARING_LINK_BYTES: usize = 4096;
 /// a verifier, code or token.
 pub const MAX_CONFIRMATION_TOKEN_BYTES: usize = 40;
 
-/// The longest pause `mount.pause` accepts, in seconds: 7 days. A longer pause is a pause with
-/// no duration, ended by `mount.resume`.
+/// The longest pause `mount.pause` accepts, in seconds: 7 days. A longer `duration_secs` is
+/// refused with `invalid-params`; it is never read as a pause with no end, nor cut to the
+/// limit. A pause with no end is asked for by leaving `duration_secs` out.
 pub const MAX_PAUSE_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Query parameters an authorisation URL must never carry: each is a credential or would make
@@ -1687,13 +1688,46 @@ impl From<MountPauseParams> for MountPauseWire {
     }
 }
 
+impl MountPauseParams {
+    /// The pause this request asks for, made at `now_secs`.
+    #[must_use]
+    pub fn requested(&self, now_secs: u64) -> PauseEnd {
+        self.duration_secs.map_or(PauseEnd::UntilResumed, |d| {
+            PauseEnd::At(now_secs.saturating_add(d))
+        })
+    }
+
+    /// The pause a mount has after this request, given the pause it had (`None` when it was
+    /// not paused) and the time the request is applied (the lead's ruling of 2026-11-15):
+    ///
+    /// - A request naming the mount replaces its pause, shorter or longer.
+    /// - A request for every mount never shortens or ends a pause: a pause until
+    ///   `mount.resume` stays so, and of two end times the later is kept.
+    #[must_use]
+    pub fn pause_after(&self, current: Option<PauseEnd>, now_secs: u64) -> PauseEnd {
+        let requested = self.requested(now_secs);
+        if self.mount_id.is_some() {
+            return requested;
+        }
+        match (current, requested) {
+            (None, requested) => requested,
+            (Some(PauseEnd::UntilResumed), _) | (_, PauseEnd::UntilResumed) => {
+                PauseEnd::UntilResumed
+            }
+            (Some(PauseEnd::At(had)), PauseEnd::At(asked)) => PauseEnd::At(had.max(asked)),
+        }
+    }
+}
+
 /// `mount.pause` result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountPauseResult {
-    /// How many mounts this request paused.
+    /// How many mounts are paused when the call returns: 1 for a request naming a mount, every
+    /// mount for a request for all of them.
     pub paused_mounts: u64,
-    /// When the pause ends, in whole seconds since the Unix epoch (UTC); absent for a pause
-    /// until `mount.resume`.
+    /// When the pause this request asked for ends, in whole seconds since the Unix epoch
+    /// (UTC); absent when it asked for a pause until `mount.resume`. A mount that kept a
+    /// longer pause shows its own end in `mount.list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_until: Option<u64>,
 }
@@ -2560,6 +2594,50 @@ mod tests {
         }
         let call = MethodCall::parse(method::MOUNT_RESUME, None).unwrap();
         assert_eq!(call, MethodCall::MountResume(MountResumeParams::default()));
+    }
+
+    /// The lead's pausing ruling (WP-016): a request naming a mount replaces that mount's
+    /// pause; a request for every mount never shortens or ends an existing pause; a duration
+    /// over the limit is `invalid-params`, never a pause with no end.
+    #[test]
+    fn pause_ruling_one_mount_replaces_all_mounts_never_shortens() {
+        let now = 1_000;
+        let one = |d: Option<u64>| MountPauseParams {
+            mount_id: Some(MountId::new("m").unwrap()),
+            duration_secs: d,
+        };
+        let all = |d: Option<u64>| MountPauseParams {
+            mount_id: None,
+            duration_secs: d,
+        };
+        let (until, at) = (PauseEnd::UntilResumed, PauseEnd::At);
+        let cases = [
+            // (request, pause the mount had, pause after)
+            (one(Some(60)), None, at(1_060)),
+            (one(Some(60)), Some(until), at(1_060)),
+            (one(Some(60)), Some(at(9_000)), at(1_060)),
+            (one(Some(9_000)), Some(at(1_100)), at(10_000)),
+            (one(None), Some(at(9_000)), until),
+            (all(Some(60)), None, at(1_060)),
+            (all(Some(60)), Some(until), until),
+            (all(Some(60)), Some(at(9_000)), at(9_000)),
+            (all(Some(9_000)), Some(at(1_100)), at(10_000)),
+            (all(None), Some(at(9_000)), until),
+            (all(None), None, until),
+            // A pause that has already ended is no pause: the request's end applies.
+            (all(Some(60)), Some(at(500)), at(1_060)),
+        ];
+        for (request, had, after) in cases {
+            assert_eq!(request.pause_after(had, now), after, "{request:?} {had:?}");
+        }
+        assert_eq!(all(Some(1)).pause_after(None, u64::MAX), at(u64::MAX));
+        let err = MethodCall::parse(
+            method::MOUNT_PAUSE,
+            Some(&json!({"duration_secs": MAX_PAUSE_SECS + 1})),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
+        assert!(err.message.contains("604800"), "{}", err.message);
     }
 
     /// WP-016 AC8, ADR-0009 R8: the local side of `item.import` and `item.export` is spelled
