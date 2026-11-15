@@ -67,8 +67,11 @@ fn text(v: &Value) -> &str {
 /// code can produce. Guards against a regenerated fixture that quietly covers less.
 #[test]
 fn the_fixture_is_a_version_1_store_covering_every_state() {
+    // A copy: opening the committed WAL-mode file, even read-only, would leave `-shm` and
+    // `-wal` files beside it.
+    let dir = tempfile::tempdir().unwrap();
     let conn = rusqlite::Connection::open_with_flags(
-        fixture(),
+        copy(dir.path()),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
