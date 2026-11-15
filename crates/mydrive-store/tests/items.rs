@@ -287,11 +287,41 @@ fn kind_is_validated_in_rust_not_sql() {
     store.insert_item(&file("f", Some(ROOT), "f", 1)).unwrap();
     drop(store);
     raw(&fx.path())
-        .execute("UPDATE items SET kind = 'package' WHERE item_id = 'f'", [])
+        .execute("UPDATE items SET kind = 'notebook' WHERE item_id = 'f'", [])
         .unwrap();
     let store = fx.open();
     let err = store.item(&key("f")).unwrap_err();
     assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
+}
+
+/// WP-017 "Item kinds": `package` is accepted (validated in Rust, no table change), and a
+/// package has no content: no ranges, no dehydration, and it may be dirty without being
+/// `full`, like a folder.
+#[test]
+fn package_is_a_kind_without_content() {
+    let fx = Fixture::new();
+    let store = fx.open_with_mount();
+    let mut package = folder("nb", Some(ROOT), "Notebook");
+    package.kind = ItemKind::Package;
+    store.insert_item(&package).unwrap();
+    assert_eq!(store.item(&key("nb")).unwrap(), Some(package.clone()));
+    let err = store.hydrated_ranges(&key("nb")).unwrap_err();
+    assert!(matches!(err, StoreError::NotAFile { .. }), "{err}");
+    let err = store.dehydrate(&key("nb")).unwrap_err();
+    assert!(matches!(err, StoreError::NotAFile { .. }), "{err}");
+    let err = store.set_local_size(&key("nb"), 4).unwrap_err();
+    assert!(matches!(err, StoreError::NotAFile { .. }), "{err}");
+    // A package with children cannot become a file, as a folder cannot.
+    store
+        .insert_item(&file("page", Some("nb"), "page.one", 3))
+        .unwrap();
+    let err = store
+        .apply_remote_metadata(&RemoteMetadata {
+            kind: ItemKind::File,
+            ..remote(&package)
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::FolderHasChildren { .. }), "{err}");
 }
 
 /// ADR-0007 R1 at the store: a drive ID column only ever holds lowercase.

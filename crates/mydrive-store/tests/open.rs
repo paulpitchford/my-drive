@@ -57,7 +57,13 @@ fn adr_0006_r3_migrating_from_version_0_yields_the_current_schema() {
         .unwrap();
     assert_eq!(
         indexes,
-        ["items_by_dirty", "items_by_parent", "items_by_sync"]
+        [
+            "delta_staged_by_order",
+            "delta_staged_by_parent",
+            "items_by_dirty",
+            "items_by_parent_name",
+            "items_by_sync",
+        ]
     );
 
     let range_fks: Vec<String> = conn
@@ -301,6 +307,34 @@ fn expected_schema() -> BTreeMap<String, Columns> {
             cols(&[
                 ("account_id", "TEXT", true, 1),
                 ("tenant_id", "TEXT", false, 0),
+                ("kind", "TEXT", true, 0),
+                ("username", "TEXT", false, 0),
+                ("display_name", "TEXT", false, 0),
+                ("org_name", "TEXT", false, 0),
+                ("needs_sign_in", "INTEGER", true, 0),
+                ("hash_percent_refused", "INTEGER", true, 0),
+            ]),
+        ),
+        (
+            "delta_staged".to_owned(),
+            cols(&[
+                ("mount_id", "TEXT", true, 1),
+                ("item_id", "TEXT", true, 2),
+                ("seq", "INTEGER", true, 0),
+                ("deleted", "INTEGER", true, 0),
+                ("problem", "TEXT", false, 0),
+                ("problem_detail", "TEXT", false, 0),
+                ("is_root", "INTEGER", true, 0),
+                ("facet", "TEXT", false, 0),
+                ("parent_item_id", "TEXT", false, 0),
+                ("name", "TEXT", false, 0),
+                ("size", "INTEGER", false, 0),
+                ("created_at", "INTEGER", false, 0),
+                ("modified_at", "INTEGER", false, 0),
+                ("etag", "TEXT", false, 0),
+                ("ctag", "TEXT", false, 0),
+                ("server_hash", "TEXT", false, 0),
+                ("apply_order", "INTEGER", false, 0),
             ]),
         ),
         (
@@ -339,6 +373,14 @@ fn expected_schema() -> BTreeMap<String, Columns> {
                 ("remote_ctag", "TEXT", false, 0),
                 ("remote_hash", "TEXT", false, 0),
                 ("remote_size", "INTEGER", false, 0),
+                ("local_id", "INTEGER", true, 0),
+            ]),
+        ),
+        (
+            "local_id_allocator".to_owned(),
+            cols(&[
+                ("singleton", "INTEGER", true, 1),
+                ("next_local_id", "INTEGER", true, 0),
             ]),
         ),
         (
@@ -349,9 +391,18 @@ fn expected_schema() -> BTreeMap<String, Columns> {
                 ("drive_id", "TEXT", true, 0),
                 ("root_item_id", "TEXT", true, 0),
                 ("mount_point", "TEXT", true, 0),
-                ("delta_token", "TEXT", false, 0),
+                ("drive_type", "TEXT", false, 0),
+                ("display_name", "TEXT", false, 0),
                 ("read_only", "INTEGER", true, 0),
+                ("read_only_reason", "TEXT", false, 0),
+                ("paused", "INTEGER", true, 0),
+                ("paused_until", "INTEGER", false, 0),
                 ("blocked_reason", "TEXT", false, 0),
+                ("blocked_message", "TEXT", false, 0),
+                ("delta_token", "TEXT", false, 0),
+                ("delta_run", "TEXT", false, 0),
+                ("delta_next_link", "TEXT", false, 0),
+                ("delta_staged_link", "TEXT", false, 0),
             ]),
         ),
     ])

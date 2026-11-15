@@ -365,9 +365,10 @@ pub enum StoreError {
         size: u64,
     },
 
-    /// Hydrated ranges were asked of a folder.
-    #[error("state store: {action}: item {item_id} in drive {drive_id} is a folder, which has \
-             no content ranges", drive_id = .key.drive_id, item_id = .key.item_id)]
+    /// Content (hydrated ranges, a size change, dehydration) was asked of an item that is
+    /// not a file: a folder or a package.
+    #[error("state store: {action}: item {item_id} in drive {drive_id} is not a file, so it \
+             has no content ranges", drive_id = .key.drive_id, item_id = .key.item_id)]
     NotAFile {
         /// What was being done.
         action: &'static str,
@@ -431,6 +432,130 @@ pub enum StoreError {
         key: ItemKey,
         /// The first item seen twice.
         repeated: ItemId,
+    },
+
+    /// A mount, or a change to one, would break a constraint of the `mounts` table.
+    /// Nothing changed.
+    #[error("state store: refusing to write mount {mount_id}: {rule}")]
+    InvalidMount {
+        /// The mount.
+        mount_id: MountId,
+        /// The constraint it would break.
+        rule: crate::types::MountRule,
+    },
+
+    /// An account would break a constraint of the `accounts` table. Nothing changed.
+    #[error("state store: refusing to write account {account_id}: {reason}")]
+    InvalidAccount {
+        /// The account.
+        account_id: AccountId,
+        /// The rule it breaks.
+        reason: &'static str,
+    },
+
+    /// The operation needs a delta run in progress on the mount, and there is none.
+    #[error("state store: cannot {action} for mount {mount_id}: no delta run is in progress")]
+    NoDeltaRun {
+        /// What was refused.
+        action: &'static str,
+        /// The mount.
+        mount_id: MountId,
+    },
+
+    /// The run's last page (with its delta link) is already staged, so no further page can
+    /// be staged. Begin a new run to restart. Nothing changed.
+    #[error(
+        "state store: cannot stage a delta page for mount {mount_id}: the run's delta link \
+             is already staged; begin a new run to restart it"
+    )]
+    DeltaRunComplete {
+        /// The mount.
+        mount_id: MountId,
+    },
+
+    /// The operation needs the run's complete staged set (its delta link staged), and the
+    /// run is still in its stage phase. Nothing changed.
+    #[error(
+        "state store: cannot {action} for mount {mount_id}: the delta run is still \
+             staging; its delta link has not arrived"
+    )]
+    DeltaRunNotComplete {
+        /// What was refused.
+        action: &'static str,
+        /// The mount.
+        mount_id: MountId,
+    },
+
+    /// A delta entry to stage breaks a rule of the staging table. Nothing was staged.
+    #[error(
+        "state store: cannot stage the delta entry for item {item_id} of mount {mount_id}: \
+             {reason}"
+    )]
+    InvalidStagedEntry {
+        /// The mount.
+        mount_id: MountId,
+        /// The item the entry describes.
+        item_id: ItemId,
+        /// The rule it breaks.
+        reason: &'static str,
+    },
+
+    /// Removing the mount would remove items whose local changes have not reached the
+    /// server. Nothing changed. `sample` names at most
+    /// [`DIRTY_SAMPLE_LIMIT`](crate::DIRTY_SAMPLE_LIMIT) of them, in key order.
+    #[error("state store: refusing to remove mount {mount_id}: {count} item(s) have local \
+             changes not on the server, including {listed}", listed = list_keys(.sample))]
+    MountHasDirtyItems {
+        /// The mount.
+        mount_id: MountId,
+        /// How many dirty items the mount has.
+        count: u64,
+        /// The first of them, in key order.
+        sample: Vec<ItemKey>,
+    },
+
+    /// The caller confirmed keeping a number of dirty items elsewhere, but a different
+    /// number is dirty now: something changed since the user confirmed. Nothing changed.
+    #[error(
+        "state store: refusing to remove mount {mount_id}: the user confirmed {confirmed} \
+             item(s) with local changes, but {actual} are dirty now"
+    )]
+    DirtyCountChanged {
+        /// The mount.
+        mount_id: MountId,
+        /// The count the caller passed.
+        confirmed: u64,
+        /// The count now.
+        actual: u64,
+    },
+
+    /// Another mount shows the same drive, so removing this mount's item rows would remove
+    /// that mount's too. Nothing changed.
+    #[error(
+        "state store: refusing to remove mount {mount_id}: {count} other mount(s) of drive \
+             {drive_id} exist, for example {other}"
+    )]
+    DriveSharedByMounts {
+        /// The mount asked to be removed.
+        mount_id: MountId,
+        /// Its drive.
+        drive_id: mydrive_core::ids::DriveId,
+        /// One other mount of the drive.
+        other: MountId,
+        /// How many other mounts the drive has.
+        count: u64,
+    },
+
+    /// More than one child of the folder has the name, so a lookup by name is ambiguous.
+    #[error("state store: folder {item_id} in drive {drive_id} has {count} children named \
+             {name:?}", drive_id = .parent.drive_id, item_id = .parent.item_id)]
+    DuplicateName {
+        /// The folder.
+        parent: ItemKey,
+        /// The name looked up.
+        name: String,
+        /// How many children have it.
+        count: u64,
     },
 }
 

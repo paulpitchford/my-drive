@@ -80,6 +80,12 @@ pub fn account() -> Account {
     Account {
         account_id: AccountId::new(ACCOUNT).unwrap(),
         tenant_id: None,
+        kind: mydrive_core::names::AccountKind::Personal,
+        username: None,
+        display_name: None,
+        org_name: None,
+        needs_sign_in: false,
+        refuses_hash_and_percent: false,
     }
 }
 
@@ -90,10 +96,42 @@ pub fn mount(id: &str, root: &str, point: &str) -> Mount {
         drive_id: DriveId::new(DRIVE).unwrap(),
         root_item_id: ItemId::new(root).unwrap(),
         mount_point: PathBuf::from(point),
-        delta_token: None,
+        drive_type: Some(mydrive_store::DriveType::Personal),
+        display_name: None,
         read_only: false,
+        read_only_reason: None,
+        paused: false,
+        paused_until: None,
         blocked_reason: None,
+        blocked_message: None,
+        delta_token: None,
+        delta_run: None,
+        delta_next_link: None,
+        delta_staged_link: None,
     }
+}
+
+/// Runs a whole delta run with no entries whose delta link is `token`, the only way the
+/// live token changes (ADR-0022 R4).
+pub fn finish_run_with_token(store: &impl Queries, mount_id: &MountId, token: &str) {
+    let kind = if store.delta_token(mount_id).unwrap().is_some() {
+        mydrive_store::DeltaRunKind::Incremental
+    } else {
+        mydrive_store::DeltaRunKind::Initial
+    };
+    store.begin_delta_run(mount_id, kind).unwrap();
+    store
+        .stage_delta_page(
+            mount_id,
+            &[],
+            &mydrive_store::PageLink::Delta(token.to_owned()),
+        )
+        .unwrap();
+    store.finish_delta_run(mount_id).unwrap();
+}
+
+pub fn limit(n: usize) -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(n).unwrap()
 }
 
 pub fn mount_id() -> MountId {

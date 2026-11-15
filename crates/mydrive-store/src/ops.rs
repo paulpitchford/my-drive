@@ -11,18 +11,21 @@
 //! the start.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::num::NonZeroUsize;
 
 use mydrive_core::hash::QuickXorHash;
-use mydrive_core::ids::{AccountId, DriveId, ItemId, ItemKey, MountId, TenantId};
+use mydrive_core::ids::{AccountId, DriveId, ItemId, ItemKey, MountId};
 use mydrive_core::state::{Hydration, ItemState, Pin, Sync as SyncState};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::{SqlContext, StoreError};
 use crate::types::{
-    Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, PendingChanges,
-    RemoteApplied, RemoteIdentity, RemoteMetadata, Timestamp, UploadCompleted,
+    Account, ByteRange, ChildrenPage, DeleteMode, DeltaRunKind, DriveType, Item, ItemKind, LocalId,
+    LocalOnlyContent, Mount, MountAccess, MountBlock, MountPath, MountPause, MountRemoved,
+    PageLink, PendingChanges, RemoteApplied, RemoteIdentity, RemoteMetadata, StagedCursor,
+    StagedEntry, StagedPage, Timestamp, UnstagedPage, UploadCompleted,
 };
+use crate::{delta, mounts};
 
 pub(crate) mod sealed {
     use crate::StoreError;
@@ -41,18 +44,16 @@ pub(crate) mod sealed {
     }
 }
 
-const ITEM_COLUMNS: &str = "drive_id, item_id, parent_item_id, name, kind, size, created_at, \
-     modified_at, etag, ctag, server_hash, local_hash, hydration, pin, sync, last_error, \
-     is_provisional, local_dirty, local_generation, remote_changed, remote_etag, remote_ctag, \
-     remote_hash, remote_size";
+pub(crate) const ITEM_COLUMNS: &str = "drive_id, item_id, parent_item_id, name, kind, size, \
+     created_at, modified_at, etag, ctag, server_hash, local_hash, hydration, pin, sync, \
+     last_error, is_provisional, local_dirty, local_generation, remote_changed, remote_etag, \
+     remote_ctag, remote_hash, remote_size";
 
-/// The columns `insert_item` writes; the `remote_*` columns start `NULL`.
+/// The columns `insert_item` writes; the `remote_*` columns start `NULL`, and `local_id`
+/// comes from the allocator.
 const INSERT_COLUMNS: &str = "drive_id, item_id, parent_item_id, name, kind, size, created_at, \
      modified_at, etag, ctag, server_hash, local_hash, hydration, pin, sync, last_error, \
-     is_provisional, local_dirty, local_generation, remote_changed";
-
-const MOUNT_COLUMNS: &str = "mount_id, account_id, drive_id, root_item_id, mount_point, \
-     delta_token, read_only, blocked_reason";
+     is_provisional, local_dirty, local_generation, remote_changed, local_id";
 
 /// Every typed operation on the store.
 ///
@@ -65,24 +66,14 @@ const MOUNT_COLUMNS: &str = "mount_id, account_id, drive_id, root_item_id, mount
 pub trait Queries: sealed::Connected {
     // ---------------------------------------------------------------- accounts
 
-    /// Inserts the account, or replaces the stored one with the same ID.
+    /// Inserts the account, or replaces every column of the stored one with the same ID.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Sqlite`] if the write fails.
+    /// [`StoreError::InvalidAccount`] if a name is empty; [`StoreError::Sqlite`] if the
+    /// write fails.
     fn upsert_account(&self, account: &Account) -> Result<(), StoreError> {
-        run(self, |c| {
-            c.execute(
-                "INSERT INTO accounts (account_id, tenant_id) VALUES (?1, ?2) \
-                 ON CONFLICT (account_id) DO UPDATE SET tenant_id = excluded.tenant_id",
-                params![
-                    account.account_id.as_str(),
-                    account.tenant_id.as_ref().map(TenantId::as_str)
-                ],
-            )
-            .ctx(|| format!("store account {}", account.account_id))?;
-            Ok(())
-        })
+        run(self, |c| mounts::upsert_account(c, account))
     }
 
     /// Fetches an account by ID.
@@ -90,27 +81,48 @@ pub trait Queries: sealed::Connected {
     /// # Errors
     ///
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if the row holds
-    /// an invalid identifier.
+    /// an invalid value.
     fn account(&self, account_id: &AccountId) -> Result<Option<Account>, StoreError> {
+        run(self, |c| mounts::account(c, account_id))
+    }
+
+    /// Lists every account, in byte order of account ID.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if a row is
+    /// invalid.
+    fn accounts(&self) -> Result<Vec<Account>, StoreError> {
+        run(self, mounts::accounts)
+    }
+
+    /// Records whether the account needs the user to sign in again.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::AccountNotFound`].
+    fn set_account_needs_sign_in(
+        &self,
+        account_id: &AccountId,
+        needs_sign_in: bool,
+    ) -> Result<(), StoreError> {
         run(self, |c| {
-            let raw: Option<(String, Option<String>)> = c
-                .query_row(
-                    "SELECT account_id, tenant_id FROM accounts WHERE account_id = ?1",
-                    [account_id.as_str()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .ctx(|| format!("read account {account_id}"))?;
-            raw.map(|(id, tenant)| {
-                let what = format!("account {id}");
-                Ok(Account {
-                    account_id: parse_id(&what, "account_id", id.clone(), AccountId::new)?,
-                    tenant_id: tenant
-                        .map(|t| parse_id(&what, "tenant_id", t, TenantId::new))
-                        .transpose()?,
-                })
-            })
-            .transpose()
+            mounts::update_account_flag(c, account_id, "needs_sign_in", needs_sign_in)
+        })
+    }
+
+    /// Records whether the account's tenant refuses `#` and `%` in names.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::AccountNotFound`].
+    fn set_account_refuses_hash_and_percent(
+        &self,
+        account_id: &AccountId,
+        refuses: bool,
+    ) -> Result<(), StoreError> {
+        run(self, |c| {
+            mounts::update_account_flag(c, account_id, "hash_percent_refused", refuses)
         })
     }
 
@@ -118,18 +130,25 @@ pub trait Queries: sealed::Connected {
 
     /// Adds a mount.
     ///
+    /// A new mount records its drive type and holds no delta token and no run links: the
+    /// live token is written only by [`finish_delta_run`](Self::finish_delta_run)
+    /// (ADR-0022 R4) and the links only by [`stage_delta_page`](Self::stage_delta_page). Its
+    /// run, if one is given, is the `initial` one; it may equally be started afterwards
+    /// with [`begin_delta_run`](Self::begin_delta_run) in the same transaction.
+    ///
     /// The mount point is not a key and is not checked here: refusing a mount point that
     /// is in use, nested or overlapping is the engine's check (overview, "Rulings on
     /// details"), and ADR-0007 R6 forbids paths as keys.
     ///
     /// # Errors
     ///
-    /// [`StoreError::AccountNotFound`] if its account is not stored,
-    /// [`StoreError::MountExists`] if the mount ID is taken, [`StoreError::MountRootTaken`]
-    /// if another mount has the same root (`drive_id`, `item_id`) (ADR-0007 R4),
+    /// [`StoreError::InvalidMount`] naming the [`MountRule`](crate::MountRule) the mount
+    /// breaks; [`StoreError::AccountNotFound`] if its account is not stored;
+    /// [`StoreError::MountExists`] if the mount ID is taken; [`StoreError::MountRootTaken`]
+    /// if another mount has the same root (`drive_id`, `item_id`) (ADR-0007 R4);
     /// [`StoreError::NonUtf8Path`] if the mount point is not UTF-8.
     fn insert_mount(&self, mount: &Mount) -> Result<(), StoreError> {
-        run(self, |c| atomic(c, |c| insert_mount(c, mount)))
+        run(self, |c| atomic(c, |c| mounts::insert_mount(c, mount)))
     }
 
     /// Fetches a mount by ID.
@@ -139,106 +158,310 @@ pub trait Queries: sealed::Connected {
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if the row is
     /// invalid.
     fn mount(&self, mount_id: &MountId) -> Result<Option<Mount>, StoreError> {
-        run(self, |c| {
-            c.query_row(
-                &format!("SELECT {MOUNT_COLUMNS} FROM mounts WHERE mount_id = ?1"),
-                [mount_id.as_str()],
-                RawMount::from_row,
-            )
-            .optional()
-            .ctx(|| format!("read mount {mount_id}"))?
-            .map(RawMount::into_mount)
-            .transpose()
-        })
+        run(self, |c| mounts::mount(c, mount_id))
     }
 
-    /// Lists every mount, ordered by mount ID.
+    /// Lists every mount, in byte order of mount ID.
     ///
     /// # Errors
     ///
     /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if a row is
     /// invalid.
     fn mounts(&self) -> Result<Vec<Mount>, StoreError> {
-        run(self, |c| {
-            let mut stmt = c
-                .prepare_cached(&format!(
-                    "SELECT {MOUNT_COLUMNS} FROM mounts ORDER BY mount_id"
-                ))
-                .ctx(|| "list mounts")?;
-            let raws = stmt
-                .query_map([], RawMount::from_row)
-                .and_then(Iterator::collect::<Result<Vec<_>, _>>)
-                .ctx(|| "list mounts")?;
-            raws.into_iter().map(RawMount::into_mount).collect()
-        })
+        run(self, mounts::mounts)
     }
 
-    /// Reads a mount's delta token (ADR-0007 R2). `None` means no token has been saved.
+    /// Reads a mount's live delta token (ADR-0007 R2). `None` means no run has been
+    /// finished yet.
     ///
     /// # Errors
     ///
     /// [`StoreError::MountNotFound`] if the mount is not stored.
     fn delta_token(&self, mount_id: &MountId) -> Result<Option<String>, StoreError> {
-        run(self, |c| {
-            c.query_row(
-                "SELECT delta_token FROM mounts WHERE mount_id = ?1",
-                [mount_id.as_str()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .ctx(|| format!("read the delta token of mount {mount_id}"))?
-            .ok_or_else(|| StoreError::MountNotFound {
-                action: "read the delta token",
-                mount_id: mount_id.clone(),
-            })
-        })
+        run(self, |c| mounts::delta_token(c, mount_id))
     }
 
-    /// Replaces a mount's delta token; `None` clears it, so the next delta enumerates the
-    /// whole drive. The token is never logged.
+    /// Records whether the mount is paused and until when.
     ///
     /// # Errors
     ///
-    /// [`StoreError::MountNotFound`] if the mount is not stored.
-    fn set_delta_token(&self, mount_id: &MountId, token: Option<&str>) -> Result<(), StoreError> {
-        run(self, |c| {
-            update_mount(c, mount_id, "delta_token", token, "write the delta token")
-        })
+    /// [`StoreError::MountNotFound`].
+    fn set_mount_paused(&self, mount_id: &MountId, pause: MountPause) -> Result<(), StoreError> {
+        run(self, |c| mounts::set_paused(c, mount_id, pause))
     }
 
-    /// Sets why organisation policy blocks a mount; `None` clears the block.
+    /// Records why organisation policy blocks the mount; `None` clears the block, reason
+    /// and message together.
     ///
     /// # Errors
     ///
-    /// [`StoreError::MountNotFound`] if the mount is not stored.
-    fn set_mount_blocked_reason(
+    /// [`StoreError::MountNotFound`]; [`StoreError::InvalidMount`] with
+    /// [`MountRule::EmptyText`](crate::MountRule::EmptyText) for an empty message.
+    fn set_mount_blocked(
         &self,
         mount_id: &MountId,
-        reason: Option<&str>,
+        block: Option<&MountBlock>,
+    ) -> Result<(), StoreError> {
+        run(self, |c| mounts::set_blocked(c, mount_id, block))
+    }
+
+    /// Records whether the mount accepts local writes, and why not.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`].
+    fn set_mount_read_only(
+        &self,
+        mount_id: &MountId,
+        access: MountAccess,
+    ) -> Result<(), StoreError> {
+        run(self, |c| mounts::set_read_only(c, mount_id, access))
+    }
+
+    /// Records the mount's drive type and display name, as Graph reports them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`]; [`StoreError::InvalidMount`] with
+    /// [`MountRule::EmptyText`](crate::MountRule::EmptyText) for an empty display name.
+    fn set_mount_drive_info(
+        &self,
+        mount_id: &MountId,
+        drive_type: DriveType,
+        display_name: Option<&str>,
     ) -> Result<(), StoreError> {
         run(self, |c| {
-            update_mount(
-                c,
-                mount_id,
-                "blocked_reason",
-                reason,
-                "write the blocked reason",
-            )
+            mounts::set_drive_info(c, mount_id, drive_type, display_name)
         })
+    }
+
+    /// Removes a mount and its store rows: the mount, its staged delta entries, and every
+    /// item of its drive with their hydrated ranges, in one operation. Nothing is sent to
+    /// the server and no file is touched (ADR-0015 R8): writing fully local files into the
+    /// mount-point directory and removing the backing directory are the engine's, before
+    /// and after this call. Rows of any other drive are never changed.
+    ///
+    /// Refused while any item of the drive is dirty, unless `local_only` is
+    /// [`LocalOnlyContent::KeptElsewhere`] with the current number of dirty items.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`]; [`StoreError::MountHasDirtyItems`] with the count and
+    /// at most [`DIRTY_SAMPLE_LIMIT`](crate::DIRTY_SAMPLE_LIMIT) of the dirty items;
+    /// [`StoreError::DirtyCountChanged`] if the confirmed count is not the current one;
+    /// [`StoreError::DriveSharedByMounts`] if another mount shows the same drive. A refusal
+    /// changes nothing.
+    fn remove_mount(
+        &self,
+        mount_id: &MountId,
+        local_only: LocalOnlyContent,
+    ) -> Result<MountRemoved, StoreError> {
+        run(self, |c| {
+            atomic(c, |c| mounts::remove_mount(c, mount_id, local_only))
+        })
+    }
+
+    // ------------------------------------------------------------ delta runs
+
+    /// Starts a delta run on the mount (ADR-0022), discarding any staged set left by an
+    /// earlier run first (overview, "A delta run that restarts from the beginning discards
+    /// its staged set first"). Returns how many staged entries were discarded. The live
+    /// token is not changed. The run's first request is the live token for an incremental
+    /// run, and the drive's delta with no token otherwise; to start from another link (a
+    /// resync's `Location`), stage an empty page with that link as
+    /// [`PageLink::Next`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`]; [`StoreError::InvalidMount`] with
+    /// [`MountRule::IncrementalWithoutToken`](crate::MountRule::IncrementalWithoutToken) or
+    /// [`MountRule::InitialWithToken`](crate::MountRule::InitialWithToken). A refusal
+    /// changes nothing.
+    fn begin_delta_run(&self, mount_id: &MountId, kind: DeltaRunKind) -> Result<u64, StoreError> {
+        run(self, |c| atomic(c, |c| delta::begin(c, mount_id, kind)))
+    }
+
+    /// Stages one delta page: its entries and the link it ends with, together or not at
+    /// all (ADR-0022 R1). An entry for an item already staged in this run replaces it
+    /// (ADR-0022 R2); within `entries`, a later entry for an item replaces an earlier one.
+    /// No item row changes (ADR-0022 R3).
+    ///
+    /// [`PageLink::Next`] records where the run continues. [`PageLink::Delta`] completes
+    /// the staged set: it is then put in apply order, and an entry the store can see is
+    /// unusable is marked as a problem ([`StagedProblem`](crate::StagedProblem)); see
+    /// [`staged_entries`](Self::staged_entries).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`]; [`StoreError::NoDeltaRun`];
+    /// [`StoreError::DeltaRunComplete`] if the run's delta link is already staged;
+    /// [`StoreError::InvalidStagedEntry`], [`StoreError::InvalidName`] or
+    /// [`StoreError::SizeTooLarge`] for an entry the table cannot hold;
+    /// [`StoreError::InvalidMount`] with
+    /// [`MountRule::EmptyText`](crate::MountRule::EmptyText) for an empty link. A refusal
+    /// stages nothing.
+    fn stage_delta_page(
+        &self,
+        mount_id: &MountId,
+        entries: &[StagedEntry],
+        link: &PageLink,
+    ) -> Result<(), StoreError> {
+        run(self, |c| {
+            atomic(c, |c| delta::stage_page(c, mount_id, entries, link))
+        })
+    }
+
+    /// How many entries are staged for the mount's run.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`].
+    fn staged_count(&self, mount_id: &MountId) -> Result<u64, StoreError> {
+        run(self, |c| delta::count(c, mount_id))
+    }
+
+    /// One page of a complete staged set, in apply order: entries that are not deletes
+    /// first, each after the staged entry for its parent (parents before children), then
+    /// the deletes. Pass `after` as the previous page's [`StagedPage::next`]; `None` starts
+    /// at the beginning. At most `limit` entries are read at a time, so memory does not
+    /// grow with the staged set.
+    ///
+    /// Every staged entry is returned exactly once. Those that cannot be ordered or applied
+    /// are returned as problems ([`StagedProblem`](crate::StagedProblem)), never left out:
+    /// an entry whose parent chain within the staged set loops (`ParentCycle`, ordered after
+    /// every other entry that is not a delete), one whose parent is neither staged nor
+    /// stored (`MissingParent`), and one whose parent is staged as deleted
+    /// (`ParentDeleted`). The drive root has no parent, so it is in the first level, with every entry whose parent is already stored.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`]; [`StoreError::NoDeltaRun`];
+    /// [`StoreError::DeltaRunNotComplete`] until the run's delta link is staged.
+    fn staged_entries(
+        &self,
+        mount_id: &MountId,
+        after: Option<&StagedCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<StagedPage, StoreError> {
+        run(self, |c| delta::entries(c, mount_id, after, limit))
+    }
+
+    /// One page of the items of the mount's drive that the complete staged set does not
+    /// contain, in byte order of item ID: the resync anti-join (F05). Pass `after` as the
+    /// previous page's [`UnstagedPage::next`]. Dirty and provisional items are listed too:
+    /// they are not on the server's list, and
+    /// [`delete_item`](Self::delete_item) refuses to remove them.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`]; [`StoreError::NoDeltaRun`];
+    /// [`StoreError::DeltaRunNotComplete`] until the run's delta link is staged, because
+    /// an item missing from a partial set is not missing from the server.
+    fn unstaged_items(
+        &self,
+        mount_id: &MountId,
+        after: Option<&ItemId>,
+        limit: NonZeroUsize,
+    ) -> Result<UnstagedPage, StoreError> {
+        run(self, |c| delta::unstaged(c, mount_id, after, limit))
+    }
+
+    /// Finishes the mount's run once its staged set has been applied: removes the staged
+    /// entries, makes the staged delta link the live token and clears the run state, in one
+    /// operation. This is the only operation that changes the live token (ADR-0022 R4).
+    /// Returns how many staged entries were removed.
+    ///
+    /// The store cannot see whether the engine applied every entry; calling this before the
+    /// apply is complete would lose the rest of the run.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::MountNotFound`]; [`StoreError::NoDeltaRun`];
+    /// [`StoreError::DeltaRunNotComplete`] until the run's delta link is staged. A refusal
+    /// changes nothing.
+    fn finish_delta_run(&self, mount_id: &MountId) -> Result<u64, StoreError> {
+        run(self, |c| atomic(c, |c| delta::finish(c, mount_id)))
     }
 
     // ------------------------------------------------------------------- items
 
     /// Inserts a new item with every column as given: an item first seen in a delta, or
-    /// one created locally (`is_provisional`, with a provisional `item_id`).
+    /// one created locally (`is_provisional`, with a provisional `item_id`). Returns the
+    /// row's new [`LocalId`], allocated in the same operation: never one any earlier row
+    /// held (ADR-0021 R1).
+    ///
+    /// Commit the insert before creating the item's content file: an allocation rolled
+    /// back with its row is never seen by any row, so it may be handed out again.
     ///
     /// # Errors
     ///
     /// [`StoreError::ItemExists`] if the key is taken, [`StoreError::InvalidName`] if the
     /// name is empty, `.`, `..`, or contains `/` or NUL, [`StoreError::SizeTooLarge`] if
     /// the size exceeds `i64::MAX`.
-    fn insert_item(&self, item: &Item) -> Result<(), StoreError> {
+    fn insert_item(&self, item: &Item) -> Result<LocalId, StoreError> {
         run(self, |c| atomic(c, |c| insert_item(c, item)))
+    }
+
+    /// The item's [`LocalId`] (ADR-0021), which names its content file.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::ItemNotFound`]; [`StoreError::Corrupt`] if the stored value is not a
+    /// valid local ID.
+    fn local_id(&self, key: &ItemKey) -> Result<LocalId, StoreError> {
+        run(self, |c| local_id_of(c, key))
+    }
+
+    /// One page of a folder's children whose names come strictly after `after_name` in
+    /// byte order of their UTF-8 (SQLite's `BINARY` collation: no locale, no case folding,
+    /// no normalisation), up to `limit` of them; `None` starts at the first. Served by the
+    /// index `items_by_parent_name` without sorting.
+    ///
+    /// Paging by passing the last returned name delivers every child that exists unchanged
+    /// for the whole loop exactly once, whatever is added, removed or renamed between pages
+    /// (ADR-0020 R1, R2). Two children can hold the same name only transiently; so that a
+    /// page boundary never separates them, a page is extended past `limit` to the last
+    /// child with the same name as the `limit`-th.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] if the read fails, [`StoreError::Corrupt`] if a row is
+    /// invalid.
+    fn children_after(
+        &self,
+        parent: &ItemKey,
+        after_name: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> Result<ChildrenPage, StoreError> {
+        run(self, |c| children_after(c, parent, after_name, limit))
+    }
+
+    /// The child of `parent` whose name is exactly `name`, compared byte for byte.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::DuplicateName`] if more than one child has the name;
+    /// [`StoreError::Sqlite`], [`StoreError::Corrupt`].
+    fn child_by_name(&self, parent: &ItemKey, name: &str) -> Result<Option<Item>, StoreError> {
+        run(self, |c| child_by_name(c, parent, name))
+    }
+
+    /// How many items the store holds for the drive.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sqlite`] if the read fails.
+    fn item_count(&self, drive_id: &DriveId) -> Result<u64, StoreError> {
+        run(self, |c| {
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM items WHERE drive_id = ?1",
+                    [drive_id.as_str()],
+                    |row| row.get(0),
+                )
+                .ctx(|| format!("count the items of drive {drive_id}"))?;
+            Ok(u64::try_from(n).unwrap_or(0))
+        })
     }
 
     /// Applies what the server reports about an existing item, writing only server-owned
@@ -779,7 +1002,7 @@ pub trait Queries: sealed::Connected {
         run(self, |c| {
             atomic(c, |c| {
                 let item = load_item(c, key, "dehydrate")?;
-                if item.kind == ItemKind::Folder {
+                if !item.kind.has_content() {
                     return Err(StoreError::NotAFile {
                         action: "dehydrate",
                         key: key.clone(),
@@ -820,98 +1043,6 @@ where
     q.run(sealed::Token(()), op)
 }
 
-fn insert_mount(c: &Connection, mount: &Mount) -> Result<(), StoreError> {
-    let mount_point = mount
-        .mount_point
-        .to_str()
-        .ok_or_else(|| StoreError::NonUtf8Path {
-            what: format!("mount point of mount {}", mount.mount_id),
-            path: mount.mount_point.clone(),
-        })?;
-    let account_known: bool = c
-        .query_row(
-            "SELECT EXISTS (SELECT 1 FROM accounts WHERE account_id = ?1)",
-            [mount.account_id.as_str()],
-            |row| row.get(0),
-        )
-        .ctx(|| format!("look up account {}", mount.account_id))?;
-    if !account_known {
-        return Err(StoreError::AccountNotFound {
-            action: "add a mount",
-            account_id: mount.account_id.clone(),
-        });
-    }
-    let taken: bool = c
-        .query_row(
-            "SELECT EXISTS (SELECT 1 FROM mounts WHERE mount_id = ?1)",
-            [mount.mount_id.as_str()],
-            |row| row.get(0),
-        )
-        .ctx(|| format!("look up mount {}", mount.mount_id))?;
-    if taken {
-        return Err(StoreError::MountExists {
-            mount_id: mount.mount_id.clone(),
-        });
-    }
-    let same_root: Option<String> = c
-        .query_row(
-            "SELECT mount_id FROM mounts WHERE drive_id = ?1 AND root_item_id = ?2",
-            [mount.drive_id.as_str(), mount.root_item_id.as_str()],
-            |row| row.get(0),
-        )
-        .optional()
-        .ctx(|| {
-            format!(
-                "check whether the root of mount {} is mounted",
-                mount.mount_id
-            )
-        })?;
-    if let Some(existing) = same_root {
-        return Err(StoreError::MountRootTaken {
-            mount_id: mount.mount_id.clone(),
-            root: ItemKey::new(mount.drive_id.clone(), mount.root_item_id.clone()),
-            existing: parse_id("mount row", "mount_id", existing, MountId::new)?,
-        });
-    }
-    c.execute(
-        &format!("INSERT INTO mounts ({MOUNT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
-        params![
-            mount.mount_id.as_str(),
-            mount.account_id.as_str(),
-            mount.drive_id.as_str(),
-            mount.root_item_id.as_str(),
-            mount_point,
-            mount.delta_token.as_deref(),
-            mount.read_only,
-            mount.blocked_reason.as_deref(),
-        ],
-    )
-    .ctx(|| format!("insert mount {}", mount.mount_id))?;
-    Ok(())
-}
-
-fn update_mount(
-    c: &Connection,
-    mount_id: &MountId,
-    column: &str,
-    value: Option<&str>,
-    action: &'static str,
-) -> Result<(), StoreError> {
-    let changed = c
-        .execute(
-            &format!("UPDATE mounts SET {column} = ?2 WHERE mount_id = ?1"),
-            params![mount_id.as_str(), value],
-        )
-        .ctx(|| format!("{action} of mount {mount_id}"))?;
-    if changed == 0 {
-        return Err(StoreError::MountNotFound {
-            action,
-            mount_id: mount_id.clone(),
-        });
-    }
-    Ok(())
-}
-
 fn update_item(
     c: &Connection,
     key: &ItemKey,
@@ -938,7 +1069,7 @@ fn found(changed: usize, key: &ItemKey, action: &'static str) -> Result<(), Stor
     Ok(())
 }
 
-fn check_name(key: &ItemKey, name: &str) -> Result<(), StoreError> {
+pub(crate) fn check_name(key: &ItemKey, name: &str) -> Result<(), StoreError> {
     let reason = if name.is_empty() {
         "is empty"
     } else if name == "." || name == ".." {
@@ -957,14 +1088,14 @@ fn check_name(key: &ItemKey, name: &str) -> Result<(), StoreError> {
     })
 }
 
-fn to_i64_checked(size: u64, key: &ItemKey) -> Result<i64, StoreError> {
+pub(crate) fn to_i64_checked(size: u64, key: &ItemKey) -> Result<i64, StoreError> {
     i64::try_from(size).map_err(|_| StoreError::SizeTooLarge {
         key: key.clone(),
         size,
     })
 }
 
-fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
+fn insert_item(c: &Connection, item: &Item) -> Result<LocalId, StoreError> {
     let key = &item.key;
     check_name(key, &item.name)?;
     let size = to_i64_checked(item.size, key)?;
@@ -989,7 +1120,7 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
             "a new item has no remote change or remote identity recorded",
         ));
     }
-    if item.local_dirty && item.kind == ItemKind::File && item.state.hydration != Hydration::Full {
+    if item.local_dirty && item.kind.has_content() && item.state.hydration != Hydration::Full {
         return Err(invalid(
             "a file created locally is fully local: its hydration must be full",
         ));
@@ -1000,11 +1131,13 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
             key: key.clone(),
         });
     }
+    // In the same savepoint as the row: both commit, or neither does (ADR-0021 R1).
+    let local_id = allocate_local_id(c, key)?;
     c.execute(
         &format!(
             "INSERT INTO items ({INSERT_COLUMNS}) VALUES \
              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-              ?18, ?19, ?20)"
+              ?18, ?19, ?20, ?21)"
         ),
         params![
             key.drive_id.as_str(),
@@ -1027,14 +1160,174 @@ fn insert_item(c: &Connection, item: &Item) -> Result<(), StoreError> {
             item.local_dirty,
             generation_to_i64(item.local_generation, key)?,
             item.remote_changed,
+            local_id_to_i64(local_id),
         ],
     )
     .ctx(|| describe("insert", key))?;
-    if item.local_dirty && item.kind == ItemKind::File {
+    if item.local_dirty && item.kind.has_content() {
         // Its bytes exist only here: the whole file is local.
         set_whole_file_range(c, key, size)?;
     }
-    Ok(())
+    Ok(local_id)
+}
+
+/// Takes the next local ID from the allocator, which only ever counts up: deleting rows,
+/// even the one with the largest ID or every row, never lowers it (ADR-0021 R1).
+fn allocate_local_id(c: &Connection, key: &ItemKey) -> Result<LocalId, StoreError> {
+    let allocated: Option<i64> = c
+        .query_row(
+            "UPDATE local_id_allocator SET next_local_id = next_local_id + 1 \
+             WHERE singleton = 1 RETURNING next_local_id - 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .ctx(|| describe("allocate a local ID for", key))?;
+    let raw = allocated.ok_or_else(|| StoreError::Corrupt {
+        what: "local_id_allocator".to_owned(),
+        value: "no row".to_owned(),
+        reason: "the local ID allocator row is missing".to_owned(),
+    })?;
+    parse_local_id(raw, || describe("local ID allocated for", key))
+}
+
+fn local_id_to_i64(id: LocalId) -> i64 {
+    // Allocated from an i64 column, so it fits.
+    i64::try_from(id.get()).unwrap_or(i64::MAX)
+}
+
+pub(crate) fn parse_local_id<S: Into<String>>(
+    raw: i64,
+    what: impl FnOnce() -> S,
+) -> Result<LocalId, StoreError> {
+    match u64::try_from(raw) {
+        Ok(v) if v >= 1 => Ok(LocalId::new(v)),
+        _ => Err(StoreError::Corrupt {
+            what: what().into(),
+            value: raw.to_string(),
+            reason: "a local ID is at least 1".to_owned(),
+        }),
+    }
+}
+
+fn local_id_of(c: &Connection, key: &ItemKey) -> Result<LocalId, StoreError> {
+    let raw: Option<i64> = c
+        .query_row(
+            "SELECT local_id FROM items WHERE drive_id = ?1 AND item_id = ?2",
+            [key.drive_id.as_str(), key.item_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .ctx(|| describe("read the local ID of", key))?;
+    let raw = raw.ok_or_else(|| StoreError::ItemNotFound {
+        action: "read the local ID",
+        key: key.clone(),
+    })?;
+    parse_local_id(raw, || describe("local ID of", key))
+}
+
+/// The statement behind [`Queries::children_after`]: `?1` drive, `?2` parent, `?3` limit,
+/// and with `after`, `?4` the name to start after.
+fn children_sql(after: bool) -> String {
+    let after = if after { "AND name > ?4 " } else { "" };
+    format!(
+        "SELECT {ITEM_COLUMNS} FROM items WHERE drive_id = ?1 AND parent_item_id = ?2 {after}\
+         ORDER BY name, item_id LIMIT ?3"
+    )
+}
+
+fn children_after(
+    c: &Connection,
+    parent: &ItemKey,
+    after_name: Option<&str>,
+    limit: NonZeroUsize,
+) -> Result<ChildrenPage, StoreError> {
+    // `name` is BINARY (memcmp of the stored UTF-8) in the table, the index and this
+    // comparison; the bound parameter is TEXT, so no affinity or collation changes it.
+    // One more row than asked shows whether more follow.
+    let want = i64::try_from(limit.get())
+        .unwrap_or(i64::MAX - 1)
+        .saturating_add(1);
+    let ids = [parent.drive_id.as_str(), parent.item_id.as_str()];
+    // Two statements rather than `(?3 IS NULL OR name > ?3)`, which SQLite cannot use as an
+    // index range: every page would scan from the folder's first child.
+    let mut items = match after_name {
+        Some(after) => query_items_params(
+            c,
+            &children_sql(true),
+            params![ids[0], ids[1], want, after],
+            || describe("list the children of", parent),
+        )?,
+        None => query_items_params(
+            c,
+            &children_sql(false),
+            params![ids[0], ids[1], want],
+            || describe("list the children of", parent),
+        )?,
+    };
+    let mut more = items.len() > limit.get();
+    if more {
+        items.truncate(limit.get());
+        // Never split equal names across pages: the next page starts strictly after the
+        // last name returned, so the rest of a run of equal names would be skipped.
+        if let Some(last) = items.last().map(|i| i.name.clone()) {
+            let after_id = items.last().map(|i| i.key.item_id.as_str().to_owned());
+            let rest = query_items_params(
+                c,
+                &format!(
+                    "SELECT {ITEM_COLUMNS} FROM items \
+                     WHERE drive_id = ?1 AND parent_item_id = ?2 AND name = ?3 \
+                     AND item_id > ?4 ORDER BY item_id"
+                ),
+                params![
+                    parent.drive_id.as_str(),
+                    parent.item_id.as_str(),
+                    last,
+                    after_id
+                ],
+                || describe("list the children of", parent),
+            )?;
+            items.extend(rest);
+            let further: bool = c
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM items WHERE drive_id = ?1 \
+                     AND parent_item_id = ?2 AND name > ?3)",
+                    params![parent.drive_id.as_str(), parent.item_id.as_str(), last],
+                    |row| row.get(0),
+                )
+                .ctx(|| describe("list the children of", parent))?;
+            more = further;
+        }
+    }
+    Ok(ChildrenPage { items, more })
+}
+
+fn child_by_name(c: &Connection, parent: &ItemKey, name: &str) -> Result<Option<Item>, StoreError> {
+    let mut found = query_items_params(
+        c,
+        &format!(
+            "SELECT {ITEM_COLUMNS} FROM items \
+             WHERE drive_id = ?1 AND parent_item_id = ?2 AND name = ?3 ORDER BY item_id LIMIT 2"
+        ),
+        params![parent.drive_id.as_str(), parent.item_id.as_str(), name],
+        || describe("look up a child by name of", parent),
+    )?;
+    if found.len() > 1 {
+        let count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM items WHERE drive_id = ?1 AND parent_item_id = ?2 \
+                 AND name = ?3",
+                params![parent.drive_id.as_str(), parent.item_id.as_str(), name],
+                |row| row.get(0),
+            )
+            .ctx(|| describe("count the children by name of", parent))?;
+        return Err(StoreError::DuplicateName {
+            parent: parent.clone(),
+            name: name.to_owned(),
+            count: u64::try_from(count).unwrap_or(0),
+        });
+    }
+    Ok(found.pop())
 }
 
 fn generation_to_i64(generation: u64, key: &ItemKey) -> Result<i64, StoreError> {
@@ -1063,7 +1356,7 @@ fn content_changed(old: &Item, known: &RemoteIdentity, new: &RemoteMetadata) -> 
     if old.kind != new.kind {
         return true;
     }
-    old.kind == ItemKind::File && !known.same_content(&new.identity())
+    old.kind.has_content() && !known.same_content(&new.identity())
 }
 
 fn mark_local_change(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
@@ -1109,7 +1402,7 @@ fn require_fully_local(
     item: &Item,
     action: &'static str,
 ) -> Result<(), StoreError> {
-    if item.kind == ItemKind::Folder {
+    if !item.kind.has_content() {
         return Ok(());
     }
     let whole = ByteRange::new(0, item.size)?;
@@ -1358,7 +1651,7 @@ fn check_folder_to_file(
     old: &Item,
     remote: &RemoteMetadata,
 ) -> Result<(), StoreError> {
-    if old.kind == ItemKind::Folder && remote.kind == ItemKind::File {
+    if !old.kind.has_content() && remote.kind.has_content() {
         let children = child_count(c, &old.key)?;
         if children > 0 {
             return Err(StoreError::FolderHasChildren {
@@ -1403,7 +1696,7 @@ fn release_content(c: &Connection, key: &ItemKey, kind: ItemKind) -> Result<u64,
     let ranges_cleared = clear_ranges(c, key)?;
     let hydration = match kind {
         ItemKind::File => Hydration::Placeholder,
-        ItemKind::Folder => Hydration::Full,
+        ItemKind::Folder | ItemKind::Package => Hydration::Full,
     };
     update_item(
         c,
@@ -1795,7 +2088,7 @@ fn ranges_of(c: &Connection, key: &ItemKey) -> Result<Vec<ByteRange>, StoreError
         .collect()
 }
 
-fn clear_ranges(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
+pub(crate) fn clear_ranges(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
     let removed = c
         .execute(
             "DELETE FROM hydrated_ranges WHERE drive_id = ?1 AND item_id = ?2",
@@ -1822,7 +2115,7 @@ fn child_count(c: &Connection, key: &ItemKey) -> Result<u64, StoreError> {
 ///
 /// Works both on a bare connection, where the savepoint is its own transaction and
 /// releasing it commits, and inside a caller's transaction, where it nests.
-fn atomic<T>(
+pub(crate) fn atomic<T>(
     c: &Connection,
     f: impl FnOnce(&Connection) -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
@@ -1889,7 +2182,7 @@ impl Drop for Savepoint<'_> {
     }
 }
 
-fn describe(action: &str, key: &ItemKey) -> String {
+pub(crate) fn describe(action: &str, key: &ItemKey) -> String {
     format!("{action} item {} in drive {}", key.item_id, key.drive_id)
 }
 
@@ -1898,7 +2191,12 @@ fn to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
-fn to_u64(value: i64, table: &str, column: &str, key: &ItemKey) -> Result<u64, StoreError> {
+pub(crate) fn to_u64(
+    value: i64,
+    table: &str,
+    column: &str,
+    key: &ItemKey,
+) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::Corrupt {
         what: format!("{} {column}", describe(&format!("{table} row of"), key)),
         value: value.to_string(),
@@ -1906,7 +2204,7 @@ fn to_u64(value: i64, table: &str, column: &str, key: &ItemKey) -> Result<u64, S
     })
 }
 
-fn item_exists(c: &Connection, key: &ItemKey) -> Result<bool, StoreError> {
+pub(crate) fn item_exists(c: &Connection, key: &ItemKey) -> Result<bool, StoreError> {
     c.query_row(
         "SELECT EXISTS (SELECT 1 FROM items WHERE drive_id = ?1 AND item_id = ?2)",
         [key.drive_id.as_str(), key.item_id.as_str()],
@@ -1937,7 +2235,7 @@ fn load_item(c: &Connection, key: &ItemKey, action: &'static str) -> Result<Item
 /// The size of a file, refusing missing items and folders.
 fn file_size(c: &Connection, key: &ItemKey, action: &'static str) -> Result<u64, StoreError> {
     let item = load_item(c, key, action)?;
-    if item.kind == ItemKind::Folder {
+    if !item.kind.has_content() {
         return Err(StoreError::NotAFile {
             action,
             key: key.clone(),
@@ -1979,7 +2277,22 @@ fn query_items<S: Into<String>>(
     raws.into_iter().map(RawItem::into_item).collect()
 }
 
-fn parse_id<T, E: std::fmt::Display>(
+/// As [`query_items`], with parameters of any SQL type.
+pub(crate) fn query_items_params<S: Into<String>>(
+    c: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+    action: impl Fn() -> S,
+) -> Result<Vec<Item>, StoreError> {
+    let mut stmt = c.prepare_cached(sql).ctx(&action)?;
+    let raws: Vec<RawItem> = stmt
+        .query_map(params, RawItem::from_row)
+        .and_then(Iterator::collect)
+        .ctx(&action)?;
+    raws.into_iter().map(RawItem::into_item).collect()
+}
+
+pub(crate) fn parse_id<T, E: std::fmt::Display>(
     what: &str,
     column: &str,
     value: String,
@@ -2006,7 +2319,7 @@ fn parse_state<T: std::str::FromStr<Err = mydrive_core::state::ParseStateError>>
     )
 }
 
-fn parse_hash(
+pub(crate) fn parse_hash(
     value: Option<String>,
     column: &str,
     key: &ItemKey,
@@ -2023,7 +2336,7 @@ fn parse_hash(
 }
 
 /// An `items` row as SQLite returns it, before validation.
-struct RawItem {
+pub(crate) struct RawItem {
     drive_id: String,
     item_id: String,
     parent_item_id: Option<String>,
@@ -2051,7 +2364,7 @@ struct RawItem {
 }
 
 impl RawItem {
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             drive_id: row.get(0)?,
             item_id: row.get(1)?,
@@ -2080,7 +2393,7 @@ impl RawItem {
         })
     }
 
-    fn into_item(self) -> Result<Item, StoreError> {
+    pub(crate) fn into_item(self) -> Result<Item, StoreError> {
         let what = format!("items row {} in drive {}", self.item_id, self.drive_id);
         let key = ItemKey::new(
             parse_id(&what, "drive_id", self.drive_id, DriveId::new)?,
@@ -2129,47 +2442,6 @@ impl RawItem {
     }
 }
 
-/// A `mounts` row as SQLite returns it, before validation.
-struct RawMount {
-    mount_id: String,
-    account_id: String,
-    drive_id: String,
-    root_item_id: String,
-    mount_point: String,
-    delta_token: Option<String>,
-    read_only: bool,
-    blocked_reason: Option<String>,
-}
-
-impl RawMount {
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            mount_id: row.get(0)?,
-            account_id: row.get(1)?,
-            drive_id: row.get(2)?,
-            root_item_id: row.get(3)?,
-            mount_point: row.get(4)?,
-            delta_token: row.get(5)?,
-            read_only: row.get(6)?,
-            blocked_reason: row.get(7)?,
-        })
-    }
-
-    fn into_mount(self) -> Result<Mount, StoreError> {
-        let what = format!("mounts row {}", self.mount_id);
-        Ok(Mount {
-            mount_id: parse_id(&what, "mount_id", self.mount_id.clone(), MountId::new)?,
-            account_id: parse_id(&what, "account_id", self.account_id, AccountId::new)?,
-            drive_id: parse_id(&what, "drive_id", self.drive_id, DriveId::new)?,
-            root_item_id: parse_id(&what, "root_item_id", self.root_item_id, ItemId::new)?,
-            mount_point: PathBuf::from(self.mount_point),
-            delta_token: self.delta_token,
-            read_only: self.read_only,
-            blocked_reason: self.blocked_reason,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -2212,6 +2484,38 @@ mod tests {
             1,
             "only the caller's own statement was committed"
         );
+    }
+
+    /// The query plan of `sql` with `params`, one line per step.
+    pub(crate) fn plan(c: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> String {
+        let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let lines: Vec<String> = stmt
+            .query_map(params, |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        lines.join("\n")
+    }
+
+    /// WP-017 AC3: both forms of the `children_after` statement are served by
+    /// `items_by_parent_name`, with no sort: each page reads only its own rows.
+    #[test]
+    fn ac3_children_after_uses_the_parent_name_index_without_sorting() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = crate::schema::open(&dir.path().join("state.db")).unwrap();
+        for (after, sql, params) in [
+            (false, children_sql(false), params!["d", "p", 10].to_vec()),
+            (
+                true,
+                children_sql(true),
+                params!["d", "p", 10, "name"].to_vec(),
+            ),
+        ] {
+            let plan = plan(&c, &sql, &params);
+            assert!(plan.contains("items_by_parent_name"), "{plan}");
+            assert_eq!(plan.contains("name>?"), after, "a range on name: {plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
     }
 
     /// Review N3: when rolling back to the savepoint itself fails while a transaction is
