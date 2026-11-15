@@ -7,11 +7,13 @@
 - **Gates:** —
 - **Owned paths:** root `Cargo.toml`, `Cargo.lock`, every crate's `Cargo.toml`;
   `crates/mydrive-engine/src/**`; `crates/mydrive-daemon/src/**`;
-  `crates/mydrive-core/src/lib.rs`; `crates/mydrive-graph/src/lib.rs`,
+  `crates/mydrive-core/src/lib.rs` and the new stub files `clock.rs` and `conflict.rs`;
+  `crates/mydrive-graph/src/lib.rs`,
   `crates/mydrive-graph/src/client/mod.rs`, `client/error.rs` (where `Operation` lives) and
   new files beside them;
   `crates/mydrive-graph-sim/src/**` and `crates/mydrive-graph-sim/README.md`,
-  `crates/mydrive-graph-sim/docs/**`; `crates/mydrive-ipc/src/lib.rs`
+  `crates/mydrive-graph-sim/docs/**`; `crates/mydrive-ipc/src/lib.rs` and the new stub
+  files `server.rs` and `client.rs`
 - **ADRs:** ADR-0003, ADR-0004, ADR-0018, ADR-0023
 - **Flows / journeys:** —
 
