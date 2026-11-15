@@ -442,7 +442,11 @@ mod tests {
             assert_eq!(logged, REDACTED, "{value}");
         }
         assert_eq!(
-            logged_header(Origin::Authority, "authorization", "Basic sim-rt-1-2.Secret"),
+            logged_header(
+                Origin::Authority,
+                "authorization",
+                "Basic sim-rt-1-2.Secret"
+            ),
             "Basic <redacted>"
         );
         assert_eq!(
