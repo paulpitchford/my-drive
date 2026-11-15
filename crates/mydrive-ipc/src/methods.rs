@@ -3072,6 +3072,23 @@ mod tests {
         assert_eq!(err.kind(), Some(ErrorCode::InvalidRequest));
     }
 
+    /// M1 plan decision D5: "download" in M1 is `item.hydrate`, which is part of version 1
+    /// and never behind the `item-import-export` capability. It is admitted and decoded on a
+    /// connection whose `hello` advertised no capability, so withdrawing import and export
+    /// never takes downloading away.
+    #[test]
+    fn d5_item_hydrate_is_admitted_without_the_import_export_capability() {
+        assert!(!method::IMPORT_EXPORT.contains(&method::ITEM_HYDRATE));
+        let without = ready_session(&[]);
+        let params = json!({"paths": ["/home/u/OneDrive/Documents/report.pdf"]});
+        let call = without.decode(method::ITEM_HYDRATE, Some(&params)).unwrap();
+        assert_eq!(
+            call,
+            MethodCall::ItemHydrate(paths(&["/home/u/OneDrive/Documents/report.pdf"]))
+        );
+        assert!(without.admit(&call).is_ok());
+    }
+
     /// With the capability withdrawn, `item.import` and `item.export` behave as if they did
     /// not exist: `method-not-found`, with the same message, whatever their parameters.
     #[test]
