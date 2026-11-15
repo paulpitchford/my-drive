@@ -60,7 +60,7 @@ use tokio::task::JoinHandle;
 
 pub use authority::{
     ACCESS_TOKEN_LIFETIME_SECS, CODE_LIFETIME_SECS, IdTokenIssue, OldRefreshToken,
-    REFRESH_TOKEN_LIFETIME_SECS,
+    REFRESH_TOKEN_LIFETIME_SECS, ReusedCode,
 };
 pub use axum::http::{Method, StatusCode};
 pub use discovery::{
@@ -135,13 +135,17 @@ impl GraphSim {
         let mut state = State::new(format!("k{}x", graph_addr.port()));
         state.tokens.insert(token.clone());
         let authority_base = format!("http://{authority_addr}");
-        let shared = Arc::new(Shared::new(
-            state,
-            Directory::new(graph_addr.port().to_string(), authority_base.clone()),
-            format!("http://{graph_addr}/v1.0"),
-            format!("http://{download_addr}"),
-            authority_base,
-        ));
+        let shared = Arc::new(
+            Shared::new(
+                state,
+                format!("http://{graph_addr}/v1.0"),
+                format!("http://{download_addr}"),
+            )
+            .with_authority(
+                Directory::new(graph_addr.port().to_string(), authority_base.clone()),
+                authority_base,
+            ),
+        );
         let graph = axum::serve(
             TapListener(graph_listener),
             server::graph_router(shared.clone()).into_make_service_with_connect_info::<ConnTap>(),

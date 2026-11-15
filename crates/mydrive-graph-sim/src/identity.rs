@@ -18,8 +18,8 @@ use axum::routing::get;
 use mydrive_core::ids::DriveId;
 use serde_json::{Value, json};
 
-use crate::authority::{AuthorityState, IdTokenIssue, OldRefreshToken};
-use crate::discovery::{DiscoveryState, ShareWithoutPrefer};
+use crate::authority::{AuthorityState, IdTokenIssue, OldRefreshToken, ReusedCode};
+use crate::discovery::{DiscoveryState, LibraryAccess, ShareWithoutPrefer};
 use crate::json::drive_json;
 use crate::model::DriveType;
 use crate::server::{Shared, graph_error, ok_json};
@@ -126,6 +126,9 @@ pub struct IdentityOptions {
     /// What resolving a sharing link without a `Prefer` header does for an account
     /// without access. Unverified; default [`ShareWithoutPrefer::Refused`].
     pub share_without_prefer: ShareWithoutPrefer,
+    /// What redeeming a code a second time does. Unverified for the identity platform;
+    /// default [`ReusedCode::RevokeIssuedTokens`], RFC 6749's SHOULD and the harder case.
+    pub reused_code: ReusedCode,
 }
 
 impl Default for IdentityOptions {
@@ -135,6 +138,7 @@ impl Default for IdentityOptions {
             id_token: IdTokenIssue::WithOpenidScope,
             personal_organization: PersonalOrganization::Forbidden,
             share_without_prefer: ShareWithoutPrefer::Refused,
+            reused_code: ReusedCode::RevokeIssuedTokens,
         }
     }
 }
@@ -176,7 +180,8 @@ pub(crate) struct TenantRecord {
 
 /// The registry of tenants and accounts, and the state of the authority and discovery.
 /// Held by `Shared` behind its own lock.
-#[derive(Debug)]
+///
+/// Its `Debug` never prints a token: bound tokens are shown as a count.
 pub(crate) struct Directory {
     pub(crate) options: IdentityOptions,
     /// Distinguishes this simulator's tokens, codes and IDs from another's.
@@ -195,6 +200,20 @@ pub(crate) struct Directory {
     token_accounts: HashMap<String, String>,
     pub(crate) authority: AuthorityState,
     pub(crate) discovery: DiscoveryState,
+}
+
+impl fmt::Debug for Directory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Directory")
+            .field("options", &self.options)
+            .field("instance", &self.instance)
+            .field("tenants", &self.tenants)
+            .field("accounts", &self.accounts)
+            .field("bound_tokens", &self.token_accounts.len())
+            .field("authority", &self.authority)
+            .field("discovery", &self.discovery)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Directory {
@@ -343,6 +362,12 @@ async fn get_my_drive(AxState(shared): AxState<Arc<Shared>>, headers: HeaderMap)
     let Some(account) = caller(&shared, &headers) else {
         return unbound();
     };
+    // The account's own drive follows the library policy as `/drives/{id}` does.
+    if let Some(LibraryAccess::Blocked { code }) =
+        shared.directory().discovery.access_of(&account.drive)
+    {
+        return crate::discovery::blocked(&code);
+    }
     // The directory lock is released; now the drives' lock.
     let state = shared.lock();
     match state.drives.get(&account.drive) {

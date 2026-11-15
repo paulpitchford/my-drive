@@ -5,7 +5,8 @@
 //! `login.microsoftonline.com`, behind the request log and the fault layer. Its state lives
 //! in the identity registry (`identity::Directory`). Documented in `docs/identity.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use axum::extract::{Form, Path, Query, State as AxState};
@@ -57,6 +58,18 @@ pub enum IdTokenIssue {
     Always,
 }
 
+/// What redeeming an authorisation code a second time does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReusedCode {
+    /// The request is refused and every token issued from the code's first redemption
+    /// (and refreshes of it) is revoked, as RFC 6749 section 4.1.2 says a server SHOULD.
+    /// Whether the identity platform does this is unverified; the default, the harder
+    /// case.
+    RevokeIssuedTokens,
+    /// The request is refused; tokens already issued keep working.
+    RefuseOnly,
+}
+
 /// An authorisation code waiting to be redeemed.
 #[derive(Debug, Clone)]
 struct CodeRecord {
@@ -83,22 +96,43 @@ enum RefreshStatus {
 #[derive(Debug, Clone)]
 struct RefreshRecord {
     client_id: String,
-    scopes: Vec<String>,
+    /// The scopes granted at the authorise step that started the chain. A refresh may ask
+    /// for these or fewer, never more.
+    granted: Vec<String>,
     object_id: String,
     issued_at: i64,
     status: RefreshStatus,
+    /// The authorisation code the chain started from.
+    chain: String,
 }
 
-/// The authority's part of the identity registry.
-#[derive(Debug, Default)]
+/// The authority's part of the identity registry. Its `Debug` shows counts only, never a
+/// code or token.
+#[derive(Default)]
 pub(crate) struct AuthorityState {
     /// The account the next authorise request signs in as.
     signing_in: Option<String>,
     /// An error the next authorise request redirects with instead of a code.
     deny_next: Option<(String, String)>,
     codes: HashMap<String, CodeRecord>,
+    /// Codes already presented once, whatever the outcome.
+    used_codes: HashSet<String>,
     refresh_tokens: HashMap<String, RefreshRecord>,
+    /// Access tokens issued in each chain, keyed by the code it started from.
+    chain_access: HashMap<String, Vec<String>>,
     next_secret: u64,
+}
+
+impl fmt::Debug for AuthorityState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthorityState")
+            .field("signing_in", &self.signing_in)
+            .field("pending_codes", &self.codes.len())
+            .field("used_codes", &self.used_codes.len())
+            .field("refresh_tokens", &self.refresh_tokens.len())
+            .field("chains", &self.chain_access.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Makes a secret in the shape the request log knows how to mask:
@@ -285,8 +319,24 @@ fn redirect_owned(redirect_uri: &str, params: &[(&'static str, String)]) -> Resp
 /// What a token request ended in, before the access token is registered with the Graph
 /// origin.
 enum Grant {
-    Issued { body: Value, access_token: String },
-    Refused(Response),
+    Issued {
+        body: Value,
+        access_token: String,
+    },
+    /// Refused; `revoke` lists access tokens the Graph origin must stop accepting.
+    Refused {
+        response: Response,
+        revoke: Vec<String>,
+    },
+}
+
+impl Grant {
+    fn refused(response: Response) -> Self {
+        Self::Refused {
+            response,
+            revoke: Vec::new(),
+        }
+    }
 }
 
 async fn token(
@@ -300,7 +350,7 @@ async fn token(
         match form.get("grant_type").map(String::as_str) {
             Some("authorization_code") => redeem_code(&mut directory, &form, now),
             Some("refresh_token") => redeem_refresh(&mut directory, &form, now),
-            _ => Grant::Refused(oauth_error(
+            _ => Grant::refused(oauth_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_grant_type",
                 70003,
@@ -316,12 +366,20 @@ async fn token(
             shared.lock().tokens.insert(access_token);
             (StatusCode::OK, Json(body)).into_response()
         }
-        Grant::Refused(response) => response,
+        Grant::Refused { response, revoke } => {
+            if !revoke.is_empty() {
+                let mut state = shared.lock();
+                for token in &revoke {
+                    state.tokens.remove(token);
+                }
+            }
+            response
+        }
     }
 }
 
 fn invalid_grant(code: u32, description: &str, now: i64) -> Grant {
-    Grant::Refused(oauth_error(
+    Grant::refused(oauth_error(
         StatusCode::BAD_REQUEST,
         "invalid_grant",
         code,
@@ -332,7 +390,7 @@ fn invalid_grant(code: u32, description: &str, now: i64) -> Grant {
 
 fn redeem_code(directory: &mut Directory, form: &HashMap<String, String>, now: i64) -> Grant {
     let Some(code) = form.get("code") else {
-        return Grant::Refused(oauth_error(
+        return Grant::refused(oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             900_144,
@@ -342,12 +400,16 @@ fn redeem_code(directory: &mut Directory, form: &HashMap<String, String>, now: i
     };
     // A code is redeemable once: any attempt uses it up, whatever the outcome.
     let Some(record) = directory.authority.codes.remove(code) else {
+        if directory.authority.used_codes.contains(code) {
+            return reused_code(directory, code, now);
+        }
         return invalid_grant(
             70000,
             "The provided authorization code is not valid: unknown or already redeemed.",
             now,
         );
     };
+    directory.authority.used_codes.insert(code.clone());
     if now - record.issued_at > CODE_LIFETIME_SECS {
         return invalid_grant(70008, "The provided authorization code has expired.", now);
     }
@@ -384,16 +446,46 @@ fn redeem_code(directory: &mut Directory, form: &HashMap<String, String>, now: i
     }
     issue(
         directory,
-        &record.object_id,
-        &record.client_id,
-        record.scopes,
+        Issue {
+            object_id: &record.object_id,
+            client_id: &record.client_id,
+            requested: record.scopes.clone(),
+            granted: record.scopes,
+            chain: code,
+        },
         now,
     )
 }
 
+/// A code presented again: refused, and under [`ReusedCode::RevokeIssuedTokens`] every
+/// token of the chain it started is revoked.
+fn reused_code(directory: &mut Directory, code: &str, now: i64) -> Grant {
+    let response = oauth_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        54005,
+        "OAuth2 Authorization code was already redeemed.",
+        now,
+    );
+    if directory.options.reused_code == ReusedCode::RefuseOnly {
+        return Grant::refused(response);
+    }
+    for record in directory.authority.refresh_tokens.values_mut() {
+        if record.chain == code {
+            record.status = RefreshStatus::Revoked;
+        }
+    }
+    let revoke = directory
+        .authority
+        .chain_access
+        .remove(code)
+        .unwrap_or_default();
+    Grant::Refused { response, revoke }
+}
+
 fn redeem_refresh(directory: &mut Directory, form: &HashMap<String, String>, now: i64) -> Grant {
     let Some(refresh) = form.get("refresh_token") else {
-        return Grant::Refused(oauth_error(
+        return Grant::refused(oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             900_144,
@@ -437,34 +529,72 @@ fn redeem_refresh(directory: &mut Directory, form: &HashMap<String, String>, now
             now,
         );
     }
+    let requested = match form.get("scope") {
+        Some(_) => split_scopes(form.get("scope")),
+        None => record.granted.clone(),
+    };
+    // A refresh cannot widen the grant: a scope not granted at the authorise step needs a
+    // new authorise step (incremental consent, ADR-0010 R5). Nothing is issued or rolled.
+    if let Some(extra) = requested.iter().find(|s| !has_scope(&record.granted, s)) {
+        return invalid_grant(
+            65001,
+            &format!(
+                "The user or administrator has not consented to use the application \
+                 with scope '{extra}'. Send an interactive authorization request."
+            ),
+            now,
+        );
+    }
     if let Some(entry) = directory.authority.refresh_tokens.get_mut(refresh)
         && entry.status == RefreshStatus::Live
     {
         entry.status = RefreshStatus::Rolled;
     }
-    let scopes = match form.get("scope") {
-        Some(_) => split_scopes(form.get("scope")),
-        None => record.scopes,
-    };
-    issue(directory, &record.object_id, &record.client_id, scopes, now)
+    issue(
+        directory,
+        Issue {
+            object_id: &record.object_id,
+            client_id: &record.client_id,
+            requested,
+            granted: record.granted,
+            chain: &record.chain,
+        },
+        now,
+    )
+}
+
+/// What to issue: for whom, the scopes asked for now, and the chain's grant.
+struct Issue<'a> {
+    object_id: &'a str,
+    client_id: &'a str,
+    requested: Vec<String>,
+    granted: Vec<String>,
+    chain: &'a str,
 }
 
 /// Issues an access token, a refresh token when `offline_access` was granted, and an ID
 /// token as the switch says.
-fn issue(
-    directory: &mut Directory,
-    object_id: &str,
-    client_id: &str,
-    scopes: Vec<String>,
-    now: i64,
-) -> Grant {
+fn issue(directory: &mut Directory, request: Issue<'_>, now: i64) -> Grant {
+    let Issue {
+        object_id,
+        client_id,
+        requested: scopes,
+        granted,
+        chain,
+    } = request;
     let Some(account) = directory.account(object_id).cloned() else {
         return invalid_grant(50034, "The user account does not exist.", now);
     };
     let access_token = mint(directory, "sim-at-");
     directory.bind_token(access_token.clone(), object_id.to_owned());
+    directory
+        .authority
+        .chain_access
+        .entry(chain.to_owned())
+        .or_default()
+        .push(access_token.clone());
     // `offline_access` and the OpenID scopes are not listed in the granted `scope`.
-    let granted: Vec<&str> = scopes
+    let listed: Vec<&str> = scopes
         .iter()
         .map(String::as_str)
         .filter(|s| {
@@ -475,7 +605,7 @@ fn issue(
         .collect();
     let mut body = json!({
         "token_type": "Bearer",
-        "scope": granted.join(" "),
+        "scope": listed.join(" "),
         "expires_in": ACCESS_TOKEN_LIFETIME_SECS,
         "ext_expires_in": ACCESS_TOKEN_LIFETIME_SECS,
         "access_token": access_token,
@@ -486,10 +616,11 @@ fn issue(
             refresh.clone(),
             RefreshRecord {
                 client_id: client_id.to_owned(),
-                scopes: scopes.clone(),
+                granted,
                 object_id: object_id.to_owned(),
                 issued_at: now,
                 status: RefreshStatus::Live,
+                chain: chain.to_owned(),
             },
         );
         body["refresh_token"] = json!(refresh);

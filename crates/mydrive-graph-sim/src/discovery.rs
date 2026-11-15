@@ -132,6 +132,24 @@ pub(crate) struct DiscoveryState {
     next_link: u64,
 }
 
+impl DiscoveryState {
+    /// What a drive allows, if it is not [`LibraryAccess::Normal`].
+    pub(crate) fn access_of(&self, drive: &DriveId) -> Option<LibraryAccess> {
+        self.access.get(drive).cloned()
+    }
+
+    /// The code of a block on any library of `site`, if one is blocked.
+    fn site_block(&self, site: &SiteId) -> Option<String> {
+        self.libraries
+            .iter()
+            .filter(|(_, s)| *s == site)
+            .find_map(|(drive, _)| match self.access.get(drive) {
+                Some(LibraryAccess::Blocked { code }) => Some(code.clone()),
+                _ => None,
+            })
+    }
+}
+
 /// The discovery routes of the Graph origin.
 pub(crate) fn routes() -> Router<Arc<Shared>> {
     Router::new()
@@ -191,7 +209,7 @@ fn access_denied() -> Response {
     )
 }
 
-fn blocked(code: &str) -> Response {
+pub(crate) fn blocked(code: &str) -> Response {
     graph_error(StatusCode::FORBIDDEN, code, BLOCKED_MESSAGE)
 }
 
@@ -322,12 +340,27 @@ async fn resolve_share(
     ok_json(value)
 }
 
-async fn get_site(AxState(shared): AxState<Arc<Shared>>, Path(site): Path<String>) -> Response {
+async fn get_site(
+    AxState(shared): AxState<Arc<Shared>>,
+    Path(site): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let directory = shared.directory();
     let id = SiteId(site);
     let Some(record) = directory.discovery.sites.get(&id) else {
         return not_found();
     };
+    // An account outside the site's tenant (a personal one included) cannot read it.
+    // Unverified: the status for another tenant's site.
+    let account = bearer(&headers).and_then(|t| directory.account_for_token(t));
+    if account.is_some_and(|a| a.tenant.as_ref() != Some(&record.tenant)) {
+        return access_denied();
+    }
+    // A blocked library models a per-site policy (unmanaged-device controls can be per
+    // site), so its site answers as the library does. Unverified (gate G2).
+    if let Some(code) = directory.discovery.site_block(&id) {
+        return blocked(&code);
+    }
     ok_json(json!({
         "id": id.as_str(),
         "name": record.name,

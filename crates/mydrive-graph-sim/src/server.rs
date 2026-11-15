@@ -29,7 +29,9 @@ use crate::{
 };
 
 /// State shared by the handlers and the control API.
-#[derive(Debug)]
+///
+/// Its `Debug` never prints a bearer token, code or refresh token: the drives' state (which
+/// holds the accepted tokens) is not shown, and the directory redacts its own.
 pub(crate) struct Shared {
     state: Mutex<State>,
     /// Accounts, tenants, the authority's codes and tokens, sites, libraries and links.
@@ -43,21 +45,44 @@ pub(crate) struct Shared {
     pub(crate) authority_base: String,
 }
 
+/// The authority origin of a `Shared` built without one, as unit tests do. Nothing
+/// listens there.
+pub(crate) const NO_AUTHORITY: &str = "http://authority.invalid";
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("graph_base", &self.graph_base)
+            .field("download_base", &self.download_base)
+            .field("authority_base", &self.authority_base)
+            .field("directory", &*self.directory())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Shared {
-    pub(crate) fn new(
-        state: State,
-        directory: Directory,
-        graph_base: String,
-        download_base: String,
-        authority_base: String,
-    ) -> Self {
+    /// Shared state with an empty identity registry and no authority origin
+    /// ([`NO_AUTHORITY`]), as before WP-023; unit tests use this form.
+    /// `GraphSim::start` then adds its registry with [`Shared::with_authority`].
+    pub(crate) fn new(state: State, graph_base: String, download_base: String) -> Self {
         Self {
             state: Mutex::new(state),
-            directory: Mutex::new(directory),
+            directory: Mutex::new(Directory::new(
+                "unwired".to_owned(),
+                NO_AUTHORITY.to_owned(),
+            )),
             graph_base,
             download_base,
-            authority_base,
+            authority_base: NO_AUTHORITY.to_owned(),
         }
+    }
+
+    /// Replaces the identity registry and sets the authority origin.
+    #[must_use]
+    pub(crate) fn with_authority(mut self, directory: Directory, authority_base: String) -> Self {
+        self.directory = Mutex::new(directory);
+        self.authority_base = authority_base;
+        self
     }
 
     /// Locks the state. A panic while it was held (only possible in a test's own code
@@ -164,6 +189,25 @@ pub(crate) fn item_id(raw: &str) -> Option<ItemId> {
 
 #[cfg(test)]
 mod tests {
+    use super::{NO_AUTHORITY, Shared};
+    use crate::model::State;
+
+    /// The three-argument constructor other packages' unit tests use keeps working, with
+    /// an empty registry and no authority.
+    #[test]
+    fn three_argument_constructor_still_works() {
+        let shared = Shared::new(
+            State::new("k".to_owned()),
+            "http://127.0.0.1:1/v1.0".to_owned(),
+            "http://127.0.0.1:2".to_owned(),
+        );
+        assert_eq!(shared.graph_base, "http://127.0.0.1:1/v1.0");
+        assert_eq!(shared.download_base, "http://127.0.0.1:2");
+        assert_eq!(shared.authority_base, NO_AUTHORITY);
+        assert!(shared.directory().tenants.is_empty());
+        assert!(shared.lock().drives.is_empty());
+    }
+
     // The functions these tests cover moved to their feature files (WP-014); the tests
     // stay here so their names do not change.
     use crate::content::{RangeRequest, parse_range};

@@ -42,6 +42,7 @@ Per simulator, in `IdentityOptions` (`set_identity_options`); sources in
 | `id_token` | `WithOpenidScope` | Documented: the token endpoint returns an `id_token` only when `openid` was requested. `Always` returns one on every success. |
 | `personal_organization` | `Forbidden` | What `/organization` answers for a personal account is unverified; `403` is harder (it looks like a policy block). `Empty` answers an empty list. |
 | `share_without_prefer` | `Refused` | What `/shares` does with no `Prefer` header for a caller without access is unverified; refusing is harder. `Peek` answers as `redeemSharingLinkIfNecessary` does. |
+| `reused_code` | `RevokeIssuedTokens` | RFC 6749 section 4.1.2: a server SHOULD revoke the tokens issued from a code that is presented again. Whether the identity platform does is unverified; revoking is harder. `RefuseOnly` only refuses the request. |
 
 Per drive, in `DriveOptions` (`add_drive_with`, `set_options`).
 
@@ -99,7 +100,6 @@ Planned for M1 simulator work packages (WP-007 out of scope):
 - `subscriptions/socketIo` change notifications.
 - A dropped connection before any response (ADR-0017 lists it; WP-007 does not). A
   truncated body is available.
-- Read-only and policy-blocked libraries (gate G2).
 
 Known Graph behaviours not simulated, and not yet assigned:
 
@@ -112,7 +112,7 @@ Known Graph behaviours not simulated, and not yet assigned:
 - `Prefer: hierarchicalsharing`, `deltashowremovedasdeleted`,
   `deltatraversepermissiongaps`, `deltashowsharingchanges`.
 - `If-None-Match` and `304 Not Modified` on get-item, list-children and content.
-- `/me/drive`, `/users/...`, `/groups/...`, `/sites/...` routes and path-based addressing
+- `/users/...`, `/groups/...`, `/sites/...` routes and path-based addressing
   (`root:/path:`); `includeDeletedItems`.
 - `@odata.context`, `createdBy`, `lastModifiedBy`, `webUrl`, `webDavUrl`, `description`,
   MIME types other than `application/octet-stream`, image/photo/video facets, `package`

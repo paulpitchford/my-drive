@@ -514,7 +514,12 @@ mod self_tests {
             id_token,
             personal_organization,
             share_without_prefer,
+            reused_code,
         } = mydrive_graph_sim::IdentityOptions::default();
+        assert_eq!(
+            reused_code,
+            mydrive_graph_sim::ReusedCode::RevokeIssuedTokens
+        );
         assert_eq!(
             old_refresh_token,
             mydrive_graph_sim::OldRefreshToken::Refused
@@ -540,6 +545,7 @@ mod self_tests {
                 "share_without_prefer",
                 format!("`{share_without_prefer:?}`"),
             ),
+            ("reused_code", format!("`{reused_code:?}`")),
             ("download", format!("`{download:?}`")),
             ("range", format!("`{range:?}`")),
             ("delta_page_size", format!("`{delta_page_size}`")),

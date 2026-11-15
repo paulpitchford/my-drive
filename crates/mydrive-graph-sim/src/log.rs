@@ -174,6 +174,43 @@ fn logged_header(origin: Origin, name: &str, value: &str) -> String {
     mask_issued(value).into_owned()
 }
 
+/// Whether a raw (still percent-encoded) query parameter name is one whose value the
+/// authority's log masks: compared after decoding `%XX` and `+`, without regard to case.
+fn is_masked_param(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => match raw
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                Some(byte) => {
+                    decoded.push(byte);
+                    i += 3;
+                }
+                None => {
+                    decoded.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                decoded.push(b' ');
+                i += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                i += 1;
+            }
+        }
+    }
+    let name = String::from_utf8_lossy(&decoded);
+    MASKED_AUTHORITY_PARAMS
+        .iter()
+        .any(|masked| name.eq_ignore_ascii_case(masked))
+}
+
 /// A query string as the log records it.
 fn logged_query(origin: Origin, query: &str) -> String {
     let masked = mask_issued(query);
@@ -183,9 +220,7 @@ fn logged_query(origin: Origin, query: &str) -> String {
     masked
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((name, _)) if MASKED_AUTHORITY_PARAMS.contains(&name) => {
-                format!("{name}={REDACTED}")
-            }
+            Some((name, _)) if is_masked_param(name) => format!("{name}={REDACTED}"),
             _ => pair.to_owned(),
         })
         .collect::<Vec<_>>()
@@ -272,6 +307,15 @@ mod tests {
         assert_eq!(
             logged_query(Origin::Authority, "code=abc&state=s&code_verifier=v"),
             "code=<redacted>&state=s&code_verifier=<redacted>"
+        );
+        assert_eq!(
+            logged_query(
+                Origin::Authority,
+                "CODE=a&Code_Verifier=b&%63ode=c&refresh%5Ftoken=d&access%5ftoken=e&state=s&%zz=f"
+            ),
+            "CODE=<redacted>&Code_Verifier=<redacted>&%63ode=<redacted>&refresh%5Ftoken=<redacted>\
+             &access%5ftoken=<redacted>&state=s&%zz=f",
+            "names match without regard to case and after percent-decoding"
         );
         assert_eq!(
             logged_query(Origin::Graph, "code=abc"),

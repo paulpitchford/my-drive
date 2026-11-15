@@ -723,4 +723,179 @@ mod identity_tests {
         let readme = include_str!("../README.md");
         assert!(readme.contains("[`docs/identity.md`](docs/identity.md) | `src/identity.rs`"));
     }
+
+    async fn refresh_with(
+        sim: &GraphSim,
+        token: &str,
+        client: &str,
+        scope: &str,
+    ) -> (StatusCode, Value) {
+        post_token(
+            sim,
+            &[
+                ("client_id", client),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", token),
+                ("scope", scope),
+            ],
+        )
+        .await
+    }
+
+    /// ADR-0010 R5 (the authority's side): a refresh cannot widen the grant. Asking for
+    /// `Sites.Read.All` on a refresh is refused and issues nothing, and the refresh token
+    /// stays usable; a subset of the granted scopes works.
+    #[tokio::test]
+    async fn refresh_cannot_widen_scope() {
+        let (sim, _) = work_sim().await;
+        let (_, body) = redeem(&sim, &code(&sim).await, VERIFIER).await;
+        let rt = body["refresh_token"].as_str().unwrap().to_owned();
+        let before = sim.requests().len();
+
+        let wider = format!("{SCOPES} Sites.Read.All");
+        let (status, refused) = refresh_with(&sim, &rt, CLIENT_ID, &wider).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["error"], "invalid_grant");
+        assert!(
+            refused["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("Sites.Read.All")
+        );
+        assert!(refused.get("access_token").is_none() && refused.get("refresh_token").is_none());
+        assert_eq!(sim.requests().len(), before + 1);
+
+        // Nothing was rolled: the same token still refreshes, for a subset.
+        let (status, ok) = refresh_with(&sim, &rt, CLIENT_ID, "offline_access User.Read").await;
+        assert_eq!(status, StatusCode::OK, "{ok}");
+        assert_eq!(ok["scope"], "User.Read");
+        // The chain keeps the original grant: the full set is still allowed afterwards.
+        let next = ok["refresh_token"].as_str().unwrap();
+        let (status, _) = refresh_with(&sim, next, CLIENT_ID, SCOPES).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A refresh without `offline_access` issues no refresh token and rolls the old one
+    /// (unverified; the harder case, documented).
+    #[tokio::test]
+    async fn refresh_without_offline_access_rolls_and_issues_none() {
+        let (sim, _) = work_sim().await;
+        let (_, body) = redeem(&sim, &code(&sim).await, VERIFIER).await;
+        let rt = body["refresh_token"].as_str().unwrap().to_owned();
+        let (status, ok) = refresh_with(&sim, &rt, CLIENT_ID, "User.Read").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ok.get("refresh_token").is_none());
+        let (status, _) = refresh_with(&sim, &rt, CLIENT_ID, "User.Read").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Refresh with another client's ID, and an unknown grant type, are refused.
+    #[tokio::test]
+    async fn refresh_wrong_client_and_unsupported_grant() {
+        let (sim, _) = work_sim().await;
+        let (_, body) = redeem(&sim, &code(&sim).await, VERIFIER).await;
+        let rt = body["refresh_token"].as_str().unwrap().to_owned();
+        let (status, refused) =
+            refresh_with(&sim, &rt, "99999999-0000-0000-0000-000000000000", SCOPES).await;
+        assert_eq!(
+            (status, refused["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        let (status, _) = refresh_with(&sim, &rt, CLIENT_ID, SCOPES).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a refused client did not use the token up"
+        );
+
+        let (status, refused) = post_token(
+            &sim,
+            &[("client_id", CLIENT_ID), ("grant_type", "password")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(refused["error"], "unsupported_grant_type");
+    }
+
+    /// `plain` PKCE: the verifier must equal the challenge.
+    #[tokio::test]
+    async fn plain_pkce_compares_verifier_and_challenge() {
+        let (sim, _) = work_sim().await;
+        let plain = "plain-verifier-0123456789-0123456789-0123456";
+        let extra = [
+            ("code_challenge", plain),
+            ("code_challenge_method", "plain"),
+        ];
+        let (_, location) = authorize(&sim, &extra).await;
+        let (status, _) = redeem(&sim, &param(&location, "code").unwrap(), VERIFIER).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (_, location) = authorize(&sim, &extra).await;
+        let (status, _) = redeem(&sim, &param(&location, "code").unwrap(), plain).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// RFC 6749 4.1.2: a code presented a second time is refused and, by default, every
+    /// token issued from its first redemption (and refreshes of it) is revoked. Under
+    /// `RefuseOnly` they keep working.
+    #[tokio::test]
+    async fn reused_code_revokes_what_it_issued() {
+        let (sim, _) = work_sim().await;
+        let c = code(&sim).await;
+        let (_, first) = redeem(&sim, &c, VERIFIER).await;
+        let access = first["access_token"].as_str().unwrap().to_owned();
+        let rt = first["refresh_token"].as_str().unwrap().to_owned();
+        let (_, rolled) = refresh(&sim, &rt).await;
+        let rolled_access = rolled["access_token"].as_str().unwrap().to_owned();
+        let rolled_rt = rolled["refresh_token"].as_str().unwrap().to_owned();
+        // Another sign-in, untouched by the reuse.
+        let (_, other) = redeem(&sim, &code(&sim).await, VERIFIER).await;
+        let other_access = other["access_token"].as_str().unwrap().to_owned();
+        assert_eq!(graph_get(&sim, "/me", &access).await.0, StatusCode::OK);
+
+        let (status, body) = redeem(&sim, &c, VERIFIER).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+        assert_eq!(
+            graph_get(&sim, "/me", &access).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            graph_get(&sim, "/me", &rolled_access).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(refresh(&sim, &rolled_rt).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            graph_get(&sim, "/me", &other_access).await.0,
+            StatusCode::OK
+        );
+
+        sim.set_identity_options(IdentityOptions {
+            reused_code: mydrive_graph_sim::ReusedCode::RefuseOnly,
+            ..IdentityOptions::default()
+        });
+        let c = code(&sim).await;
+        let (_, first) = redeem(&sim, &c, VERIFIER).await;
+        let access = first["access_token"].as_str().unwrap().to_owned();
+        assert_eq!(redeem(&sim, &c, VERIFIER).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(graph_get(&sim, "/me", &access).await.0, StatusCode::OK);
+    }
+
+    /// `Debug` of the simulator never prints an issued code, access token or refresh token.
+    #[tokio::test]
+    async fn debug_output_redacts_issued_secrets() {
+        let (sim, _) = work_sim().await;
+        let pending = code(&sim).await;
+        let (_, body) = redeem(&sim, &code(&sim).await, VERIFIER).await;
+        let printed = format!("{sim:?} {sim:#?}");
+        for secret in [
+            pending.as_str(),
+            body["access_token"].as_str().unwrap(),
+            body["refresh_token"].as_str().unwrap(),
+        ] {
+            assert!(!printed.contains(secret), "{secret} in {printed}");
+        }
+        assert!(printed.contains("GraphSim"));
+    }
 }

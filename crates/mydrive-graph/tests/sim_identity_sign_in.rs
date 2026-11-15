@@ -16,7 +16,7 @@ mod sim_identity_sign_in {
     };
     use mydrive_graph::client::UserAgent;
     use mydrive_graph::model::DriveType;
-    use mydrive_graph_sim::{Account, GraphSim, StatusCode};
+    use mydrive_graph_sim::{Account, GraphSim, Origin, StatusCode};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
     use url::Url;
@@ -43,6 +43,31 @@ mod sim_identity_sign_in {
         assert_eq!(response.status(), StatusCode::FOUND);
         let location = response.headers()["location"].to_str().unwrap();
         Url::parse(location).unwrap()
+    }
+
+    /// ADR-0010 R1: the authority's request log shows that the authorise request the
+    /// client built carried an `S256` challenge (the log keeps the challenge; it is not a
+    /// secret). A client that drops S256 fails here.
+    fn assert_s256_challenge_sent(sim: &GraphSim) {
+        let authorise: Vec<_> = sim
+            .requests()
+            .into_iter()
+            .filter(|r| r.origin == Origin::Authority && r.path.ends_with("/oauth2/v2.0/authorize"))
+            .collect();
+        assert!(!authorise.is_empty(), "no authorise request logged");
+        for request in authorise {
+            let query = request.query.unwrap_or_default();
+            let pairs: Vec<(&str, &str)> = query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .collect();
+            let value = |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| *v);
+            assert_eq!(value("code_challenge_method"), Some("S256"), "{query}");
+            let challenge = value("code_challenge").unwrap_or_default();
+            // base64url of a SHA-256 digest is 43 characters.
+            assert_eq!(challenge.len(), 43, "{query}");
+            assert!(value("code_verifier").is_none(), "{query}");
+        }
     }
 
     /// Delivers a redirect to the loopback listener, as the browser does.
@@ -101,6 +126,7 @@ mod sim_identity_sign_in {
         let port = sign_in.local_addr().port();
         let redirect = browser_authorize(sign_in.authorization_url()).await;
         assert_eq!(redirect.port(), Some(port));
+        assert_s256_challenge_sent(&sim);
         let (tokens, page) = tokio::join!(
             sign_in.complete(&client, Duration::from_secs(30)),
             browser_deliver(port, &redirect)
@@ -148,6 +174,7 @@ mod sim_identity_sign_in {
             PasteSignIn::start(&config, PASTE_REDIRECT, Scopes::initial_sign_in()).unwrap();
         let redirect = browser_authorize(sign_in.authorization_url().unwrap()).await;
         assert!(redirect.as_str().starts_with(PASTE_REDIRECT), "{redirect}");
+        assert_s256_challenge_sent(&sim);
 
         let tokens = sign_in.complete(redirect.as_str(), &client).await.unwrap();
         assert!(!sign_in.is_pending());

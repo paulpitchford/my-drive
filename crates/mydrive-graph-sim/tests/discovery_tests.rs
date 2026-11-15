@@ -391,4 +391,101 @@ mod discovery_tests {
         let (status, _) = get(&s.sim, "/drives/b!no-such-drive", s.token).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+
+    /// `Prefer` with several comma-separated preferences, in mixed case: a durable redeem
+    /// anywhere in the list wins; `IfNecessary` alone stays a peek.
+    #[tokio::test]
+    async fn prefer_lists_and_case() {
+        let s = setup().await;
+        let root = s.sim.root_id(&s.finance).unwrap();
+        let link = s.sim.add_sharing_link(&s.finance, &root).unwrap();
+        let (status, _) = send(
+            &s.sim,
+            Method::GET,
+            &share_path(&link),
+            s.token,
+            Some("odata.maxpagesize=10, REDEEMSHARINGLINKIFNECESSARY"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!s.sim.can_reach(&s.priya, &s.finance));
+        let (status, _) = send(
+            &s.sim,
+            Method::GET,
+            &share_path(&link),
+            s.token,
+            Some("redeemSharingLinkIfNecessary,  RedeemSharingLink"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(s.sim.can_reach(&s.priya, &s.finance));
+    }
+
+    /// `/me/drive` follows a block on the account's own drive.
+    #[tokio::test]
+    async fn my_drive_follows_a_block() {
+        let s = setup().await;
+        let (status, _) = get(&s.sim, "/me/drive", s.token).await;
+        assert_eq!(status, StatusCode::OK);
+        s.sim
+            .set_library_access(
+                &s.priya.drive,
+                LibraryAccess::Blocked {
+                    code: "simulatedPolicyBlock".to_owned(),
+                },
+            )
+            .unwrap();
+        let (status, body) = get(&s.sim, "/me/drive", s.token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "simulatedPolicyBlock");
+        // Read-only does not affect a read.
+        s.sim
+            .set_library_access(&s.priya.drive, LibraryAccess::read_only())
+            .unwrap();
+        assert_eq!(get(&s.sim, "/me/drive", s.token).await.0, StatusCode::OK);
+    }
+
+    /// `/sites/{id}` refuses an account outside the site's tenant (a personal one too),
+    /// and answers with the block code when a library of the site is blocked
+    /// (unverified). Unbound tokens and same-tenant accounts read it.
+    #[tokio::test]
+    async fn sites_follow_tenant_and_block() {
+        let s = setup().await;
+        let site = s.sim.site_of_library(&s.atlas).unwrap();
+        let path = format!("/sites/{site}");
+        assert_eq!(get(&s.sim, &path, s.token).await.0, StatusCode::OK);
+        assert_eq!(get(&s.sim, &path, s.sim.token()).await.0, StatusCode::OK);
+
+        let other = s.sim.add_tenant("Fabrikam", "fabrikam.example.invalid");
+        let outsider = s
+            .sim
+            .add_work_account(&other, "o@fabrikam.example.invalid", "Outsider")
+            .unwrap();
+        let personal = s
+            .sim
+            .add_personal_account("sam@example.invalid", "Sam")
+            .unwrap();
+        for (token, account) in [("outsider", &outsider), ("personal", &personal)] {
+            s.sim.add_token(token);
+            s.sim.bind_token(token, account).unwrap();
+            let (status, body) = get(&s.sim, &path, token).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{token}");
+            assert_eq!(body["error"]["code"], "accessDenied");
+        }
+
+        s.sim
+            .set_library_access(&s.atlas, LibraryAccess::blocked())
+            .unwrap();
+        let (status, body) = get(&s.sim, &path, s.token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], DEFAULT_POLICY_CODE);
+        // The other site is not affected.
+        let finance_site = s.sim.site_of_library(&s.finance).unwrap();
+        assert_eq!(
+            get(&s.sim, &format!("/sites/{finance_site}"), s.token)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
 }

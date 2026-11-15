@@ -77,12 +77,16 @@ One example: the token endpoint reads the clock from `State`, issues tokens unde
 | Behaviour | Source |
 |---|---|
 | `GET {authority}oauth2/v2.0/authorize` with `client_id`, `response_type=code`, `redirect_uri`, `scope`, `state`, `code_challenge`, `code_challenge_method`. It redirects (`302`) to `redirect_uri` with `code` and `state`, signed in as the account chosen with `sign_in_as`. With `deny_next_sign_in`, the next request redirects with `error` and `error_description` instead. | [Authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow) **(not re-read)**. That the client sends these parameters: ADR-0010, F01 |
+| `scope` is optional at the authorise step: without it, the code carries no scopes, and redeeming it gives an access token with an empty `scope` and no refresh token. This is laxer than the platform, which requires `scope`. | Auth code flow page **(not re-read)**. The simulator is laxer on purpose: the client always sends `scope` (ADR-0010 R5) |
 | A missing `client_id` or `redirect_uri`, a `redirect_uri` that is not absolute `http(s)`, or no account chosen gives `400` with no redirect. This stands in for the error page the platform shows instead of redirecting to an untrusted address. | Same page **(not re-read)**. The page and the status are **unverified** |
 | PKCE (RFC 7636): methods `S256` and `plain`, with `plain` when no method is given. A request without a challenge gets a code that is not bound to a verifier. | [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636) sections 4.2 and 4.3. That the platform accepts both methods and makes PKCE optional for native clients: the auth code flow page **(not re-read)** |
 | `POST {authority}oauth2/v2.0/token`, `grant_type=authorization_code`. The code is refused (`400 invalid_grant`) if it is unknown, already used (any attempt uses it up), older than 10 minutes on the simulator's clock, or issued to another `client_id` or `redirect_uri`. It is also refused if the `code_verifier` is missing or does not match the challenge (ADR-0010 R1). | Auth code flow page: codes are short-lived, about 10 minutes, and redeemable once **(not re-read)**. Using up the code on a failed attempt is **unverified** |
 | A success is `{token_type: "Bearer", scope, expires_in: 3600, ext_expires_in, access_token}`. `refresh_token` is included only when `offline_access` was requested. `scope` leaves out `offline_access`, `openid`, `profile` and `email`. | Auth code flow page **(not re-read)**. The 60–90 minute lifetime: [Access tokens](https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens) **(not re-read)**. The simulator uses 3600. Which scopes `scope` lists is **unverified** |
 | `id_token` is returned only when `openid` was requested. The switch `id_token = Always` returns it every time. Note: the client's initial scopes (ADR-0010 R5) do not include `openid`, so the existing client gets no ID token (lead's open question Q37). | Auth code flow page **(not re-read)** |
 | `grant_type=refresh_token` returns a new access token and a new refresh token (ADR-0010 R8). The old refresh token is then refused (`invalid_grant`) under the default `old_refresh_token = Refused`, and keeps working under `Accepted`. | [Refresh tokens](https://learn.microsoft.com/en-us/entra/identity-platform/refresh-tokens): tokens "replace themselves with a fresh token upon every use" and the old one is not revoked on use (research, section 1). **The default departs from that page on purpose**: WP-023 AC2 sets it, because it catches a client that keeps using an old token |
+| A refresh may ask only for scopes granted at the authorise step that started its chain, or a subset; without `scope` it gets the chain's grant. A scope beyond that grant (for example `Sites.Read.All`) is refused with `400 invalid_grant` and `AADSTS65001` (consent required), and nothing is issued or rolled. Incremental consent needs a new authorise step, which ADR-0010 R5 relies on. A subset refresh keeps the chain's full grant for later refreshes. | That the platform refuses scopes the user has not consented to: auth code flow and permissions-and-consent pages **(not re-read)**. The exact error (`invalid_grant`, AADSTS65001) is **unverified**, and so is whether the platform allows other scopes consented earlier for the app. The simulator takes the stricter reading |
+| A refresh whose requested scopes leave out `offline_access` issues no refresh token, and it still rolls the one presented. Under `old_refresh_token = Refused` the chain then ends. | **Unverified**; the harder case |
+| A code presented a second time is refused (`invalid_grant`, AADSTS54005). Under the default `reused_code = RevokeIssuedTokens`, every token issued from its first redemption is revoked: the access tokens (the Graph origin answers `401`), the refresh token and every token rolled from it. Tokens from other sign-ins are untouched. `RefuseOnly` only refuses. | [RFC 6749](https://www.rfc-editor.org/rfc/rfc6749) section 4.1.2: the server "SHOULD revoke (when possible) all tokens previously issued based on that authorization code". Whether the platform does, and the AADSTS number: **unverified** |
 | `revoke_refresh_token`, and `revoke_refresh_tokens(account)` (as an admin revocation or password reset does), make later refreshes answer `invalid_grant`. A refresh token older than 90 days on the simulator's clock also answers `invalid_grant`. Access tokens already issued keep working until a test revokes them with `revoke_token`. | Refresh tokens page: 90 days, and the revocation table (research, section 1). That access tokens outlive a revocation until they expire: Access tokens page **(not re-read)** |
 | Error bodies are `{error, error_description: "AADSTS<n>: ...", error_codes, timestamp, trace_id, correlation_id}`. The `error` values used are `invalid_grant`, `invalid_request`, `unsupported_grant_type` and `unsupported_response_type`. | Shape: auth code flow page **(not re-read)**. The AADSTS numbers (70000, 70008, 50148, 501481, 50173, 700082, 9002313, 900144, 70003, 70005, 501491, 50034) are **unverified**. A client must act on `error`, not on the number |
 | An access token the authority issues is accepted by the Graph origin and is bound to its account. The fixed per-instance token and `add_token` tokens are still accepted and belong to no account, unless `bind_token` binds them. | Simulator design (WP-023) |
@@ -119,6 +123,7 @@ uses `.invalid` domains.
 |---|---|
 | `GET /me` gives `{id, displayName, userPrincipalName, mail}` for the token's account. | [Get user](https://learn.microsoft.com/en-us/graph/api/user-get?view=graph-rest-1.0) **(not re-read)** |
 | `GET /me/drive` gives the account's own drive, as `GET /drives/{id}` renders it. A personal account's drive is `personal` and a work account's is `business` (AC6). The drive ID is as `add_drive` makes it: no mixed-case switch exists yet (research, section 4, issue #1902). | [Get drive](https://learn.microsoft.com/en-us/graph/api/drive-get?view=graph-rest-1.0) **(not re-read)**. Research, section 2 |
+| `GET /me/drive` follows the policy on the account's own drive: if it is blocked, `/me/drive` answers `403` with the block's code, as `/drives/{id}` does. Read-only does not affect it, because it is a read. | Provisional, as blocked libraries are (gate G2) |
 | `GET /organization` gives a work account's tenant as `{value: [{id, displayName, verifiedDomains: [{name, isDefault, isInitial, type}]}]}`. For a personal account it is `403 accessDenied` by default, or `{value: []}` under `personal_organization = Empty`. | [List organization](https://learn.microsoft.com/en-us/graph/api/organization-list?view=graph-rest-1.0) **(not re-read)**. Personal accounts and the required permission: **unverified** |
 | A token bound to no account (the fixed one, say) gets `403 accessDenied` on `/me`, `/me/drive` and `/organization`, with a message naming `bind_token`. | Simulator departure: every real token belongs to a user |
 
@@ -132,6 +137,8 @@ uses `.invalid` domains.
 | A link into another tenant's drive is `403 accessDenied` for the caller. | **Unverified**; models "people in your organization" links |
 | A token bound to an account reaches only its own drive, drives granted with `grant_access`, and drives reached through a redeemed link. Any other existing drive is `403 accessDenied`. Unbound tokens reach every drive, as before WP-023. | Simulator model. The status for "no access" is **unverified** |
 | `GET /sites/{site-id}` gives `{id, name, displayName, webUrl, siteCollection.hostname}`. Site IDs have the composite form `<host>,<guid>,<guid>`, with hosts under `sharepoint.example.invalid`. | [Get site](https://learn.microsoft.com/en-us/graph/api/site-get?view=graph-rest-1.0) **(not re-read)**. Whether it needs `Sites.Read.All` is not modelled (F09 open question) |
+| `GET /sites/{site-id}` refuses (`403 accessDenied`) an account bound to a token whose tenant is not the site's, which includes every personal account. Unbound tokens read every site. Same-tenant accounts read it whether or not they can reach its libraries. | **Unverified**; models a site visible only inside its organisation |
+| If any library of the site is blocked, `GET /sites/{site-id}` answers `403` with that block's code. Unmanaged-device controls "can be per site", so a library block stands in for a per-site policy. | [Control access from unmanaged devices](https://learn.microsoft.com/en-us/sharepoint/control-access-from-unmanaged-devices) for per-site policies (research `sharepoint_libraries.md`, section 1). That `/sites/{id}` is refused, and how: **unverified** (gate G2) |
 | `GET /drives/{id}/list` gives a library's list: `{id, name: "Shared Documents", displayName: "Documents", list.template: "documentLibrary", parentReference.siteId, webUrl}`. A drive that is not a library gets `404`. | drive resource, `list` relationship **(not re-read)**. The list's `name` is **unverified** |
 | A library's name is always "Documents", in the drive resource (`GET /drives/{id}`, rendered by `json.rs`) and in its list. | Default library name. Other names are not simulated (see below) |
 
@@ -177,14 +184,33 @@ nothing else that the log records.
   may want to check that the challenge is S256.
 
 Masking is by shape, so a token a test adds with `add_token` that happens to start with an
-issued prefix would be masked too. Issued secrets are derived from a counter, not drawn at
-random. The simulator is not a security boundary, and derived values keep runs reproducible.
+issued prefix would be masked too. The same goes for any value shaped like a JWT, even one
+that is not a token: that false positive is accepted. On the authority's origin, the masked
+parameter names are compared without regard to case and after percent-decoding (`CODE`,
+`%63ode` and `refresh%5Ftoken` are all masked).
+
+Issued secrets are derived from a counter, not drawn at random. **The label the log keeps
+determines the whole secret**: the secret part is a hash of the label and a fixed string. So
+masking protects against a secret being copied by accident, out of a log into a test
+failure message or a report. It does not protect against someone who reads the log and
+knows how the simulator works. The simulator is not a security boundary, and derived values
+keep runs reproducible.
+
+`Debug` of `GraphSim` does not print issued secrets. The identity registry and the
+authority's state print counts in place of codes, refresh tokens and bound tokens. The
+shared state's `Debug` leaves out the drives' state, which holds the accepted bearer tokens.
+`GraphSim`'s own `token` field (the fixed per-instance token) is still printed.
+
+Tests that assert over all of `requests()` now see the authority's requests too, and should
+filter on `Origin::Graph` where they mean the Graph API.
 
 ## Departures and not simulated
 
 - The authority does not check `redirect_uri` or `client_id` against an app registration.
   It accepts any absolute `http(s)` URI and any client ID, and only requires the token
   request to repeat the ones used at the authorise step.
+- The Graph origin does not check an access token's scopes: any accepted token may call any
+  route, whatever it was granted. Only the authority enforces scopes, on refresh.
 - The authority does not check scopes against an app registration and never asks for
   consent. `organizations` and `consumers` do not restrict which account may sign in.
 - Device-code flow, client credentials, `prompt`, `login_hint`, `nonce` and
