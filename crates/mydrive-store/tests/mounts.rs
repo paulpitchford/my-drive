@@ -185,6 +185,19 @@ fn mount_debug_redacts_the_delta_token_and_links() {
     assert!(!shown.contains("secret-staged"), "{shown}");
 }
 
+/// A page link carries a delta token, so its `Debug` never shows it either.
+#[test]
+fn page_link_debug_redacts_the_link() {
+    for link in [
+        mydrive_store::PageLink::Next("https://graph.example/next?token=secret-next".to_owned()),
+        mydrive_store::PageLink::Delta("https://graph.example/delta?token=secret-delta".to_owned()),
+    ] {
+        let shown = format!("{link:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
+}
+
 #[test]
 fn mount_insert_refusals() {
     let fx = Fixture::new();

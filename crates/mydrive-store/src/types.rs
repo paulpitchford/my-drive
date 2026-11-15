@@ -966,13 +966,25 @@ pub struct Staged {
 }
 
 /// The link a delta page ends with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` redacts the link: both kinds carry a delta token, which must never reach a log.
+#[derive(Clone, PartialEq, Eq)]
 pub enum PageLink {
     /// More pages follow at this `@odata.nextLink`.
     Next(String),
     /// The last page: this `@odata.deltaLink` becomes the live token when the run is
     /// finished.
     Delta(String),
+}
+
+impl fmt::Debug for PageLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self {
+            Self::Next(_) => "Next",
+            Self::Delta(_) => "Delta",
+        };
+        f.debug_tuple(kind).field(&"<redacted>").finish()
+    }
 }
 
 /// Where a walk of the staged set continues, from [`StagedPage::next`].

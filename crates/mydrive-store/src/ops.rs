@@ -331,7 +331,8 @@ pub trait Queries: sealed::Connected {
     /// an entry whose parent chain within the staged set loops (`ParentCycle`, ordered after
     /// every other entry that is not a delete), one whose parent is neither staged nor
     /// stored (`MissingParent`), and one whose parent is staged as deleted
-    /// (`ParentDeleted`). The drive root has no parent, so it is in the first level, with every entry whose parent is already stored.
+    /// (`ParentDeleted`). The drive root has no parent, so it is in the first level, with
+    /// every entry whose parent is already stored.
     ///
     /// # Errors
     ///
@@ -2443,7 +2444,7 @@ impl RawItem {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;

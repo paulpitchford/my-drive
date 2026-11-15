@@ -74,6 +74,9 @@ The delta token and both links are never logged; `Mount`'s `Debug` redacts all t
 `UNIQUE (drive_id, root_item_id)`: the same remote folder cannot be mounted twice
 (ADR-0007 R4). The store refuses it with an error naming the existing mount.
 
+`UNIQUE (mount_id, delta_run)` adds nothing on its own (`mount_id` is the key); it is the
+parent key `delta_staged`'s foreign key needs.
+
 Table CHECKs (WP-017 AC7):
 
 - `delta_run IS NOT NULL OR (delta_next_link IS NULL AND delta_staged_link IS NULL)`: no
@@ -84,8 +87,9 @@ Table CHECKs (WP-017 AC7):
 - `read_only = 1 OR read_only_reason IS NULL`.
 - An `incremental` run has a live token; an `initial` run has none.
 - Every code column holds one of its listed values; a unit test keeps each list equal to
-  the Rust type's `WIRE_FORMS`. A new code is a new migration; `mounts` is small and has no
-  foreign key pointing at it except `delta_staged`, so a rebuild is cheap.
+  the Rust type's `WIRE_FORMS`. A new code is a new migration; `mounts` is small and only
+  `delta_staged` has a foreign key pointing at it, so a rebuild is cheap (a rebuild must
+  keep `UNIQUE (mount_id, delta_run)`).
 
 Every operation checks these first and refuses a violation with
 `StoreError::InvalidMount { rule: MountRule::… }`, so the caller gets a typed error, never a
@@ -162,7 +166,9 @@ Indexes:
   `items` is `WITHOUT ROWID`, each index entry also carries `item_id`, so children come in
   (`name`, `item_id`) order straight from the index.
 - `items_by_sync (sync)` for listing items by sync state.
-- `items_by_dirty (local_dirty) WHERE local_dirty = 1`, a partial index, for `dirty_items`.
+- `items_by_dirty (local_dirty) WHERE local_dirty = 1`, a partial index, for `dirty_items`
+  and for a drive's dirty items in `remove_mount` (its entries also carry `drive_id` and
+  `item_id`).
 - The `UNIQUE` constraint on `local_id`.
 
 ### `local_id_allocator`
@@ -174,11 +180,12 @@ One row (`singleton = 1`, a CHECK) holding `next_local_id`, the next local ID to
 
 The staged set of the mount's delta run in progress (ADR-0022), one row per item: the last
 entry staged for it in the run. Primary key (`mount_id`, `item_id`). `WITHOUT ROWID`.
-`mount_id` references `mounts` `ON DELETE CASCADE`.
+(`mount_id`, `run`) references (`mount_id`, `delta_run`) of `mounts` `ON DELETE CASCADE`.
 
 | Column | Type | Null | Notes |
 |---|---|---|---|
 | `mount_id` | TEXT | no | The mount. |
+| `run` | TEXT | no | The run the row belongs to: the mount's `delta_run` when it was staged. |
 | `item_id` | TEXT | no | The item, in the mount's drive. |
 | `seq` | INTEGER | no | Order of staging in the run: re-staging an item gives it a larger value. `UNIQUE (mount_id, seq)`. |
 | `deleted` | INTEGER | no | 1 for an entry with the `deleted` facet. |
@@ -194,10 +201,13 @@ has a facet, name, size and both times, and a parent unless it is the drive root
 root has no parent and is never a delete; `problem_detail` is present exactly for a
 `reported` problem; name and facet are present together.
 
-Rows exist only while the mount has a run (`delta_run` set): `begin_delta_run` and
-`finish_delta_run` remove them, `stage_delta_page` refuses without a run, and removing the
-mount removes them. SQLite cannot express this across two tables without a trigger, so the
-operations enforce it and the model test checks it after every step.
+Rows exist only while the mount has their run in progress, and the table enforces it: the
+foreign key on (`mount_id`, `run`) needs a mount whose `delta_run` is `run` (a `NULL`
+`delta_run` matches nothing), and with its default action it refuses to end the run or
+change its kind while rows remain. `begin_delta_run` and `finish_delta_run` therefore
+remove the rows before writing `delta_run`; `stage_delta_page` refuses without a run
+(`NoDeltaRun`), so the API reports a typed error first; removing the mount removes them.
+The model test also checks it after every step.
 
 Indexes: `delta_staged_by_parent (mount_id, parent_item_id)` for ordering the set, and
 `delta_staged_by_order (mount_id, apply_order, item_id)` for walking it.
@@ -423,6 +433,11 @@ never changed.
 It is also refused (`DriveSharedByMounts`) while another mount shows the same drive, whose
 rows it would remove. There is no default: the caller must name one of the two modes.
 
+A refusal costs the drive's dirty rows, not its size: the count and the sample are searches
+of `items_by_dirty`, whose entries carry (`drive_id`, `item_id`) because `items` is
+`WITHOUT ROWID`, so they read that drive's dirty rows in key order with no sort (a unit test
+reads both query plans). The error holds at most 20 keys however many are dirty.
+
 ## What the engine must do
 
 The store enforces everything it can see. It never sees the bytes in a backing file, the
@@ -615,7 +630,7 @@ The error kinds are part of the API. Version 2 adds:
 | Version | Change |
 |---|---|
 | 1 | `application_id`; `accounts`, `mounts`, `items`, `hydrated_ranges`; indexes `items_by_parent`, `items_by_sync`, `items_by_dirty`. |
-| 2 | `accounts` gains `kind`, `username`, `display_name`, `org_name`, `needs_sign_in`, `hash_percent_refused` by `ADD COLUMN`. `mounts` is rebuilt with the new facts, run columns and CHECKs. `items` is rebuilt with `local_id`, `items_by_parent` is replaced by `items_by_parent_name`, and `name` is `COLLATE BINARY` (the default, now explicit). New: `local_id_allocator`, `delta_staged` and its two indexes. |
+| 2 | `accounts` gains `kind`, `username`, `display_name`, `org_name`, `needs_sign_in`, `hash_percent_refused` by `ADD COLUMN`. `mounts` is rebuilt with the new facts, run columns, CHECKs and `UNIQUE (mount_id, delta_run)`. `items` is rebuilt with `local_id`, `items_by_parent` is replaced by `items_by_parent_name`, and `name` is `COLLATE BINARY` (the default, now explicit). New: `local_id_allocator`, `delta_staged` and its two indexes. |
 
 **Why version 2 rebuilds `items`.** `ALTER TABLE ADD COLUMN` cannot add a `NOT NULL` column
 without a constant default, nor a `UNIQUE` column; and a constant default gives every

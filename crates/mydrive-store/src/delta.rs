@@ -163,6 +163,7 @@ fn check_entry(mount: &Mount, entry: &StagedEntry) -> Result<(), StoreError> {
 fn upsert_entry(
     c: &Connection,
     mount: &Mount,
+    run: DeltaRunKind,
     entry: &StagedEntry,
     seq: i64,
 ) -> Result<(), StoreError> {
@@ -182,9 +183,10 @@ fn upsert_entry(
     c.execute(
         "INSERT INTO delta_staged (mount_id, item_id, seq, deleted, problem, problem_detail, \
          is_root, facet, parent_item_id, name, size, created_at, modified_at, etag, ctag, \
-         server_hash, apply_order) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, NULL) \
-         ON CONFLICT (mount_id, item_id) DO UPDATE SET seq = excluded.seq, \
+         server_hash, apply_order, run) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, NULL, \
+         ?17) \
+         ON CONFLICT (mount_id, item_id) DO UPDATE SET run = excluded.run, seq = excluded.seq, \
          deleted = excluded.deleted, problem = excluded.problem, \
          problem_detail = excluded.problem_detail, is_root = excluded.is_root, \
          facet = excluded.facet, parent_item_id = excluded.parent_item_id, \
@@ -208,6 +210,7 @@ fn upsert_entry(
             item.and_then(|i| i.etag.as_deref()),
             item.and_then(|i| i.ctag.as_deref()),
             item.and_then(|i| i.server_hash.as_ref().map(QuickXorHash::to_base64)),
+            run.as_str(),
         ],
     )
     .ctx(|| {
@@ -226,7 +229,7 @@ pub(crate) fn stage_page(
     link: &PageLink,
 ) -> Result<(), StoreError> {
     let mount = load_mount(c, mount_id, "stage a delta page")?;
-    require_run(&mount, "stage a delta page")?;
+    let run = require_run(&mount, "stage a delta page")?;
     if mount.delta_staged_link.is_some() {
         return Err(StoreError::DeltaRunComplete {
             mount_id: mount_id.clone(),
@@ -255,7 +258,7 @@ pub(crate) fn stage_page(
     // In page order, so a later entry for an item replaces an earlier one (ADR-0022 R2).
     for entry in entries {
         seq = seq.saturating_add(1);
-        upsert_entry(c, &mount, entry, seq)?;
+        upsert_entry(c, &mount, run, entry, seq)?;
     }
     c.execute(
         "UPDATE mounts SET delta_next_link = ?2, delta_staged_link = ?3 WHERE mount_id = ?1",
@@ -627,16 +630,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
-
-    fn plan(c: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> String {
-        let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-        let lines: Vec<String> = stmt
-            .query_map(params, |r| r.get::<_, String>(3))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        lines.join("\n")
-    }
+    use crate::ops::tests::plan;
 
     /// WP-017, the lead's bounded-memory point: each page of the walk is a range scan of
     /// `delta_staged_by_order` starting at the cursor, with no sort, so a page reads only

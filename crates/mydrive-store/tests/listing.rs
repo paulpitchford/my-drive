@@ -112,7 +112,7 @@ fn ac3_equal_names_are_never_split_across_pages() {
         .unwrap();
     assert_eq!(names(&page.items), ["z"]);
     assert!(!page.more);
-    // A page that ends exactly at the end of a run reports no more when none follow.
+    // A page extended to the end of a run reports more when a later name follows.
     let page = store
         .children_after(&key(ROOT), Some("a"), limit(1))
         .unwrap();

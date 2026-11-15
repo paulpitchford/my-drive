@@ -572,6 +572,54 @@ fn unusable_parents_surface_as_problems() {
     );
 }
 
+/// WP-017, lead's point (invariants are table constraints): staged rows exist only for
+/// the run in progress, enforced by the table, not only by the operations. Whatever
+/// writes the database, a staged row needs its mount to have that run in progress; the
+/// run cannot end or change kind while its staged rows remain; removing the mount removes
+/// them.
+#[test]
+fn staged_rows_belong_to_the_run_in_progress_by_a_foreign_key() {
+    let fx = Fixture::new();
+    let store = running(&fx);
+    store
+        .stage_delta_page(&mount_id(), &[present("a", ROOT, "a")], &next("n"))
+        .unwrap();
+    drop(store);
+    let conn = raw(&fx.path());
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    let refused = |sql: &str| {
+        let err = conn.execute_batch(sql).unwrap_err().to_string();
+        assert!(err.contains("FOREIGN KEY constraint failed"), "{sql}: {err}");
+    };
+    let m = mount_id();
+    let m = m.as_str();
+    // A row for a run the mount does not have.
+    refused(&format!(
+        "INSERT INTO delta_staged (mount_id, run, item_id, seq, deleted, is_root) \
+         VALUES ('{m}', 'incremental', 'x', 99, 1, 0)"
+    ));
+    // Ending the run, or changing its kind, with rows still staged.
+    refused(&format!(
+        "UPDATE mounts SET delta_run = NULL, delta_next_link = NULL WHERE mount_id = '{m}'"
+    ));
+    refused(&format!(
+        "UPDATE mounts SET delta_run = 'resync-apply' WHERE mount_id = '{m}'"
+    ));
+    let staged: i64 = conn
+        .query_row("SELECT COUNT(*) FROM delta_staged", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(staged, 1);
+    // Removing the mount (after its items, which the store does first) cascades.
+    conn.execute_batch(&format!(
+        "DELETE FROM hydrated_ranges; DELETE FROM items; DELETE FROM mounts WHERE mount_id = '{m}'"
+    ))
+    .unwrap();
+    let staged: i64 = conn
+        .query_row("SELECT COUNT(*) FROM delta_staged", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(staged, 0);
+}
+
 /// The walk, the anti-join and finishing need a complete staged set, and a run.
 #[test]
 fn walking_listing_and_finishing_need_a_complete_run() {

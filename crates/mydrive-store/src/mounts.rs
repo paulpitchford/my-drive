@@ -476,7 +476,7 @@ pub(crate) fn remove_mount(
 
     let dirty: i64 = c
         .query_row(
-            "SELECT COUNT(*) FROM items WHERE local_dirty = 1 AND drive_id = ?1",
+            DIRTY_COUNT_SQL,
             [drive],
             |row| row.get(0),
         )
@@ -528,13 +528,19 @@ pub(crate) fn remove_mount(
     })
 }
 
+/// How many items of a drive are dirty. A search of the partial index `items_by_dirty`,
+/// whose entries carry (`drive_id`, `item_id`), so it reads only the drive's dirty rows.
+const DIRTY_COUNT_SQL: &str = "SELECT COUNT(*) FROM items WHERE local_dirty = 1 AND drive_id = ?1";
+
+/// The first dirty items of a drive in key order, from the same index without sorting, so a
+/// refused removal costs at most the drive's dirty rows however large the drive is.
+const DIRTY_SAMPLE_SQL: &str = "SELECT item_id FROM items WHERE local_dirty = 1 \
+     AND drive_id = ?1 ORDER BY item_id LIMIT ?2";
+
 /// At most [`DIRTY_SAMPLE_LIMIT`] dirty items of the drive, in key order.
 fn dirty_sample(c: &Connection, drive_id: &DriveId) -> Result<Vec<ItemKey>, StoreError> {
     let mut stmt = c
-        .prepare_cached(
-            "SELECT item_id FROM items WHERE local_dirty = 1 AND drive_id = ?1 \
-             ORDER BY item_id LIMIT ?2",
-        )
+        .prepare_cached(DIRTY_SAMPLE_SQL)
         .ctx(|| format!("list dirty items of drive {drive_id}"))?;
     let limit = i64::try_from(DIRTY_SAMPLE_LIMIT).unwrap_or(i64::MAX);
     let ids: Vec<String> = stmt
@@ -631,4 +637,31 @@ fn parse_opt<T: FromStr<Err = String>>(
             })
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    /// WP-017, lead's point: refusing to remove a mount is bounded in cost. Counting and
+    /// sampling the drive's dirty items are searches of the partial index `items_by_dirty`
+    /// (covering, no sort), so they read the dirty rows of that drive and nothing else.
+    #[test]
+    fn dirty_count_and_sample_read_only_the_dirty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = crate::schema::open(&dir.path().join("state.db")).unwrap();
+        for (sql, params) in [
+            (DIRTY_COUNT_SQL, rusqlite::params!["d"].to_vec()),
+            (DIRTY_SAMPLE_SQL, rusqlite::params!["d", 20].to_vec()),
+        ] {
+            let plan = crate::ops::tests::plan(&c, sql, &params);
+            assert!(
+                plan.contains("COVERING INDEX items_by_dirty (local_dirty=? AND drive_id=?)"),
+                "{plan}"
+            );
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+    }
 }

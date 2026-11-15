@@ -135,7 +135,10 @@ CREATE TABLE hydrated_ranges (
 ///   allocator starts after the largest. `kind` keeps having no CHECK; the dirty-file CHECK
 ///   is now written for every kind without content. `items_by_parent` is replaced by
 ///   `items_by_parent_name`, which serves the same lookups and orders children by name.
-/// - `delta_staged` and `local_id_allocator` are new.
+/// - `delta_staged` and `local_id_allocator` are new. A staged row names the run it
+///   belongs to, and (`mount_id`, `run`) references (`mount_id`, `delta_run`) of `mounts`:
+///   staged rows can exist only while their mount has that run in progress, and the run
+///   cannot end or change kind until they are removed.
 ///
 /// The CHECK lists are the stored forms of the store's enums as of this migration; a test
 /// keeps them equal to each enum's `WIRE_FORMS`.
@@ -176,6 +179,7 @@ CREATE TABLE mounts_v2 (
     delta_next_link   TEXT CHECK (delta_next_link IS NULL OR delta_next_link <> ''),
     delta_staged_link TEXT CHECK (delta_staged_link IS NULL OR delta_staged_link <> ''),
     UNIQUE (drive_id, root_item_id),
+    UNIQUE (mount_id, delta_run),
     CHECK (delta_run IS NOT NULL OR (delta_next_link IS NULL AND delta_staged_link IS NULL)),
     CHECK (delta_next_link IS NULL OR delta_staged_link IS NULL),
     CHECK (blocked_message IS NULL OR blocked_reason IS NOT NULL),
@@ -258,7 +262,8 @@ INSERT INTO local_id_allocator (singleton, next_local_id)
     SELECT 1, COALESCE(MAX(local_id), 0) + 1 FROM items;
 
 CREATE TABLE delta_staged (
-    mount_id       TEXT NOT NULL REFERENCES mounts (mount_id) ON DELETE CASCADE,
+    mount_id       TEXT NOT NULL,
+    run            TEXT NOT NULL,
     item_id        TEXT NOT NULL CHECK (item_id <> ''),
     seq            INTEGER NOT NULL CHECK (seq >= 1),
     deleted        INTEGER NOT NULL CHECK (deleted IN (0, 1)),
@@ -278,6 +283,7 @@ CREATE TABLE delta_staged (
     apply_order    INTEGER CHECK (apply_order IS NULL OR apply_order >= 0),
     PRIMARY KEY (mount_id, item_id),
     UNIQUE (mount_id, seq),
+    FOREIGN KEY (mount_id, run) REFERENCES mounts (mount_id, delta_run) ON DELETE CASCADE,
     CHECK (deleted = 0 OR (problem IS NULL AND is_root = 0 AND facet IS NULL
         AND parent_item_id IS NULL AND name IS NULL AND size IS NULL AND created_at IS NULL
         AND modified_at IS NULL AND etag IS NULL AND ctag IS NULL AND server_hash IS NULL)),
