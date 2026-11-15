@@ -93,6 +93,7 @@ flowchart TB
     daemon["mydrive-daemon (bin: mydrived)"] --> ipc
     daemon --> vfs
     daemon --> engine
+    daemon --> core
     vfs["mydrive-vfs"] --> core
     engine["mydrive-engine"] --> store
     engine --> graphcrate
