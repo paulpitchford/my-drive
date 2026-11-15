@@ -122,7 +122,8 @@ outcome for what they are, and it changes how to plan.
   another merged. Resolve by taking master's lockfile and letting `cargo check` add the
   branch's entries, then run `just check`.
 - **Licence and audit configuration is the lead's to change**, and such changes go to the
-  owner afterwards: two were needed (Zlib allowed; audit limited to Linux targets).
+  owner afterwards: two were needed (Zlib allowed; audit limited to Linux targets). The owner
+  confirmed both on 2026-11-15.
 - **Leave non-blocking gaps in a follow-up WP** rather than another round, once a final
   verification passes (WP-013).
 - **Cost.** Five WPs used roughly 45 agent runs: 5 implementers resumed 17 times, 11 reviews

@@ -1,11 +1,13 @@
 # WP-011: Gate experiments G1 and G5
 
-- **Status:** blocked on the owner (app registration)
+- **Status:** ready
 - **Milestone:** M0
 - **Wave:** 4
 - **Depends on:** WP-008, WP-009
 - **Gates:** answers G1 and G5
-- **Owned paths:** `crates/mydrive-graph/examples/**`, `docs/gates/**`
+- **Owned paths:** `crates/mydrive-graph/examples/g1_*.rs`, `examples/g5_*.rs`,
+  `crates/mydrive-graph/tests/g1_*.rs`, `tests/g5_*.rs`, `docs/gates/G1.md`,
+  `docs/gates/G5.md`
 - **ADRs:** ADR-0005, ADR-0010, ADR-0011
 - **Flows / journeys:** F01, F03
 
@@ -45,10 +47,13 @@ whether device-code sign-in works for personal accounts (G5).
 
 ## Notes
 
-Running against a real account needs the owner: they register the app, supply the client ID
-through an environment variable, and sign in themselves. The implementer builds and tests
+Running against a real account needs the owner to sign in themselves. The app is registered
+and its client ID is the compiled-in default. The registration lists `Files.ReadWrite.All`,
+not `Files.Read`; the examples still request only `Files.Read offline_access`, which the
+identity platform lets a user consent to without its being listed. If the service refuses
+that, record it in the gate document and stop; do not widen the scope. The implementer builds and tests
 against the simulator and stops there; AC4 is completed with the owner.
 
 ## Open questions
 
-- Client ID: pending the owner's app registration.
+None.

@@ -26,7 +26,7 @@ answered. No daemon yet.
 | [WP-012](WP-012-architecture-conformance-checks.md) | Architecture conformance checks | 2 | WP-010 | done (#9) |
 | [WP-008](WP-008-graph-client-foundations.md) | Graph client foundations | 3 | WP-001, WP-007, WP-009 | done (#23) |
 | [WP-013](WP-013-wave-2-test-follow-ups.md) | Wave 2 test follow-ups | 3 | WP-005, WP-006, WP-009 | done (#20, #21, #22) |
-| [WP-011](WP-011-gate-experiments-g1-g5.md) | Gate experiments G1 and G5 | 4 | WP-008, WP-009 | blocked on the owner (app registration) |
+| [WP-011](WP-011-gate-experiments-g1-g5.md) | Gate experiments G1 and G5 | 4 | WP-008, WP-009 | ready (the real run needs the owner to sign in) |
 
 Waves 1 to 3 are merged. What they taught is in `docs/process/orchestration.md`. Wave 4
 (WP-011) needs the owner to register the Microsoft app. Milestone M1 is next to be specified.
@@ -38,11 +38,12 @@ From `docs/architecture/overview.md`. A gate is an experiment, not a code delive
 | Gate | How it is answered | Needs | Status |
 |---|---|---|---|
 | — FUSE in hosted CI | WP-010 | — | **answered: yes** (`docs/process/ci-fuse.md`) |
-| G1 Range on authenticated `/content` | WP-011 against a real personal account, then a work account | App registration; owner signs in | open |
+| G1 Range on authenticated `/content` | WP-011 against a real personal account, then a work account | Owner signs in | open |
 | G2 Policy errors and shortcut stubs | Manual experiment against a work tenant with unmanaged-device controls | A work tenant; owner | open |
 | G3 abraunegg FUSE ADR | Lead reads PR #3600 and its ADR, writes up findings | Nothing | **answered: pass with changes** ([docs/gates/G3.md](../gates/G3.md)); ADR-0005 to be amended before M2 |
 | G4 Per-file status in Files | Issue on omacom/folio | Owner approves the wording before it is posted | open |
-| G5 Device-code sign-in for personal accounts | WP-011 | App registration; owner signs in | open |
+| G5 Device-code sign-in for personal accounts | WP-011 | Owner signs in | open |
+| G6 Write-side behaviour | WP-045 on a scratch folder of a real personal drive and a scratch document library | Owner signs in (approved 2026-11-15) | open |
 
 ## Milestone M1: Engine
 
@@ -61,6 +62,7 @@ as it then stands. Rows marked `planned` have no file yet.
 | [WP-019](WP-019-sim-write-side.md) | Simulator write side | 6 | WP-014 | ready |
 | [WP-023](WP-023-sim-identity-and-discovery.md) | Simulator identity and discovery | 6 | WP-014 | ready |
 | 018 | Store schema version 3: pending operations | 7 | 017 | planned |
+| [WP-045](WP-045-gate-experiments-g6.md) | Gate experiment G6, write-side behaviour | 7 | WP-008, WP-009 | ready |
 | 025 | Graph client write side | 7 | 019 | planned |
 | 029 | Engine foundations and facade | 7 | 015, 017 | planned |
 | 030 | Request scheduler | 7 | 015 | planned |
