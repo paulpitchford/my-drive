@@ -480,6 +480,39 @@ mod tests {
         }
     }
 
+    /// Verifier C16: a stem budget of exactly 0 bytes, or smaller than the stem's first
+    /// character, is `NoRoom`, never a name with no stem.
+    #[test]
+    fn no_room_when_not_even_the_first_stem_character_fits() {
+        // `-laptop` is 7 bytes; an extension of 248 bytes leaves exactly 0 for the stem.
+        let name = format!("a.{}", "e".repeat(247));
+        assert_eq!(
+            conflict_copy_name(&name, "laptop", PERSONAL, |_| false),
+            Err(ConflictNameError::NoRoom {
+                name: name.clone(),
+                number: 1
+            })
+        );
+        // A 4-byte first character with 1, 2 or 3 bytes of room.
+        for room in 1..=3 {
+            let name = format!("😀.{}", "e".repeat(247 - room));
+            assert_eq!(
+                conflict_copy_name(&name, "laptop", PERSONAL, |_| false),
+                Err(ConflictNameError::NoRoom {
+                    name: name.clone(),
+                    number: 1
+                }),
+                "room {room}"
+            );
+        }
+        // With 4 bytes of room the character fits.
+        let name = format!("😀.{}", "e".repeat(243));
+        assert_eq!(
+            conflict_copy_name(&name, "laptop", PERSONAL, |_| false).unwrap(),
+            format!("😀-laptop.{}", "e".repeat(243))
+        );
+    }
+
     /// An extension too long to leave room is a typed error, not a cut extension.
     #[test]
     fn extension_too_long_is_an_error() {
@@ -533,6 +566,13 @@ mod tests {
         let straddling = format!("{}é", "a".repeat(MAX_HOST_BYTES - 1));
         assert_eq!(
             host_segment(&straddling, PERSONAL),
+            "a".repeat(MAX_HOST_BYTES - 1)
+        );
+        // Verifier C17: the cut stops at the straddling character; a shorter character after
+        // it is not taken instead.
+        let continued = format!("{}éb", "a".repeat(MAX_HOST_BYTES - 1));
+        assert_eq!(
+            host_segment(&continued, PERSONAL),
             "a".repeat(MAX_HOST_BYTES - 1)
         );
     }
