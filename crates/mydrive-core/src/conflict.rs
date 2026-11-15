@@ -175,9 +175,15 @@ where
 
 /// Turns a host name into the segment used in a conflict-copy suffix.
 ///
+/// Control characters in the original file name are not this function's concern: the name is
+/// used as given.
+///
 /// - Each character that [`validate_name`] rejects as a forbidden character in `context` is
 ///   replaced with [`HOST_REPLACEMENT`]. That includes `#` and `%` where the tenant refuses
 ///   them.
+/// - Each control character (U+0000 to U+001F and U+007F) is replaced with
+///   [`HOST_REPLACEMENT`] too, so a copy name never gains a control character from the host.
+///   `validate_name` accepts them, so this goes beyond the server's rules (lead ruling).
 /// - The result is cut to [`MAX_HOST_BYTES`] at a character boundary.
 /// - Leading and trailing spaces are removed, because the segment can end the name (a name
 ///   without an extension) and the server refuses a trailing space.
@@ -188,7 +194,7 @@ pub fn host_segment(host: &str, context: NameContext) -> String {
     let mut segment: Vec<(char, bool)> = Vec::new();
     let mut bytes = 0;
     for c in host.chars() {
-        let forbidden = is_forbidden_character(c, context);
+        let forbidden = c.is_ascii_control() || is_forbidden_character(c, context);
         let out = if forbidden { HOST_REPLACEMENT } else { c };
         bytes += out.len_utf8();
         if bytes > MAX_HOST_BYTES {
@@ -469,6 +475,42 @@ mod tests {
         let host = "é".repeat(100);
         let segment = host_segment(&host, PERSONAL);
         assert_eq!(segment, "é".repeat(MAX_HOST_BYTES / 2));
+        // A two-byte character straddling the cut is dropped whole, not split.
+        let straddling = format!("{}é", "a".repeat(MAX_HOST_BYTES - 1));
+        assert_eq!(
+            host_segment(&straddling, PERSONAL),
+            "a".repeat(MAX_HOST_BYTES - 1)
+        );
+    }
+
+    /// A host whose first `MAX_HOST_BYTES` are all replaced or all spaces still falls back to
+    /// `device`, even though usable characters follow the cut.
+    #[test]
+    fn host_unusable_after_the_cut_becomes_device() {
+        for filler in ["?", " ", "\0", "\u{7f}", "? "] {
+            let host = format!("{}laptop", filler.repeat(MAX_HOST_BYTES));
+            assert_eq!(host_segment(&host, PERSONAL), HOST_FALLBACK, "{host:?}");
+            assert_eq!(free("README", &host), "README-device");
+        }
+        // Spaces before the cut are trimmed after it, leaving the usable part.
+        let host = format!("x{}", " ".repeat(MAX_HOST_BYTES + 5));
+        assert_eq!(host_segment(&host, PERSONAL), "x");
+    }
+
+    /// Control characters in the host become `_`; a host of only control characters becomes
+    /// `device`. Control characters in the original name are kept as they are.
+    #[test]
+    fn control_characters_in_the_host_become_underscores() {
+        assert_eq!(free("a.txt", "lap\ttop\0\n\u{7f}x"), "a-lap_top___x.txt");
+        assert_eq!(free("a.txt", "\u{1}\u{1f}"), "a-device.txt");
+        assert_eq!(free("README", "\0\r\n"), "README-device");
+        // U+0080 and above are not in the ruled range and are kept.
+        assert_eq!(free("a.txt", "pc\u{85}"), "a-pc\u{85}.txt");
+        assert_eq!(free("tab\tname.txt", "pc"), "tab\tname-pc.txt");
+        for c in (0_u8..0x20).chain([0x7f]) {
+            let host = format!("pc{}", char::from(c));
+            assert_eq!(free("a.txt", &host), "a-pc_.txt", "{c:#x}");
+        }
     }
 
     /// AC6: conflict naming does no I/O and never reads the system time or host name. The
@@ -529,6 +571,7 @@ mod tests {
             prop::collection::vec(
                 prop::sample::select(vec![
                     'a', ' ', '?', ':', '/', '#', '%', '_', 'v', 't', 'i', 'V', '日', '😀', '.',
+                    '\0', '\t', '\n', '\u{1f}', '\u{7f}',
                 ]),
                 0..90,
             )
@@ -571,6 +614,17 @@ mod tests {
             prop_assert!(kept.is_some(), "suffix {:?} missing from {:?}", suffix, result);
             let kept = kept.unwrap_or_default();
             prop_assert!(!kept.is_empty());
+            // The suffix brings no control character into the name.
+            prop_assert!(
+                !suffix.chars().any(|c| c.is_ascii_control()),
+                "control character in suffix {:?}",
+                suffix
+            );
+            prop_assert_eq!(
+                result.chars().filter(char::is_ascii_control).count(),
+                name.chars().filter(char::is_ascii_control).count()
+                    - stem[kept.len()..].chars().filter(char::is_ascii_control).count()
+            );
             prop_assert!(stem.starts_with(kept), "{:?} is not a prefix of {:?}", kept, stem);
             if stem.len() + suffix.len() + extension.len() <= MAX_NAME_BYTES {
                 prop_assert_eq!(kept, stem);
