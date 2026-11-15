@@ -47,6 +47,13 @@ Per drive, in `DriveOptions` (`add_drive_with`, `set_options`).
 | `personal_folder_ctag` | `false` | The driveItem resource says cTag "isn't returned if the item is a folder". The get-item example shows a cTag on a folder, so `true` exists for the other case. |
 | `content_etag_header` | `false` | Whether content responses carry an `ETag` header is unverified (F03 open question 3, gate G1); absent is harder. |
 | `hash_empty_files` | `false` | Whether zero-byte files report a quickXorHash is unverified (research section 4 gaps); absent is harder. |
+| `simple_replace_honours_if_match` | `false` | Whether a simple `PUT .../content` replace checks `If-Match` is unverified (F04 question 3, ADR-0012 context); not checking, so a stale eTag overwrites, is harder (see [`docs/write.md`](docs/write.md)). |
+| `rename_sets_modified` | `false` | Whether a rename or move changes `lastModifiedDateTime` is unverified. `false` keeps the behaviour the control API had before writes existed; see [`docs/write.md`](docs/write.md) for why this default was not flipped. |
+| `quota_bytes` | `1099511627776` | 1 TiB, the `quota.total` the drive resource reports. Exceeding it answers `507` (errors page). |
+| `simple_upload_max_bytes` | `250000000` | Simple upload "only supports files up to 250 MB" (driveitem-put-content); the smaller, decimal reading is harder. The `413` above it is **unverified**. |
+| `rewrite` | `Later` | SharePoint libraries rewrite some uploaded files (rclone; research section 4). When the change shows is unverified; after the upload response, as a separate change, is harder. `InResponse` and `Off` exist. Libraries only. |
+| `rewrite_extensions` | `["doc", "docx", "xls", "xlsx", "ppt", "pptx", "eml", "msg", "tif", "tiff"]` | Office files (rclone), and eml, msg and TIFF as abraunegg reports (ADR-0012 context). |
+| `folder_conflict_default` | `Rename` | Create folder's default conflict behaviour is undocumented; silently creating `<name> 1` is harder than an error. |
 
 ## Simulated
 
@@ -61,6 +68,7 @@ routes and its part of the `GraphSim` control API.
 | Delta: token-less enumeration, tokens, repeats, deletes | [`docs/delta.md`](docs/delta.md) | `src/delta.rs` |
 | Content download: redirect and direct modes, ranges | [`docs/content.md`](docs/content.md) | `src/content.rs` |
 | Faults and the request log | [`docs/faults.md`](docs/faults.md) | `src/fault.rs`, `src/log.rs` |
+| Writes: simple upload, create folder, update, delete, `If-Match`, conflicts, locks, quota, library rewriting | [`docs/write.md`](docs/write.md) | `src/write.rs`, with the state in `src/model.rs` |
 
 Declared for the M1 simulator work packages, each adding its document beside these: the
 write side (`src/write.rs`, WP-019), upload sessions (`src/session.rs`, WP-020), the second
