@@ -90,6 +90,17 @@ for the authority's listener. Mask authority-issued access tokens where the log 
 and tokens added through the control API are still logged in full, because existing tests
 read them. Nothing sent to the authority (codes, verifiers, refresh tokens) is logged.
 
+Lead's rulings, 2026-11-15, after review. (1) The masking grew past "two changes" at the
+lead's request (query, path, other headers, percent-encoded forms); that is accepted. (2) The
+corrections to `docs/server.md` and `docs/faults.md` and the two lines removed from the
+README are accepted: each fixed text this package made wrong. (3) "Nothing sent to the
+authority is logged" holds for what the simulator can recognise. A verifier sent outside the
+form body under a name the simulator does not know, and a `plain` challenge (which is the
+verifier), are logged as sent and `docs/identity.md` says so: every secret here is fake, the
+log lives in a test process, and hiding all authority query values would hide the very leak
+a test needs to see. A deny-by-default rule for unknown authority parameters is a follow-up
+(Q43).
+
 Personal accounts carry the consumer tenant ID `9188040d-6c67-4c5b-b112-36a304b66dad`, which
 is Microsoft's documented public constant, not account data. Every other tenant, object ID,
 user name and domain is obviously fake.
