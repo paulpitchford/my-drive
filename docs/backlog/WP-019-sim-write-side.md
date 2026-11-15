@@ -67,11 +67,12 @@ conflict work can be tested without a real account.
 ## Notes
 
 Shared files, as WP-014 left them: the write routes returned by `write::routes()` are already
-merged into the Graph router; `lib.rs` re-exports everything public in `write.rs` with a
-glob; `State` holds a `write::WriteState` for state that is not part of the item model. So
-declare new public types (switches, modes) in `write.rs`, not `model.rs`, whose public types
-are re-exported by name from `lib.rs`. New fields on the existing `DriveOptions` are fine.
-Do not edit `lib.rs` or `server.rs` (WP-023 owns them in this wave). Refusing writes on a
+merged into the Graph router, so `server.rs` needs no change; do not edit it (WP-023 owns it
+in this wave). State for writes goes in `model.rs`, which you own. Declare new public types
+(switches, modes) in `write.rs` and export them by adding exactly one line to `lib.rs`,
+`pub use write::{...};`, directly below the existing `pub use model::{...};`. That one line
+is the only edit you may make to `lib.rs`, which WP-023 otherwise owns in this wave; it was
+tried as a prepared glob in WP-014 and cannot pass the lints while empty. Refusing writes on a
 read-only library is WP-023's, done before a request reaches your handlers.
 
 Follow the simulator's rule: the default is what Microsoft documents; where that is unknown,

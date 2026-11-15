@@ -62,10 +62,12 @@ reused. Give the simulator its own authority and the identity and discovery endp
 ## Notes
 
 Shared files, as WP-014 left them: `identity::routes()` and `discovery::routes()` are already
-merged into the Graph router; `lib.rs` re-exports everything public in your three files with
-a glob; `State` (in `model.rs`, owned by WP-019 in this wave: do not edit it) holds
-`identity::IdentityState`, `discovery::DiscoveryState` and `authority::AuthorityState`, so
-accounts, tenants, tokens, codes and links live in your own structs. The authority is not
+merged into the Graph router. `model.rs` is owned by WP-019 in this wave: do not edit it.
+Keep accounts, tenants, tokens, codes and links in state structs defined in your own three
+files and held by `Shared` in `server.rs` behind their own lock, beside the existing
+`State`; never hold both locks at once unless you document and test one fixed order. Export
+your public types from `lib.rs`; leave the line directly below `pub use model::{...};` free,
+because WP-019 adds one `pub use write::{...};` line there. The authority is not
 wired: it needs its own listener, started in `lib.rs`, and its own router in `server.rs`,
 with the request log applied and AC7 holding. You own both files in this wave; keep the
 existing listeners, routers and middleware order as they are.
