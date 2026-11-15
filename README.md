@@ -7,8 +7,8 @@ infrastructure in place; waves 1 to 3 of milestone M0 merged (core types, name v
 quickXorHash, FUSE test in CI, socket protocol, state store, Graph simulator, sign-in, Graph
 client, architecture checks). Milestone M1, the sync engine, has started: its shared files
 are prepared (WP-014) and wave 6 is being built. No daemon yet.
-**Next action:** the Microsoft app registration (owner), which unblocks the experiments
-against a real account (WP-011), the last open part of M0. Owner review of the
+**Next action:** the experiments against a real account (WP-011), the last open part of
+M0, now that the app is registered. They need the owner to sign in. Owner review of the
 decisions in `docs/architecture/open-questions.md` is still outstanding.
 
 ## Project documents

@@ -8,10 +8,11 @@ use super::error::ConfigError;
 
 /// The compiled-in client ID.
 ///
-/// A placeholder (the nil UUID) until the owner registers the app (ADR-0010, open question
-/// Q22). Sign-in against Microsoft with this value will fail; it exists so that the override
-/// path from `config.toml` (ADR-0010 R4) can be built and tested now.
-pub const DEFAULT_CLIENT_ID: &str = "00000000-0000-0000-0000-000000000000";
+/// The project's app registration (ADR-0010, open question Q22): a public client with no
+/// secret, open to work or school accounts of any organisation and to personal Microsoft
+/// accounts. A client ID is an identifier, not a credential. `config.toml` can override it
+/// (ADR-0010 R4), for a fork or for an organisation that requires its own registration.
+pub const DEFAULT_CLIENT_ID: &str = "04f1d571-4c17-4408-8f62-39424bba12ba";
 
 /// The documented default authority: Entra's `common` endpoint, which accepts personal and
 /// work or school accounts (ADR-0010). Tests inject their own.

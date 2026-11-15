@@ -39,7 +39,7 @@ The owner should know these were choices, not findings.
 | Q19 | Freedesktop thumbnail-cache layout and Graph thumbnail endpoint details for seeding placeholder thumbnails | M2 hydration-policy WP | M2 |
 | Q20 | Is the crawler deny list workable in practice (pid races, sandboxed apps)? ADR-0013 is an unproven design | Experiment in M2 | M2 |
 | Q21 | Product name | Owner | Before M3 packaging |
-| Q22 | App registration and publisher verification | Owner | Before WP-011 |
+| Q22 | Publisher verification of the app registration. The app was registered on 2026-11-15 (client ID in `mydrive-graph`'s `auth/config.rs`): public client, no secret, any organisation plus personal accounts, redirect URIs `http://localhost` and the native-client URI, delegated permissions `Files.ReadWrite.All`, `Sites.Read.All`, `User.Read`, `offline_access`. Until the publisher is verified, users in other organisations see an "unverified" consent screen and some tenants will require admin consent | Owner | Before a public release |
 | Q23 | Can Graph return the same item ID in two casings (as it does for drive IDs since June 2025)? `ItemId` compares exactly | Simulator and gate work | Before the M1 delta WP |
 | Q24 | Which tenants refuse `#` and `%` in names, and how the engine learns it (`hash_and_percent_allowed`) | Lead, in the M1 upload WP | M1 |
 | Q25 | A path can grow past the protocol's 4,096-byte cap (renaming a parent to a longer name). The VFS must refuse creates and renames that would exceed OneDrive's own path limit, and mount points long enough to make that possible must be refused | Lead, in the M2 VFS WP | M2 |
@@ -57,7 +57,7 @@ The owner should know these were choices, not findings.
 | Q39 | Journeys J01 and J14 are M2 journeys (they need the mounted folder), so M1 needs acceptance criteria of its own for sign-in, mirroring and single-file transfer | Lead, when writing the M1 acceptance WP (044) | M1 wave 12 |
 | Q40 | J05 says a held mass-delete pauses the mount; F12 keeps the mount active. To reconcile in M2 | Lead | M2 |
 | Q41 | ADR-0003 R6 says library crates do not depend on `anyhow`. `mydrive-daemon` now has a library target beside its binary (so tests can run the daemon in-process) and the package depends on `anyhow`. Lead's ruling until an ADR says otherwise: `anyhow` may appear only in `main.rs`; the daemon's library target defines its errors with `thiserror` and has no `anyhow` type in any signature. The daemon package (WP-042) must carry this as a constraint with a test or check | Lead, when writing WP-042 | M1 wave 11 |
-| Q30 | Which redirect URIs the app registration allows: whether a loopback redirect to `127.0.0.1` rather than `localhost` is accepted (RFC 8252 recommends the literal address), and which redirect the headless flow uses (the native-client URI or a loopback one). The code takes both as parameters | With the app registration (Q22) | Before WP-011 |
+| Q30 | Partly answered: the registration allows `http://localhost` (any port) and the native-client URI. Still open, for gate G1 to test: whether a loopback redirect to `127.0.0.1` rather than `localhost` is accepted (RFC 8252 recommends the literal address), and which redirect the headless flow uses (the native-client URI or a loopback one). The code takes both as parameters | With the app registration (Q22) | Before WP-011 |
 
 ## Detail questions in the flows and journeys
 
