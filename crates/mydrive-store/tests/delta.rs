@@ -589,7 +589,10 @@ fn staged_rows_belong_to_the_run_in_progress_by_a_foreign_key() {
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
     let refused = |sql: &str| {
         let err = conn.execute_batch(sql).unwrap_err().to_string();
-        assert!(err.contains("FOREIGN KEY constraint failed"), "{sql}: {err}");
+        assert!(
+            err.contains("FOREIGN KEY constraint failed"),
+            "{sql}: {err}"
+        );
     };
     let m = mount_id();
     let m = m.as_str();

@@ -475,11 +475,7 @@ pub(crate) fn remove_mount(
     }
 
     let dirty: i64 = c
-        .query_row(
-            DIRTY_COUNT_SQL,
-            [drive],
-            |row| row.get(0),
-        )
+        .query_row(DIRTY_COUNT_SQL, [drive], |row| row.get(0))
         .ctx(|| format!("count the dirty items of mount {mount_id}"))?;
     let dirty = u64::try_from(dirty).unwrap_or(0);
     match local_only {

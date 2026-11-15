@@ -319,6 +319,7 @@ fn expected_schema() -> BTreeMap<String, Columns> {
             "delta_staged".to_owned(),
             cols(&[
                 ("mount_id", "TEXT", true, 1),
+                ("run", "TEXT", true, 0),
                 ("item_id", "TEXT", true, 2),
                 ("seq", "INTEGER", true, 0),
                 ("deleted", "INTEGER", true, 0),
