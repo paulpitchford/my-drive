@@ -67,7 +67,7 @@ routes and its part of the `GraphSim` control API.
 
 | Feature | Document | Source file |
 |---|---|---|
-| Server and auth: the two origins, bearer tokens, error bodies | [`docs/server.md`](docs/server.md) | `src/server.rs`, `src/auth.rs` |
+| Server and auth: the three origins, bearer tokens, error bodies | [`docs/server.md`](docs/server.md) | `src/server.rs`, `src/auth.rs` |
 | Identity, the fake authority and discovery: accounts, tenants, sign-in, `/me`, sharing links, sites, blocked and read-only libraries | [`docs/identity.md`](docs/identity.md) | `src/identity.rs`, `src/authority.rs`, `src/discovery.rs` |
 | Drives and items: drive and item JSON, IDs, eTags, get-item and list-children | [`docs/items.md`](docs/items.md) | `src/items.rs` |
 | Delta: token-less enumeration, tokens, repeats, deletes | [`docs/delta.md`](docs/delta.md) | `src/delta.rs` |

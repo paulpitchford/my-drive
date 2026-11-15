@@ -834,6 +834,113 @@ mod identity_tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// RFC 7636 4.3: a challenge sent without `code_challenge_method` is `plain`. The code
+    /// is issued, the verifier equal to the challenge redeems it, and the verifier whose
+    /// S256 hash is the challenge does not.
+    #[tokio::test]
+    async fn challenge_without_method_is_plain() {
+        let (sim, _) = work_sim().await;
+        let plain = "plain-verifier-0123456789-0123456789-0123456";
+        let no_method = |challenge: &str| {
+            format!(
+                "{}oauth2/v2.0/authorize?{}",
+                sim.authority_url(),
+                form(&[
+                    ("client_id", CLIENT_ID),
+                    ("response_type", "code"),
+                    ("redirect_uri", REDIRECT),
+                    ("scope", SCOPES),
+                    ("state", "state-1"),
+                    ("code_challenge", challenge),
+                ])
+            )
+        };
+        let code_for = |url: String| async move {
+            let response = client().get(url).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND);
+            let location = response.headers()[LOCATION].to_str().unwrap().to_owned();
+            assert_eq!(param(&location, "error"), None, "{location}");
+            param(&location, "code").unwrap()
+        };
+
+        let c = code_for(no_method(plain)).await;
+        let (status, body) = redeem(&sim, &c, plain).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let c = code_for(no_method(&challenge(VERIFIER))).await;
+        let (status, body) = redeem(&sim, &c, VERIFIER).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "not compared as S256");
+        assert_eq!(body["error"], "invalid_grant");
+    }
+
+    /// Every byte of `text` as `%XX`.
+    fn encode_all(text: &str) -> String {
+        text.bytes().map(|b| format!("%{b:02X}")).collect()
+    }
+
+    /// AC7: an issued secret sent percent-encoded in a query value, a path segment or an
+    /// `Authorization` header is masked after decoding; neither the secret nor any of its
+    /// escaped forms reaches the log.
+    #[tokio::test]
+    async fn ac7_percent_encoded_secrets_are_masked() {
+        let (sim, _) = work_sim().await;
+        let c = code(&sim).await;
+        let (_, body) = redeem(&sim, &c, VERIFIER).await;
+        let access = body["access_token"].as_str().unwrap().to_owned();
+        let refresh_token = body["refresh_token"].as_str().unwrap().to_owned();
+        let (label, secret) = access.split_at(access.find('.').unwrap() + 1);
+        let dot_escaped = access.replace('.', "%2E");
+        let all_escaped = encode_all(&refresh_token);
+        sim.clear_requests();
+
+        graph_get(
+            &sim,
+            &format!("/me?leak={dot_escaped}&all={all_escaped}"),
+            &access,
+        )
+        .await;
+        graph_get(&sim, &format!("/nowhere/{all_escaped}/x"), &access).await;
+        let header = client()
+            .get(format!("{}/me", sim.base_url()))
+            .header(AUTHORIZATION, format!("Bearer {dot_escaped}"))
+            .send()
+            .await
+            .unwrap();
+        drop(header);
+
+        let log = sim.requests();
+        assert_eq!(log.len(), 3, "{log:?}");
+        let rt_label = &refresh_token[..=refresh_token.find('.').unwrap()];
+        assert_eq!(
+            log[0].query.as_deref(),
+            Some(format!("leak={label}<redacted>&all={rt_label}<redacted>").as_str()),
+            "query values"
+        );
+        assert!(
+            log[1]
+                .path
+                .ends_with(&format!("/nowhere/{rt_label}<redacted>/x")),
+            "path segment: {}",
+            log[1].path
+        );
+        assert_eq!(
+            log[2].header("authorization"),
+            Some(format!("Bearer {label}<redacted>").as_str()),
+            "authorization header"
+        );
+        let text = log_text(&sim);
+        let rt_secret = &refresh_token[rt_label.len()..];
+        for leaked in [
+            secret.to_owned(),
+            rt_secret.to_owned(),
+            encode_all(secret),
+            encode_all(rt_secret),
+            dot_escaped.clone(),
+        ] {
+            assert!(!text.contains(&leaked), "{leaked} is in the log: {text}");
+        }
+    }
+
     /// RFC 6749 4.1.2: a code presented a second time is refused and, by default, every
     /// token issued from its first redemption (and refreshes of it) is revoked. Under
     /// `RefuseOnly` they keep working.

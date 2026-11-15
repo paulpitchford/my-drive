@@ -168,6 +168,13 @@ nothing else that the log records.
   keeps `<prefix><instance>-<n>.` and writes `<redacted>` for the secret part. The label
   tells tokens apart (for example "the rolled token was sent") and is not secret. On the
   Graph origin, `authorization: Bearer sim-at-5000-3.<redacted>` is logged.
+- **Percent-encoded secrets.** Each path segment, query parameter name and value, and
+  header value is searched after decoding `%XX` (and `+` in the query), because a client
+  may escape any character of a secret, the `.` included. A component in which decoding
+  reveals a secret is logged decoded, with the secret masked: masking the raw form could
+  leave escaped characters of the secret part behind. Every other component is logged
+  exactly as sent. Decoding is done once, as a server does; a doubly encoded secret is
+  not one the simulator would accept and is not looked for.
 - **ID tokens.** Anything shaped like a JWT (`eyJ...` with two dots) is replaced whole with
   `<redacted>`.
 - **Authority origin only.** The `authorization` header is logged as `<scheme> <redacted>`
@@ -178,6 +185,12 @@ nothing else that the log records.
 - **Bodies are never logged.** The token request's form (code, verifier, refresh token) and
   token responses therefore never reach the log. Neither do redirect `Location` headers,
   which carry the code.
+- **A verifier anywhere but the form body is logged.** A PKCE verifier is a random string
+  the client makes up, with no shape the log can recognise. Sent where it belongs, in the
+  token request's form body, it is never logged. Sent anywhere else, it is logged as sent:
+  in a header, in the path, in a query on the Graph or download origin, or in an authority
+  query under a parameter name other than `code_verifier`. Only the authority's
+  `code_verifier` query parameter is masked, by name.
 - **Not masked.** The fixed per-instance token (`sim-token-<port>`) and tokens added with
   `add_token` are logged in full as before, because existing tests compare them. So are
   `state` and `code_challenge` in the authorise query: neither is a credential, and a test

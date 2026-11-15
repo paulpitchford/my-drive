@@ -43,15 +43,17 @@ pub struct LoggedRequest {
     /// The HTTP method, for example `GET`.
     pub method: String,
     /// The path, without the query string, exactly as sent (still percent-encoded), except
-    /// that a secret the fake authority issued is masked.
+    /// that a secret the fake authority issued is masked. Secrets are looked for after
+    /// percent-decoding; a segment that holds one is logged decoded, with it masked.
     pub path: String,
     /// The query string without the leading `?`, if there was one, with the same masking
-    /// as the headers; on the authority's origin the values of the parameters in
-    /// [`MASKED_AUTHORITY_PARAMS`] are masked too.
+    /// as the path, applied to each name and value; on the authority's origin the values
+    /// of the parameters in [`MASKED_AUTHORITY_PARAMS`] are masked too.
     pub query: Option<String>,
     /// The headers named in [`LOGGED_HEADERS`] that were present, as (lowercase name,
     /// value). A value that is not visible ASCII is recorded as `<non-ascii>`. A secret
-    /// the fake authority issued is masked (see [`REDACTED`]), and on the authority's
+    /// the fake authority issued is masked (see [`REDACTED`]), looked for after
+    /// percent-decoding as in the path, and on the authority's
     /// origin the `authorization` value is masked whatever it holds.
     pub headers: Vec<(String, String)>,
     /// The status the simulator answered with, including a scripted fault's status.
@@ -163,20 +165,12 @@ pub(crate) fn mask_issued(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// A header value as the log records it.
-fn logged_header(origin: Origin, name: &str, value: &str) -> String {
-    if origin == Origin::Authority && name == "authorization" {
-        return match value.split_once(' ') {
-            Some((scheme, _)) => format!("{scheme} {REDACTED}"),
-            None => REDACTED.to_owned(),
-        };
+/// Decodes `%XX` escapes in `raw` (and `+` as a space when `plus_is_space`). A `%` not
+/// followed by two hex digits is kept as it is; bytes that are not UTF-8 become U+FFFD.
+fn percent_decode(raw: &str, plus_is_space: bool) -> Cow<'_, str> {
+    if !raw.contains('%') && !(plus_is_space && raw.contains('+')) {
+        return Cow::Borrowed(raw);
     }
-    mask_issued(value).into_owned()
-}
-
-/// Whether a raw (still percent-encoded) query parameter name is one whose value the
-/// authority's log masks: compared after decoding `%XX` and `+`, without regard to case.
-fn is_masked_param(raw: &str) -> bool {
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -195,7 +189,7 @@ fn is_masked_param(raw: &str) -> bool {
                     i += 1;
                 }
             },
-            b'+' => {
+            b'+' if plus_is_space => {
                 decoded.push(b' ');
                 i += 1;
             }
@@ -205,23 +199,67 @@ fn is_masked_param(raw: &str) -> bool {
             }
         }
     }
-    let name = String::from_utf8_lossy(&decoded);
+    Cow::Owned(String::from_utf8_lossy(&decoded).into_owned())
+}
+
+/// Masks issued secrets in one still-encoded component (a path segment, a query name or
+/// value, a header value), looking at it after percent-decoding: a client may escape any
+/// character of a secret, and a server decodes before it reads the value. If the decoded
+/// form holds a secret, the component is logged decoded and masked, because masking the
+/// raw form could leave escaped characters of the secret part behind. Otherwise the
+/// component is logged exactly as sent.
+fn mask_component(raw: &str, plus_is_space: bool) -> Cow<'_, str> {
+    let decoded = percent_decode(raw, plus_is_space);
+    if let Cow::Owned(masked) = mask_issued(&decoded) {
+        return Cow::Owned(masked);
+    }
+    Cow::Borrowed(raw)
+}
+
+/// A header value as the log records it.
+fn logged_header(origin: Origin, name: &str, value: &str) -> String {
+    if origin == Origin::Authority && name == "authorization" {
+        return match value.split_once(' ') {
+            Some((scheme, _)) => format!("{scheme} {REDACTED}"),
+            None => REDACTED.to_owned(),
+        };
+    }
+    mask_component(value, false).into_owned()
+}
+
+/// A path as the log records it: each segment masked after percent-decoding.
+fn logged_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| mask_component(segment, false))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Whether a raw (still percent-encoded) query parameter name is one whose value the
+/// authority's log masks: compared after decoding `%XX` and `+`, without regard to case.
+fn is_masked_param(raw: &str) -> bool {
+    let name = percent_decode(raw, true);
     MASKED_AUTHORITY_PARAMS
         .iter()
         .any(|masked| name.eq_ignore_ascii_case(masked))
 }
 
-/// A query string as the log records it.
+/// A query string as the log records it: each name and value masked after
+/// percent-decoding, and on the authority's origin the named parameters' values masked
+/// whatever they hold.
 fn logged_query(origin: Origin, query: &str) -> String {
-    let masked = mask_issued(query);
-    if origin != Origin::Authority {
-        return masked.into_owned();
-    }
-    masked
+    query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((name, _)) if is_masked_param(name) => format!("{name}={REDACTED}"),
-            _ => pair.to_owned(),
+            Some((name, _)) if origin == Origin::Authority && is_masked_param(name) => {
+                format!("{name}={REDACTED}")
+            }
+            Some((name, value)) => format!(
+                "{}={}",
+                mask_component(name, true),
+                mask_component(value, true)
+            ),
+            None => mask_component(pair, true).into_owned(),
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -233,7 +271,7 @@ pub(crate) async fn log_request(
     next: Next,
 ) -> Response {
     let method = req.method().to_string();
-    let path = mask_issued(req.uri().path()).into_owned();
+    let path = logged_path(req.uri().path());
     let query = req.uri().query().map(|q| logged_query(origin, q));
     let headers = LOGGED_HEADERS
         .iter()
@@ -329,6 +367,52 @@ mod tests {
         assert_eq!(
             logged_header(Origin::Graph, "authorization", "Bearer sim-token-1"),
             "Bearer sim-token-1"
+        );
+    }
+
+    /// AC7: an issued secret is masked after percent-decoding, in a query name or value, a
+    /// path segment and a header value, however much of it is escaped.
+    #[test]
+    fn masks_percent_encoded_issued_secrets() {
+        // `.` escaped, so the raw form has no token shape.
+        assert_eq!(
+            logged_query(Origin::Graph, "leak=sim-at-1-2%2ESecretPart&x=1"),
+            "leak=sim-at-1-2.<redacted>&x=1"
+        );
+        // Only the secret part escaped: raw masking would keep `%53ecret`.
+        assert_eq!(
+            logged_query(Origin::Graph, "leak=sim-rt-1-2.Ab%53ecret"),
+            "leak=sim-rt-1-2.<redacted>"
+        );
+        // Every byte escaped, in a parameter name too.
+        assert_eq!(
+            logged_query(Origin::Graph, "%73%69%6D-code-1-2.%41%42=v"),
+            "sim-code-1-2.<redacted>=v"
+        );
+        assert_eq!(
+            logged_query(Origin::Authority, "x=sim-at-1-2%2ESecret&state=s"),
+            "x=sim-at-1-2.<redacted>&state=s"
+        );
+        assert_eq!(
+            logged_path("/drives/sim-rt-1-2%2ESecret/items/a%20b"),
+            "/drives/sim-rt-1-2.<redacted>/items/a%20b",
+            "only the segment holding a secret is decoded"
+        );
+        assert_eq!(logged_path("/a/eyJhbGc%2EeyJzdWIi%2Esig"), "/a/<redacted>");
+        assert_eq!(
+            logged_header(Origin::Graph, "authorization", "Bearer sim-at-1-2%2ESecret"),
+            "Bearer sim-at-1-2.<redacted>"
+        );
+        assert_eq!(
+            logged_header(Origin::Graph, "if-match", "sim-at-1-2.Sec%72et"),
+            "sim-at-1-2.<redacted>"
+        );
+        // Encoded text without a secret is logged exactly as sent.
+        assert_eq!(logged_path("/items/a%20b%zz"), "/items/a%20b%zz");
+        assert_eq!(logged_query(Origin::Graph, "q=a+b%26c"), "q=a+b%26c");
+        assert_eq!(
+            logged_header(Origin::Graph, "authorization", "Bearer sim%2Dtoken-1"),
+            "Bearer sim%2Dtoken-1"
         );
     }
 }
