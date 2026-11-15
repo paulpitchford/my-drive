@@ -14,10 +14,13 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+# For the socket server and client (WP-041); added by WP-014.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true

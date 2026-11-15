@@ -5,6 +5,8 @@
 //! documentation's examples. The clock never reads wall-clock time, so a test's responses
 //! are the same on every run; tests move it with `GraphSim::advance_clock`.
 
+use crate::GraphSim;
+
 /// Seconds since the Unix epoch at which every simulator's clock starts:
 /// 2026-01-01T00:00:00Z.
 pub(crate) const START_SECS: i64 = 1_767_225_600;
@@ -36,6 +38,14 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     (year, month, day)
+}
+
+impl GraphSim {
+    /// Moves the simulator's clock forward. Timestamps are whole seconds and the clock
+    /// starts at 2026-01-01T00:00:00Z; it never reads the wall clock.
+    pub fn advance_clock(&self, secs: u32) {
+        self.shared.lock().clock += i64::from(secs);
+    }
 }
 
 #[cfg(test)]

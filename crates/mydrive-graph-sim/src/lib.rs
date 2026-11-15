@@ -30,20 +30,30 @@
 
 #![forbid(unsafe_code)]
 
+// Each feature lives in its own file: its routes, its handlers and its `impl GraphSim`
+// block of the control API. `server` composes the routers (WP-014).
+mod auth;
+mod authority;
 mod conn;
+mod content;
+mod delta;
+mod discovery;
 mod error;
 mod fault;
+mod identity;
+mod items;
 mod json;
 mod log;
 mod model;
 mod server;
+mod session;
+mod throttle;
 mod time;
+mod write;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use axum::body::Bytes;
-use mydrive_core::ids::{DriveId, ItemId};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -154,189 +164,5 @@ impl GraphSim {
     #[must_use]
     pub fn graph_addr(&self) -> SocketAddr {
         self.graph_addr
-    }
-
-    /// A bearer token this simulator accepts, unique to it.
-    #[must_use]
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
-    /// Makes another bearer token valid.
-    pub fn add_token(&self, token: impl Into<String>) {
-        self.shared.lock().tokens.insert(token.into());
-    }
-
-    /// Makes a bearer token invalid; later requests carrying it get 401.
-    pub fn revoke_token(&self, token: &str) {
-        self.shared.lock().tokens.remove(token);
-    }
-
-    /// Adds a drive with the default options and returns its ID.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::Id`] only if the simulator builds an invalid ID, which is a bug.
-    pub fn add_drive(&self, drive_type: DriveType) -> Result<DriveId, SimError> {
-        self.add_drive_with(drive_type, DriveOptions::default())
-    }
-
-    /// Adds a drive with the given options and returns its ID.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::Id`] only if the simulator builds an invalid ID, which is a bug.
-    pub fn add_drive_with(
-        &self,
-        drive_type: DriveType,
-        options: DriveOptions,
-    ) -> Result<DriveId, SimError> {
-        self.shared.lock().add_drive(drive_type, options)
-    }
-
-    /// The drive's current options.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::UnknownDrive`] if the drive does not exist.
-    pub fn options(&self, drive: &DriveId) -> Result<DriveOptions, SimError> {
-        Ok(self.shared.lock().drive(drive)?.options.clone())
-    }
-
-    /// Replaces the drive's options. Takes effect from the next request.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::UnknownDrive`] if the drive does not exist.
-    pub fn set_options(&self, drive: &DriveId, options: DriveOptions) -> Result<(), SimError> {
-        self.shared.lock().drive_mut(drive)?.options = options;
-        Ok(())
-    }
-
-    /// The ID of the drive's root folder.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::UnknownDrive`] if the drive does not exist.
-    pub fn root_id(&self, drive: &DriveId) -> Result<ItemId, SimError> {
-        Ok(self.shared.lock().drive(drive)?.root.clone())
-    }
-
-    /// Creates a folder in `parent`, as another device would.
-    ///
-    /// # Errors
-    ///
-    /// An unknown drive or parent, a parent that is a file, an empty name or one with `/`,
-    /// or a name a sibling already has without regard to case.
-    pub fn create_folder(
-        &self,
-        drive: &DriveId,
-        parent: &ItemId,
-        name: &str,
-    ) -> Result<ItemId, SimError> {
-        self.shared.lock().create_folder(drive, parent, name)
-    }
-
-    /// Creates a file with `content` in `parent`, as another device would.
-    ///
-    /// # Errors
-    ///
-    /// As for [`GraphSim::create_folder`].
-    pub fn create_file(
-        &self,
-        drive: &DriveId,
-        parent: &ItemId,
-        name: &str,
-        content: impl Into<Bytes>,
-    ) -> Result<ItemId, SimError> {
-        self.shared
-            .lock()
-            .create_file(drive, parent, name, content.into())
-    }
-
-    /// Replaces a file's content: new size, quickXorHash, eTag, cTag and modification
-    /// time.
-    ///
-    /// # Errors
-    ///
-    /// An unknown drive or item, or an item that is a folder.
-    pub fn modify_file(
-        &self,
-        drive: &DriveId,
-        item: &ItemId,
-        content: impl Into<Bytes>,
-    ) -> Result<(), SimError> {
-        self.shared.lock().modify_file(drive, item, content.into())
-    }
-
-    /// Renames an item in place. Only the item itself appears in delta.
-    ///
-    /// # Errors
-    ///
-    /// An unknown drive or item, the root, or an unusable or clashing name.
-    pub fn rename(&self, drive: &DriveId, item: &ItemId, new_name: &str) -> Result<(), SimError> {
-        self.shared.lock().rename(drive, item, new_name)
-    }
-
-    /// Moves an item to another folder, keeping its name.
-    ///
-    /// # Errors
-    ///
-    /// An unknown drive, item or folder, the root, a destination that is a file or lies
-    /// inside the item, or a name clash in the destination.
-    pub fn move_item(
-        &self,
-        drive: &DriveId,
-        item: &ItemId,
-        new_parent: &ItemId,
-    ) -> Result<(), SimError> {
-        self.shared.lock().move_to(drive, item, new_parent)
-    }
-
-    /// Deletes an item and everything below it. The item appears in delta with the
-    /// `deleted` facet; its descendants follow it only under
-    /// [`FolderDeletes::EveryDescendant`].
-    ///
-    /// # Errors
-    ///
-    /// An unknown drive or item, or the root.
-    pub fn delete(&self, drive: &DriveId, item: &ItemId) -> Result<(), SimError> {
-        self.shared.lock().delete(drive, item)
-    }
-
-    /// Moves the simulator's clock forward. Timestamps are whole seconds and the clock
-    /// starts at 2026-01-01T00:00:00Z; it never reads the wall clock.
-    pub fn advance_clock(&self, secs: u32) {
-        self.shared.lock().clock += i64::from(secs);
-    }
-
-    /// Queues a fault. It applies to the next request that matches it, then is removed.
-    pub fn push_fault(&self, fault: Fault) {
-        self.shared.lock().faults.push_back(fault);
-    }
-
-    /// How many queued faults have not yet matched a request.
-    #[must_use]
-    pub fn pending_faults(&self) -> usize {
-        self.shared.lock().faults.len()
-    }
-
-    /// Removes every queued fault.
-    pub fn clear_faults(&self) {
-        self.shared.lock().faults.clear();
-    }
-
-    /// The requests received so far, in the order the responses were completed. Only the
-    /// newest [`MAX_LOGGED_REQUESTS`] are kept; older ones are dropped first. A long test
-    /// that asserts on the log should call [`GraphSim::clear_requests`] before the part
-    /// it checks.
-    #[must_use]
-    pub fn requests(&self) -> Vec<LoggedRequest> {
-        self.shared.lock().log.iter().cloned().collect()
-    }
-
-    /// Empties the request log.
-    pub fn clear_requests(&self) {
-        self.shared.lock().log.clear();
     }
 }

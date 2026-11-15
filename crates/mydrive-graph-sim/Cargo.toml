@@ -10,7 +10,10 @@ publish.workspace = true
 
 [dependencies]
 axum.workspace = true
+# base64 and serde are for the M1 simulator packages (WP-014).
+base64.workspace = true
 mydrive-core.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }

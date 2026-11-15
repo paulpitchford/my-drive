@@ -12,5 +12,13 @@ publish.workspace = true
 name = "mydrive"
 path = "src/main.rs"
 
+# Prepared by WP-014 so the M1 CLI work package does not edit this file. No direct
+# dependency on mydrive-core: the CLI depends on mydrive-ipc only (ADR-0004 R3).
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+mydrive-ipc.workspace = true
+serde_json.workspace = true
+
 [lints]
 workspace = true

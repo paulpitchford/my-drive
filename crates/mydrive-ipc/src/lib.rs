@@ -12,17 +12,19 @@
 //! - [`values`]: the open value sets (ADR-0019).
 //! - [`error`]: the error object and the stable error-code table.
 //! - [`path`]: absolute protocol paths.
+//! - [`server`] and [`client`]: the socket server and client (WP-041; empty until then).
 //!
 //! The written catalogue, with an example of every message, is `docs/protocol/README.md`.
-//! The socket server and client come later (M1). See `docs/architecture/overview.md` for what
-//! this crate owns and must not do.
+//! See `docs/architecture/overview.md` for what this crate owns and must not do.
 
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod codec;
 pub mod envelope;
 pub mod error;
 pub mod methods;
 pub mod paging;
 pub mod path;
+pub mod server;
 pub mod values;

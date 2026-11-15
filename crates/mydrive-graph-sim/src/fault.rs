@@ -1,8 +1,19 @@
 //! Scripted faults: the next request that matches gets a chosen failure (ADR-0017 R5).
+//!
+//! The fault types, the middleware that applies them on both origins and the control API
+//! that queues them. Documented in `docs/faults.md`.
 
 use std::time::Duration;
 
-use axum::http::{Method, StatusCode};
+use axum::body::{Body, to_bytes};
+use axum::extract::{ConnectInfo, Request, State as AxState};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::Response;
+
+use crate::GraphSim;
+use crate::conn::ConnTap;
+use crate::server::{Ctx, graph_error};
 
 /// One scripted fault. It applies to exactly one request, the first one after it was
 /// queued that matches, and is then removed from the queue.
@@ -129,6 +140,109 @@ impl Fault {
                 .path_contains
                 .as_deref()
                 .is_none_or(|fragment| path.contains(fragment))
+    }
+}
+
+// ---- middleware ------------------------------------------------------------------------
+
+pub(crate) async fn apply_fault(
+    AxState((shared, _)): AxState<Ctx>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let fault = shared.lock().take_fault(req.method(), req.uri().path());
+    let Some(fault) = fault else {
+        return next.run(req).await;
+    };
+    match fault.action {
+        FaultAction::Status {
+            status,
+            retry_after,
+            code,
+            location,
+        } => {
+            let code = code.as_deref().unwrap_or_else(|| default_code(status));
+            let mut response = graph_error(status, code, "Scripted fault.");
+            if let Some(secs) = retry_after {
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+            }
+            if let Some(location) = location {
+                match HeaderValue::from_str(&location) {
+                    Ok(value) => {
+                        response.headers_mut().insert(header::LOCATION, value);
+                    }
+                    Err(_) => {
+                        return graph_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "generalException",
+                            "The scripted fault's Location is not a valid header value.",
+                        );
+                    }
+                }
+            }
+            response
+        }
+        FaultAction::Delay(delay) => {
+            tokio::time::sleep(delay).await;
+            next.run(req).await
+        }
+        FaultAction::TruncateBody { keep_bytes } => {
+            let tap = req.extensions().get::<ConnectInfo<ConnTap>>().cloned();
+            let (parts, body) = next.run(req).await.into_parts();
+            let Ok(full) = to_bytes(body, usize::MAX).await else {
+                return graph_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "generalException",
+                    "The simulator could not buffer a body to truncate.",
+                );
+            };
+            // The head announces the whole length; the connection then lets only
+            // `keep_bytes` of the body through and closes (see `conn`). A body no longer
+            // than that is sent whole.
+            if keep_bytes < full.len()
+                && let Some(ConnectInfo(tap)) = tap
+            {
+                tap.truncate_next_response(keep_bytes);
+            }
+            Response::from_parts(parts, Body::from(full))
+        }
+    }
+}
+
+/// The Graph error code a scripted status fault carries.
+fn default_code(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "invalidRequest",
+        401 => "InvalidAuthenticationToken",
+        403 => "accessDenied",
+        404 => "itemNotFound",
+        409 => "nameAlreadyExists",
+        416 => "invalidRange",
+        429 => "activityLimitReached",
+        503 => "serviceNotAvailable",
+        _ => "generalException",
+    }
+}
+
+// ---- control API -----------------------------------------------------------------------
+
+impl GraphSim {
+    /// Queues a fault. It applies to the next request that matches it, then is removed.
+    pub fn push_fault(&self, fault: Fault) {
+        self.shared.lock().faults.push_back(fault);
+    }
+
+    /// How many queued faults have not yet matched a request.
+    #[must_use]
+    pub fn pending_faults(&self) -> usize {
+        self.shared.lock().faults.len()
+    }
+
+    /// Removes every queued fault.
+    pub fn clear_faults(&self) {
+        self.shared.lock().faults.clear();
     }
 }
 
