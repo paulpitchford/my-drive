@@ -17,7 +17,9 @@
 
 #![forbid(unsafe_code)]
 
+mod delta;
 mod error;
+mod mounts;
 mod ops;
 mod schema;
 mod types;
@@ -31,8 +33,12 @@ pub use crate::error::StoreError;
 pub use crate::ops::Queries;
 pub use crate::schema::{APPLICATION_ID, SCHEMA_VERSION};
 pub use crate::types::{
-    Account, ByteRange, DeleteMode, Item, ItemKind, Mount, MountPath, PendingChanges,
-    RemoteApplied, RemoteIdentity, RemoteMetadata, Timestamp, UploadCompleted,
+    Account, AccountState, BlockedReason, ByteRange, ChildrenPage, DIRTY_SAMPLE_LIMIT, DeleteMode,
+    DeltaRunKind, DriveType, Item, ItemKind, LocalId, LocalOnlyContent, Mount, MountAccess,
+    MountBlock, MountPath, MountPause, MountRemoved, MountRule, MountState, MountStateFacts,
+    PageLink, PendingChanges, ReadOnlyReason, RemoteApplied, RemoteIdentity, RemoteMetadata,
+    Staged, StagedChange, StagedCursor, StagedEntry, StagedFacet, StagedItem, StagedPage,
+    StagedProblem, Timestamp, UnstagedPage, UploadCompleted, derive_mount_state,
 };
 
 use crate::error::SqlContext;
@@ -183,6 +189,12 @@ mod tests {
         Account {
             account_id: AccountId::new(format!("acct-{n}")).unwrap(),
             tenant_id: None,
+            kind: mydrive_core::names::AccountKind::Personal,
+            username: None,
+            display_name: None,
+            org_name: None,
+            needs_sign_in: false,
+            refuses_hash_and_percent: false,
         }
     }
 

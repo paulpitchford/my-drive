@@ -7,7 +7,23 @@ mod common;
 use std::path::Path;
 
 use common::{Fixture, ROOT, file, key, kill_self, mount_id, raw, run_child_until_killed};
-use mydrive_store::{ByteRange, DeleteMode, PendingChanges, Queries, Store};
+use mydrive_store::{
+    ByteRange, DeleteMode, DeltaRunKind, PageLink, PendingChanges, Queries, Store,
+};
+
+/// The store with its mount in an initial delta run, so a batch can record a next link.
+fn open_running(fx: &Fixture) -> Store {
+    let store = fx.open_with_mount();
+    store
+        .begin_delta_run(&mount_id(), DeltaRunKind::Initial)
+        .unwrap();
+    store
+}
+
+/// The mount's recorded next link.
+fn next_link(store: &Store) -> Option<String> {
+    store.mount(&mount_id()).unwrap().unwrap().delta_next_link
+}
 
 /// Set in the child process of `ac2_killed_at_any_point_leaves_exactly_the_committed_state`:
 /// `<db path>|<kill point>`.
@@ -40,7 +56,8 @@ fn apply_items(tx: &impl Queries, prefix: &str, from: usize, to: usize) {
 
 fn apply_page(tx: &impl Queries, prefix: &str, token: &str) {
     apply_items(tx, prefix, 0, BATCH);
-    tx.set_delta_token(&mount_id(), Some(token)).unwrap();
+    tx.stage_delta_page(&mount_id(), &[], &PageLink::Next(token.to_owned()))
+        .unwrap();
 }
 
 fn count_prefix(store: &Store, prefix: &str) -> usize {
@@ -55,7 +72,7 @@ fn count_prefix(store: &Store, prefix: &str) -> usize {
 #[test]
 fn ac2_committed_batch_is_fully_visible_after_reopen() {
     let fx = Fixture::new();
-    let mut store = fx.open_with_mount();
+    let mut store = open_running(&fx);
     let tx = store.transaction().unwrap();
     apply_page(&tx, "c", "token-1");
     tx.commit().unwrap();
@@ -64,17 +81,16 @@ fn ac2_committed_batch_is_fully_visible_after_reopen() {
 
     let store = fx.open();
     assert_eq!(count_prefix(&store, "c"), BATCH);
-    assert_eq!(
-        store.delta_token(&mount_id()).unwrap().as_deref(),
-        Some("token-1")
-    );
+    assert_eq!(next_link(&store).as_deref(), Some("token-1"));
 }
 
 #[test]
 fn ac2_dropped_transaction_leaves_nothing() {
     let fx = Fixture::new();
-    let mut store = fx.open_with_mount();
-    store.set_delta_token(&mount_id(), Some("token-0")).unwrap();
+    let mut store = open_running(&fx);
+    store
+        .stage_delta_page(&mount_id(), &[], &PageLink::Next("token-0".to_owned()))
+        .unwrap();
     {
         let tx = store.transaction().unwrap();
         apply_page(&tx, "d", "token-1");
@@ -83,18 +99,12 @@ fn ac2_dropped_transaction_leaves_nothing() {
         // ...and dropped without commit.
     }
     assert_eq!(count_prefix(&store, "d"), 0);
-    assert_eq!(
-        store.delta_token(&mount_id()).unwrap().as_deref(),
-        Some("token-0")
-    );
+    assert_eq!(next_link(&store).as_deref(), Some("token-0"));
     drop(store);
 
     let store = fx.open();
     assert_eq!(count_prefix(&store, "d"), 0);
-    assert_eq!(
-        store.delta_token(&mount_id()).unwrap().as_deref(),
-        Some("token-0")
-    );
+    assert_eq!(next_link(&store).as_deref(), Some("token-0"));
 }
 
 #[test]
@@ -144,7 +154,7 @@ fn ac2_killed_at_any_point_leaves_exactly_the_committed_state() {
 
     for point in KILL_POINTS {
         let fx = Fixture::new();
-        drop(fx.open_with_mount());
+        drop(open_running(&fx));
         run_child_until_killed(
             "ac2_killed_at_any_point_leaves_exactly_the_committed_state",
             CHILD_ENV,
@@ -175,7 +185,7 @@ fn ac2_killed_at_any_point_leaves_exactly_the_committed_state() {
             "{point}"
         );
         assert_eq!(
-            store.delta_token(&mount_id()).unwrap().as_deref(),
+            next_link(&store).as_deref(),
             Some(if second_committed {
                 "token-second"
             } else {
@@ -407,7 +417,7 @@ fn crash_child(db: &Path, point: &str) -> ! {
         kill_self();
     }
     apply_items(&tx, "second", BATCH / 2, BATCH);
-    tx.set_delta_token(&mount_id(), Some("token-second"))
+    tx.stage_delta_page(&mount_id(), &[], &PageLink::Next("token-second".to_owned()))
         .unwrap();
     if point == "before-commit" {
         reached(point);
@@ -415,5 +425,197 @@ fn crash_child(db: &Path, point: &str) -> ! {
     }
     tx.commit().unwrap();
     reached(point);
+    kill_self();
+}
+
+/// Set in the child of `adr_0022_killed_anywhere_in_a_delta_run_leaves_it_in_progress_or_finished`.
+const RUN_CHILD_ENV: &str = "MYDRIVE_STORE_RUN_CRASH_CHILD";
+/// Entries per staged page; long names push the pages past SQLite's cache into the WAL.
+const RUN_PAGE: usize = 1500;
+
+const RUN_KILL_POINTS: [&str; 10] = [
+    "mid-page",
+    "after-page",
+    "mid-last-page",
+    "after-last-page",
+    "mid-apply",
+    "after-apply",
+    "mid-finish",
+    "after-finish",
+    "mid-remove",
+    "after-remove",
+];
+
+fn run_page(prefix: &str) -> Vec<mydrive_store::StagedEntry> {
+    let padding = "y".repeat(800);
+    (0..RUN_PAGE)
+        .map(|i| mydrive_store::StagedEntry {
+            item_id: mydrive_core::ids::ItemId::new(format!("{prefix}{i}")).unwrap(),
+            is_root: false,
+            change: mydrive_store::StagedChange::Present(mydrive_store::StagedItem {
+                parent_item_id: Some(mydrive_core::ids::ItemId::new(ROOT).unwrap()),
+                name: format!("{prefix}{i}{padding}"),
+                facet: mydrive_store::StagedFacet::File,
+                size: 7,
+                created: mydrive_store::Timestamp::from_unix_seconds(1),
+                modified: mydrive_store::Timestamp::from_unix_seconds(2),
+                etag: Some(format!("e-{prefix}{i}")),
+                ctag: None,
+                server_hash: None,
+            }),
+        })
+        .collect()
+}
+
+/// WP-017 AC6 and AC10: a process killed anywhere in a delta run (staging a page, the
+/// last page, applying the staged set, finishing the run) or in removing the mount
+/// afterwards leaves the run still in progress with its staged set intact, or the run
+/// finished, never anything between. The live token moves only with the finish
+/// (ADR-0022 R1, R4). After each kill the store passes `PRAGMA integrity_check` and
+/// `PRAGMA foreign_key_check`.
+#[test]
+fn adr_0022_killed_anywhere_in_a_delta_run_leaves_it_in_progress_or_finished() {
+    if let Ok(arg) = std::env::var(RUN_CHILD_ENV) {
+        let (db, point) = arg.split_once('|').unwrap();
+        run_crash_child(Path::new(db), point);
+    }
+
+    for point in RUN_KILL_POINTS {
+        let fx = Fixture::new();
+        drop(fx.open_with_mount());
+        run_child_until_killed(
+            "adr_0022_killed_anywhere_in_a_delta_run_leaves_it_in_progress_or_finished",
+            RUN_CHILD_ENV,
+            &format!("{}|{point}", fx.path().display()),
+        );
+        assert!(
+            fx.dir.path().join(format!("reached-{point}")).exists(),
+            "{point}: the child reached the kill point"
+        );
+        let conn = raw(&fx.path());
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(conn);
+        assert_eq!((integrity.as_str(), violations), ("ok", 0), "{point}");
+
+        let store = fx.open();
+        let applied = count_prefix(&store, "p");
+        let Some(m) = store.mount(&mount_id()).unwrap() else {
+            assert_eq!(point, "after-remove");
+            assert_eq!(store.item(&key(ROOT)).unwrap(), None);
+            assert_eq!(applied, 0);
+            continue;
+        };
+        let staged = store.staged_count(&mount_id()).unwrap();
+        let got = (
+            m.delta_token.as_deref(),
+            m.delta_run,
+            m.delta_next_link.as_deref(),
+            m.delta_staged_link.as_deref(),
+            staged,
+            applied,
+        );
+        let page = RUN_PAGE as u64;
+        let initial = Some(DeltaRunKind::Initial);
+        let expected = match point {
+            // The run began (its own commit), but no page committed.
+            "mid-page" => (None, initial, None, None, 0, 0),
+            "after-page" | "mid-last-page" => (None, initial, Some("next-1"), None, page, 0),
+            // The staged set is complete; the apply's transaction never committed.
+            "after-last-page" | "mid-apply" => (None, initial, None, Some("delta-1"), 2 * page, 0),
+            // Applied, not finished: still in progress, with the staged set intact.
+            "after-apply" | "mid-finish" => {
+                (None, initial, None, Some("delta-1"), 2 * page, 2 * RUN_PAGE)
+            }
+            "after-finish" | "mid-remove" => (Some("delta-1"), None, None, None, 0, 2 * RUN_PAGE),
+            other => panic!("{other}"),
+        };
+        assert_eq!(got, expected, "{point}");
+        if m.delta_staged_link.is_some() {
+            // The complete staged set walks in full after the restart.
+            let mut walked = 0;
+            let mut cursor = None;
+            loop {
+                let page = store
+                    .staged_entries(&mount_id(), cursor.as_ref(), common::limit(500))
+                    .unwrap();
+                walked += page.entries.len();
+                match page.next {
+                    Some(c) => cursor = Some(c),
+                    None => break,
+                }
+            }
+            assert_eq!(walked, 2 * RUN_PAGE, "{point}");
+        }
+    }
+}
+
+fn run_crash_child(db: &Path, point: &str) -> ! {
+    let reached = |p: &str| std::fs::write(db.with_file_name(format!("reached-{p}")), b"").unwrap();
+    let kill_at = |p: &str| {
+        if p == point {
+            reached(p);
+            kill_self();
+        }
+    };
+    let mut store = Store::open(db).unwrap();
+    let m = mount_id();
+    store.begin_delta_run(&m, DeltaRunKind::Initial).unwrap();
+
+    let tx = store.transaction().unwrap();
+    tx.stage_delta_page(&m, &run_page("p1-"), &PageLink::Next("next-1".to_owned()))
+        .unwrap();
+    kill_at("mid-page");
+    tx.commit().unwrap();
+    kill_at("after-page");
+
+    let tx = store.transaction().unwrap();
+    tx.stage_delta_page(&m, &run_page("p2-"), &PageLink::Delta("delta-1".to_owned()))
+        .unwrap();
+    kill_at("mid-last-page");
+    tx.commit().unwrap();
+    kill_at("after-last-page");
+
+    // Apply: walk the staged set and insert each item, in one transaction.
+    let tx = store.transaction().unwrap();
+    let mut cursor = None;
+    loop {
+        let page = tx
+            .staged_entries(&m, cursor.as_ref(), common::limit(400))
+            .unwrap();
+        for s in &page.entries {
+            if let mydrive_store::StagedChange::Present(it) = &s.entry.change {
+                let mut item = file(s.entry.item_id.as_str(), Some(ROOT), &it.name, it.size);
+                item.etag.clone_from(&it.etag);
+                tx.insert_item(&item).unwrap();
+            }
+        }
+        match page.next {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    kill_at("mid-apply");
+    tx.commit().unwrap();
+    kill_at("after-apply");
+
+    let tx = store.transaction().unwrap();
+    tx.finish_delta_run(&m).unwrap();
+    kill_at("mid-finish");
+    tx.commit().unwrap();
+    kill_at("after-finish");
+
+    let tx = store.transaction().unwrap();
+    tx.remove_mount(&m, mydrive_store::LocalOnlyContent::Refuse)
+        .unwrap();
+    kill_at("mid-remove");
+    tx.commit().unwrap();
+    reached("after-remove");
     kill_self();
 }
