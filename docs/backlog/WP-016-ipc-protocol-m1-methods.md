@@ -28,7 +28,8 @@ Types, parsing, the catalogue and its tests for:
   returns the drive's names and type, the item count if known, whether it is read-only, the
   proposed mount point, and a confirmation token. `mount.add.confirm`: the token and an
   optional mount point. `mount.remove`.
-- `sync.pause` (all mounts or one; optional duration) and `sync.resume`.
+- `mount.pause` (all mounts or one; optional duration) and `mount.resume`. (ADR-0009 has no
+  `sync.*` group.)
 - `item.import` (copy a local file into a folder of a mount, as a new file or replacing one)
   and `item.export` (copy a hydrated file out to a path), advertised by a capability string
   in `hello` so they can be withdrawn later.
@@ -57,7 +58,19 @@ Types, parsing, the catalogue and its tests for:
   when used with a different target or twice.
 - AC7: `mount.remove` and `account.logout` results state how many files have unsynced
   changes, so a client can warn before confirming; neither has a parameter that could delete
-  remote content.
+  remote content. Lead's ruling, 2026-11-15, after review: a client-side warning alone does
+  not meet F12 step 11. `mount.remove` on a mount with unsynced changes is refused (`refused`,
+  reason `unsynced-changes`, with the count and a bounded sample of paths) unless the request
+  carries `keep_unsynced: true`, by which the user confirms those files will stay only on
+  this computer. The default is to refuse. `dry_run` never refuses.
+- AC6 addendum (same ruling): a token is used up only when the mount has been added. A
+  `mount.add.confirm` that fails with `offline`, `needs-sign-in` or a `refused` the user can
+  correct (for example `mount-point-not-empty`) leaves the token valid until it expires.
+- Pausing (same ruling): a call naming one mount replaces that mount's pause; a call for all
+  mounts never shortens or ends an existing pause (an indefinite pause stays indefinite, a
+  later end time is kept). `paused_mounts` is the number of mounts paused when the call
+  returns. A duration over the limit is refused with `invalid-params`, never read as
+  indefinite.
 - AC8: Paths given to `item.import` and `item.export` for the local side are absolute and
   canonical by the same rule as protocol paths; a relative or non-canonical one is
   `invalid-params`.

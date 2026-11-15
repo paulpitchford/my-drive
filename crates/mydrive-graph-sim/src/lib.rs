@@ -81,6 +81,7 @@ pub use model::{
     DeltaRepeats, DownloadMode, DriveOptions, DriveType, FolderDeletes, MAX_LOGGED_REQUESTS,
     RangeMode,
 };
+pub use write::{ConflictBehavior, ReplaceStatus, RewriteMode};
 
 use conn::{ConnTap, TapListener};
 use identity::Directory;

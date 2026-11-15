@@ -11,6 +11,7 @@ use crate::error::SimError;
 use crate::fault::Fault;
 use crate::log::LoggedRequest;
 use crate::time::START_SECS;
+use crate::write::{ConflictBehavior, ReplaceStatus, RewriteMode};
 
 /// The kind of drive, as Graph's `driveType` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,7 +124,45 @@ pub struct DriveOptions {
     /// Whether zero-byte files report a quickXorHash. Unverified; default `false`, the
     /// harder case.
     pub hash_empty_files: bool,
+    /// Whether a simple `PUT .../content` that replaces an existing file checks
+    /// `If-Match`. Unverified (F04 question 3); default `false`, the harder case: a stale
+    /// eTag does not stop the replace.
+    pub simple_replace_honours_if_match: bool,
+    /// Whether a rename or move sets the item's `lastModifiedDateTime` to the time of the
+    /// change, through HTTP and the control API alike. Unverified; default `false`, which
+    /// keeps the behaviour the simulator had before writes existed (see `docs/write.md`).
+    pub rename_sets_modified: bool,
+    /// The drive's storage quota in bytes. A write that would take the total size of the
+    /// drive's live files above it answers `507` and stores nothing. Default 1 TiB, the
+    /// `quota.total` the drive resource reports.
+    pub quota_bytes: u64,
+    /// The largest body a simple `PUT .../content` accepts; a larger one answers `413` and
+    /// stores nothing. Default 250,000,000 bytes: the documented "250 MB", read as the
+    /// smaller decimal value (harder). What Graph answers above it is unverified.
+    pub simple_upload_max_bytes: u64,
+    /// When a SharePoint library rewrites an uploaded file whose extension is in
+    /// [`DriveOptions::rewrite_extensions`]. Applies to `documentLibrary` drives only.
+    /// Timing unverified; default [`RewriteMode::Later`], the harder case.
+    pub rewrite: RewriteMode,
+    /// Lower-case extensions, without the dot, of the files a library rewrites after
+    /// upload. Default: the Office formats rclone reports, and eml, msg and TIFF, which
+    /// abraunegg reports (ADR-0012 context).
+    pub rewrite_extensions: Vec<String>,
+    /// What create folder does with an existing name when the request names no
+    /// `@microsoft.graph.conflictBehavior`. Undocumented; default
+    /// [`ConflictBehavior::Rename`], the harder case: the folder is created under another
+    /// name without an error.
+    pub folder_conflict_default: ConflictBehavior,
+    /// The status a successful upload that replaced an existing file answers. Unverified;
+    /// default [`ReplaceStatus::Created`], what driveitem-put-content's update example
+    /// shows and the harder case for a client that reads `201` as "a new item".
+    pub replace_status: ReplaceStatus,
 }
+
+/// The extensions [`DriveOptions::rewrite_extensions`] holds by default.
+const DEFAULT_REWRITE_EXTENSIONS: &[&str] = &[
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "eml", "msg", "tif", "tiff",
+];
 
 impl Default for DriveOptions {
     fn default() -> Self {
@@ -138,8 +177,27 @@ impl Default for DriveOptions {
             personal_folder_ctag: false,
             content_etag_header: false,
             hash_empty_files: false,
+            simple_replace_honours_if_match: false,
+            rename_sets_modified: false,
+            quota_bytes: 1 << 40,
+            simple_upload_max_bytes: 250_000_000,
+            rewrite: RewriteMode::Later,
+            rewrite_extensions: DEFAULT_REWRITE_EXTENSIONS
+                .iter()
+                .map(|ext| (*ext).to_owned())
+                .collect(),
+            folder_conflict_default: ConflictBehavior::Rename,
+            replace_status: ReplaceStatus::Created,
         }
     }
+}
+
+/// Times a client supplies in `fileSystemInfo`, as whole seconds since the Unix epoch.
+/// `None` leaves the service's choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FileTimes {
+    pub(crate) created: Option<i64>,
+    pub(crate) modified: Option<i64>,
 }
 
 /// Folder or file, and a file's content.
@@ -225,6 +283,8 @@ pub(crate) struct Drive {
     changes: Vec<(u64, ItemId)>,
     seq: u64,
     next_item: u64,
+    /// Items a test has locked (`GraphSim::set_locked`); writes to them answer `423`.
+    locked: HashSet<ItemId>,
     /// Sibling entries looked at by name checks and children pages, for tests that bound
     /// the cost of large folders without timing anything.
     #[cfg(test)]
@@ -273,10 +333,11 @@ impl Drive {
             changes: Vec::new(),
             seq: 0,
             next_item: 0,
+            locked: HashSet::new(),
             #[cfg(test)]
             visits: std::cell::Cell::new(0),
         };
-        drive.root = drive.insert(None, "root".to_owned(), ItemKind::Folder, now)?;
+        drive.root = drive.insert(None, "root".to_owned(), ItemKind::Folder, now, now)?;
         Ok(drive)
     }
 
@@ -301,7 +362,8 @@ impl Drive {
         parent: Option<ItemId>,
         name: String,
         kind: ItemKind,
-        now: i64,
+        created: i64,
+        modified: i64,
     ) -> Result<ItemId, SimError> {
         let (id, guid) = self.new_item_id()?;
         let size = match &kind {
@@ -313,8 +375,8 @@ impl Drive {
             name,
             parent: parent.clone(),
             kind,
-            created: now,
-            modified: now,
+            created,
+            modified,
             size,
             etag_version: 1,
             ctag_version: 1,
@@ -487,12 +549,77 @@ impl Drive {
         kind: ItemKind,
         now: i64,
     ) -> Result<ItemId, SimError> {
-        self.live_folder(parent)?;
-        self.check_name(parent, name, None)?;
-        self.insert(Some(parent.clone()), name.to_owned(), kind, now)
+        self.create_with_times(parent, name, kind, now, FileTimes::default())
     }
 
-    fn file_kind(content: Bytes) -> ItemKind {
+    /// Creates an item, taking its times from `times` where given and `now` otherwise.
+    /// Checks everything before changing anything.
+    pub(crate) fn create_with_times(
+        &mut self,
+        parent: &ItemId,
+        name: &str,
+        kind: ItemKind,
+        now: i64,
+        times: FileTimes,
+    ) -> Result<ItemId, SimError> {
+        self.live_folder(parent)?;
+        self.check_name(parent, name, None)?;
+        self.insert(
+            Some(parent.clone()),
+            name.to_owned(),
+            kind,
+            times.created.unwrap_or(now),
+            times.modified.unwrap_or(now),
+        )
+    }
+
+    /// The live child of `folder` named `name` without regard to case, if any.
+    pub(crate) fn child_named(&self, folder: &ItemId, name: &str) -> Option<&ItemId> {
+        self.visit(1);
+        self.children
+            .get(folder)
+            .and_then(|children| children.get(&fold(name)))
+    }
+
+    /// The total size of the drive's live files: what counts against the quota.
+    pub(crate) fn used_bytes(&self) -> u64 {
+        self.items.get(&self.root).map_or(0, |root| root.size)
+    }
+
+    /// Whether `id` or anything below it is locked.
+    pub(crate) fn locked_within(&self, id: &ItemId) -> bool {
+        if self.locked.is_empty() {
+            return false;
+        }
+        let mut queue = VecDeque::from([id.clone()]);
+        while let Some(current) = queue.pop_front() {
+            if self.locked.contains(&current) {
+                return true;
+            }
+            if let Some(children) = self.children.get(&current) {
+                queue.extend(children.values().cloned());
+            }
+        }
+        false
+    }
+
+    /// Whether `id` itself is locked.
+    pub(crate) fn is_locked(&self, id: &ItemId) -> bool {
+        self.locked.contains(id)
+    }
+
+    /// Locks or unlocks a live item.
+    pub(crate) fn set_locked(&mut self, id: &ItemId, locked: bool) -> Result<(), SimError> {
+        self.live(id)?;
+        if locked {
+            self.locked.insert(id.clone());
+        } else {
+            self.locked.remove(id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn file_kind(content: Bytes) -> ItemKind {
         let mut hasher = QuickXorHasher::new();
         hasher.update(&content);
         ItemKind::File {
@@ -512,6 +639,19 @@ impl Drive {
     }
 
     fn modify_file(&mut self, id: &ItemId, content: Bytes, now: i64) -> Result<(), SimError> {
+        self.replace_content(id, content, now, FileTimes::default())
+    }
+
+    /// Replaces a file's content as one change: new size, hash, eTag and cTag, and the
+    /// modification time from `times` or else `now` (the fileSystemInfo resource: without
+    /// a supplied value "lastModifiedDateTime automatically resets to the current time").
+    pub(crate) fn replace_content(
+        &mut self,
+        id: &ItemId,
+        content: Bytes,
+        now: i64,
+        times: FileTimes,
+    ) -> Result<(), SimError> {
         let item = self.live(id)?;
         if item.is_folder() {
             return Err(SimError::NotAFile {
@@ -525,7 +665,10 @@ impl Drive {
         if let Some(item) = self.items.get_mut(id) {
             item.kind = kind;
             item.size = new_size;
-            item.modified = now;
+            item.modified = times.modified.unwrap_or(now);
+            if let Some(created) = times.created {
+                item.created = created;
+            }
             item.etag_version += 1;
             item.ctag_version += 1;
         }
@@ -537,59 +680,110 @@ impl Drive {
         Ok(())
     }
 
-    fn rename(&mut self, id: &ItemId, name: &str) -> Result<(), SimError> {
-        self.not_root(id)?;
-        let parent = self.live(id)?.parent.clone();
-        let old_key = fold(&self.live(id)?.name);
-        if let Some(parent) = &parent {
-            self.check_name(parent, name, Some(id))?;
-            if let Some(siblings) = self.children.get_mut(parent) {
-                siblings.remove(&old_key);
-                siblings.insert(fold(name), id.clone());
-            }
-        }
-        if let Some(item) = self.items.get_mut(id) {
-            item.name = name.to_owned();
-            item.etag_version += 1;
-        }
-        self.record(id);
-        Ok(())
+    /// The server changing a file's content by itself (SharePoint's post-upload rewrite):
+    /// new content, size, hash, eTag and cTag as one change; the times are kept.
+    pub(crate) fn rewrite_content(&mut self, id: &ItemId, content: Bytes) -> Result<(), SimError> {
+        let (created, modified) = {
+            let item = self.live(id)?;
+            (item.created, item.modified)
+        };
+        self.replace_content(
+            id,
+            content,
+            modified,
+            FileTimes {
+                created: Some(created),
+                modified: Some(modified),
+            },
+        )
     }
 
+    /// Renames in place at the clock's start; the unit tests' form of [`Drive::relocate`].
+    #[cfg(test)]
+    fn rename(&mut self, id: &ItemId, name: &str) -> Result<(), SimError> {
+        self.relocate(id, Some(name), None, FileTimes::default(), START_SECS)
+    }
+
+    /// Moves at the clock's start; the unit tests' form of [`Drive::relocate`].
+    #[cfg(test)]
     fn move_to(&mut self, id: &ItemId, new_parent: &ItemId) -> Result<(), SimError> {
-        self.not_root(id)?;
+        self.relocate(id, None, Some(new_parent), FileTimes::default(), START_SECS)
+    }
+
+    /// Renames and/or moves an item and/or sets its `fileSystemInfo` times, as one change
+    /// that bumps the eTag only. Checks everything before changing anything. A rename or
+    /// move sets `lastModifiedDateTime` to `now` only under
+    /// [`DriveOptions::rename_sets_modified`]; supplied times win over that.
+    pub(crate) fn relocate(
+        &mut self,
+        id: &ItemId,
+        new_name: Option<&str>,
+        new_parent: Option<&ItemId>,
+        times: FileTimes,
+        now: i64,
+    ) -> Result<(), SimError> {
+        let moves = new_name.is_some() || new_parent.is_some();
+        if moves {
+            self.not_root(id)?;
+        }
         let item = self.live(id)?;
-        let (name, size, old_parent) = (item.name.clone(), item.size, item.parent.clone());
-        self.live_folder(new_parent)?;
-        // A folder cannot move into itself or below itself.
-        let mut cursor = Some(new_parent.clone());
-        while let Some(current) = cursor {
-            if current == *id {
-                return Err(SimError::MoveIntoSelf {
-                    drive: self.id.clone(),
-                    item: id.clone(),
-                });
+        let (old_name, size, old_parent) = (item.name.clone(), item.size, item.parent.clone());
+        let name = new_name.map_or_else(|| old_name.clone(), str::to_owned);
+        if let Some(target) = new_parent {
+            self.live_folder(target)?;
+            // A folder cannot move into itself or below itself.
+            let mut cursor = Some(target.clone());
+            while let Some(current) = cursor {
+                if current == *id {
+                    return Err(SimError::MoveIntoSelf {
+                        drive: self.id.clone(),
+                        item: id.clone(),
+                    });
+                }
+                cursor = self
+                    .items
+                    .get(&current)
+                    .and_then(|item| item.parent.clone());
             }
-            cursor = self
-                .items
-                .get(&current)
-                .and_then(|item| item.parent.clone());
         }
-        self.check_name(new_parent, &name, Some(id))?;
-        let key = fold(&name);
-        if let Some(old) = &old_parent {
-            if let Some(siblings) = self.children.get_mut(old) {
-                siblings.remove(&key);
+        let target_parent = new_parent.cloned().or_else(|| old_parent.clone());
+        if moves && let Some(target) = &target_parent {
+            self.check_name(target, &name, Some(id))?;
+        }
+        if moves {
+            if let Some(old) = &old_parent
+                && let Some(siblings) = self.children.get_mut(old)
+            {
+                siblings.remove(&fold(&old_name));
             }
-            self.adjust_sizes(old, size, false);
+            if new_parent.is_some()
+                && let Some(old) = &old_parent
+            {
+                self.adjust_sizes(old, size, false);
+            }
+            if let Some(target) = &target_parent {
+                self.children
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(fold(&name), id.clone());
+                if new_parent.is_some() {
+                    self.adjust_sizes(target, size, true);
+                }
+            }
         }
-        self.children
-            .entry(new_parent.clone())
-            .or_default()
-            .insert(key, id.clone());
-        self.adjust_sizes(new_parent, size, true);
+        let touch = moves && self.options.rename_sets_modified;
         if let Some(item) = self.items.get_mut(id) {
-            item.parent = Some(new_parent.clone());
+            item.name = name;
+            item.parent = target_parent;
+            if touch {
+                item.modified = now;
+            }
+            if let Some(created) = times.created {
+                item.created = created;
+            }
+            if let Some(modified) = times.modified {
+                item.modified = modified;
+            }
             item.etag_version += 1;
         }
         self.record(id);
@@ -598,7 +792,7 @@ impl Drive {
 
     /// Deletes an item and everything below it. Delta reports the item, and its
     /// descendants after it only under [`FolderDeletes::EveryDescendant`].
-    fn delete(&mut self, id: &ItemId) -> Result<(), SimError> {
+    pub(crate) fn delete(&mut self, id: &ItemId) -> Result<(), SimError> {
         self.not_root(id)?;
         let item = self.live(id)?;
         let (size, parent, key) = (item.size, item.parent.clone(), fold(&item.name));
@@ -801,7 +995,9 @@ impl State {
         item: &ItemId,
         name: &str,
     ) -> Result<(), SimError> {
-        self.drive_mut(drive)?.rename(item, name)
+        let now = self.clock;
+        self.drive_mut(drive)?
+            .relocate(item, Some(name), None, FileTimes::default(), now)
     }
 
     pub(crate) fn move_to(
@@ -810,7 +1006,9 @@ impl State {
         item: &ItemId,
         new_parent: &ItemId,
     ) -> Result<(), SimError> {
-        self.drive_mut(drive)?.move_to(item, new_parent)
+        let now = self.clock;
+        self.drive_mut(drive)?
+            .relocate(item, None, Some(new_parent), FileTimes::default(), now)
     }
 
     pub(crate) fn delete(&mut self, drive: &DriveId, item: &ItemId) -> Result<(), SimError> {
