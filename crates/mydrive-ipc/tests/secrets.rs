@@ -130,6 +130,24 @@ fn link_target() -> MountTarget {
     }
 }
 
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn mount() -> MountInfo {
+    MountInfo {
+        mount_id: MountId::new("example-finance-documents").unwrap(),
+        account_id: AccountId::new("acct-work-1").unwrap(),
+        drive_id: DriveId::new("b!financedriveid").unwrap(),
+        mount_point: ProtocolPath::new("/home/user/Example/Finance - Documents").unwrap(),
+        state: MountState::Resyncing,
+        blocked_reason: None,
+        blocked_message: None,
+        read_only: false,
+        drive_type: Some(DriveType::DocumentLibrary),
+        item_count: Some(0),
+        paused: false,
+        paused_until: None,
+    }
+}
+
 /// The RFC 7636 example: our base64url and digest are the real S256 transform.
 #[test]
 fn the_planted_challenge_is_the_s256_of_the_verifier() {
@@ -194,20 +212,7 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
         user_name: Some("sam@example.com".into()),
         display_name: Some("Sam Example".into()),
     };
-    let mount = MountInfo {
-        mount_id: MountId::new("example-finance-documents").unwrap(),
-        account_id: AccountId::new("acct-work-1").unwrap(),
-        drive_id: DriveId::new("b!financedriveid").unwrap(),
-        mount_point: ProtocolPath::new("/home/user/Example/Finance - Documents").unwrap(),
-        state: MountState::Resyncing,
-        blocked_reason: None,
-        blocked_message: None,
-        read_only: false,
-        drive_type: Some(DriveType::DocumentLibrary),
-        item_count: Some(0),
-        paused: false,
-        paused_until: None,
-    };
+    let mount = mount();
     let mut ledger = ConfirmationLedger::new();
     let token = ledger.issue(&link_target(), "payload", 0).unwrap();
     for name in method::ALL {
@@ -308,10 +313,16 @@ fn sign_in_and_confirmation_errors_carry_no_secret() {
         account_id: AccountId::new("acct-work-2").unwrap(),
         ..link_target()
     };
-    let err = ledger.redeem(&token, &other, 0).unwrap_err();
+    let err = ledger.claim(&token, &other, 0).unwrap_err();
     assert_clean(&error_line(err), "confirmation refusal");
-    assert!(ledger.redeem(&token, &link_target(), 0).is_ok());
-    let err = ledger.redeem(&token, &link_target(), 0).unwrap_err();
+    let claim = ledger.claim(&token, &link_target(), 0).unwrap();
+    let err = ledger.claim(&token, &link_target(), 0).unwrap_err();
+    assert_clean(&error_line(err), "confirmation while claimed");
+    assert_clean(format!("{claim:?}").as_bytes(), "claim Debug");
+    ledger.release(claim, 0);
+    let claim = ledger.claim(&token, &link_target(), 0).unwrap();
+    let _ = ledger.consume(claim, mount());
+    let err = ledger.claim(&token, &link_target(), 0).unwrap_err();
     assert_clean(&error_line(err), "second confirmation");
     assert_clean(format!("{ledger:?}").as_bytes(), "ledger Debug");
 }

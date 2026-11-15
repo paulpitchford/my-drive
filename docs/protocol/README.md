@@ -768,8 +768,9 @@ the drive's name as Graph reports it (for a library, the library's name); `site_
 library; `item_count`, when known; `read_only`; and `mount_point`, the proposed mount point.
 Nothing is created. Names are for display and at most 1 KiB.
 
-The token is opaque, at most 40 characters, and valid for 10 minutes, for one
-`mount.add.confirm` with **the same target parameters**. It does not encode the target
+The token is opaque, at most 40 characters, and valid for 10 minutes, for
+`mount.add.confirm` with **the same target parameters** until one confirmation adds the
+mount. It does not encode the target
 readably. The daemon keeps a bounded number of previews waiting; an old preview may be
 forgotten, and its token is then refused like an expired one.
 
@@ -829,8 +830,13 @@ redeemed durably (ADR-0015 R2) and the mount created.
 Result: `mount`, the new mount in the shape of a [`mount.list`](#mountlist) entry. Its state is
 `resyncing` until its first full delta has been applied (overview "First enumeration").
 
-A token is accepted **once**. A token that is unknown, already used, expired, forgotten, or
-offered with other target parameters is `invalid-params` with `data.reason`
+A token is **used up only when the mount has been added**. A confirmation that fails with
+`offline`, `needs-sign-in`, or a `refused` the user can correct (`mount-point-not-empty`,
+`mount-point-overlaps`) leaves the token valid until it expires, so the client can retry with
+the same token, or with another `mount_point`. While one confirmation of a token is in
+progress, another confirmation of the same token is refused, so one preview never adds two
+mounts. A token that is unknown, used up, being confirmed by another request, expired,
+forgotten, or offered with other target parameters is `invalid-params` with `data.reason`
 `restart-preview`: call `mount.add.preview` again. Offering a token with the wrong target
 does not use it up. The mount point must not exist, or be an empty directory, and must not be
 inside or contain another mount or the daemon's data directory.
@@ -880,10 +886,10 @@ The drive is already mounted:
 |---|---|---|
 | `invalid-params` | Malformed parameters; with `data.reason` `restart-preview`, a token that cannot be used | Fix the request, or preview again |
 | `unknown-account` | No account has this ID | List accounts again |
-| `needs-sign-in` | The account must sign in again | Offer `account.login.start` |
+| `needs-sign-in` | The account must sign in again; the token stays valid | Offer `account.login.start`, then retry with the same token while it is valid |
 | `blocked-by-policy` | Organisation policy refuses access | Show the message; nothing was mounted |
-| `refused` | `mount-point-not-empty`, `mount-point-overlaps`, `already-mounted` (with `data.mount_id`), `no-access` | Show the message; nothing was mounted |
-| `offline` | Graph cannot be reached | Retry with the same token while it is valid |
+| `refused` | `mount-point-not-empty`, `mount-point-overlaps` (the token stays valid), `already-mounted` (with `data.mount_id`), `no-access` | Show the message; nothing was mounted. For a mount point, retry with another `mount_point` and the same token |
+| `offline` | Graph cannot be reached; the token stays valid | Retry with the same token while it is valid |
 | `hello-required` | Before `hello` | Fix the client |
 | `not-ready` | The daemon is starting | Retry shortly |
 | `internal` | A daemon fault | Report it |

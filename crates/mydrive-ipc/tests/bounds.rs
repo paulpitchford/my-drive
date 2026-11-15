@@ -592,8 +592,9 @@ fn worst_mount_add_confirm() {
     };
     let result = fit_result(&worst_id(), result).unwrap();
     assert_result_fits(&result, method::MOUNT_ADD_CONFIRM);
-    assert!(ledger.redeem(&token, &worst_target(), 1).is_ok());
-    let err = ledger.redeem(&token, &worst_target(), 1).unwrap_err();
+    let claim = ledger.claim(&token, &worst_target(), 1).unwrap();
+    let _ = ledger.consume(claim, worst_mount_info());
+    let err = ledger.claim(&token, &worst_target(), 1).unwrap_err();
     assert_fits(
         &ErrorResponse::new(Some(worst_id()), err),
         "restart-preview",

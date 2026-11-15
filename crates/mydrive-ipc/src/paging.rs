@@ -33,8 +33,8 @@ use crate::envelope::{Id, Notification, SuccessResponse};
 use crate::error::{ErrorCode, RpcError, truncate_to};
 use crate::methods::{
     AccountInfo, AccountListResult, ActionOutcome, ConfirmationToken, ItemActionEntry,
-    ItemActionResult, ItemStatusEntry, ItemStatusResult, MountInfo, MountListResult, MountSource,
-    MountTarget, SkippedItem, StatusChangedParams, method,
+    ItemActionResult, ItemStatusEntry, ItemStatusResult, MountAddConfirmResult, MountInfo,
+    MountListResult, MountSource, MountTarget, SkippedItem, StatusChangedParams, method,
 };
 use crate::path::ProtocolPath;
 use crate::values::MountTargetKind;
@@ -591,17 +591,30 @@ struct PendingPreview<T> {
     nonce: u64,
     binding: String,
     issued_at: u64,
-    payload: T,
+    /// `None` while a confirmation holds the preview ([`ConfirmationClaim`]).
+    payload: Option<T>,
 }
 
 /// The previews awaiting `mount.add.confirm` (WP-016 AC6).
 ///
-/// [`ConfirmationLedger::issue`] gives a token bound to the preview's target;
-/// [`ConfirmationLedger::redeem`] accepts it once, with the same target, within
-/// [`PREVIEW_LIFETIME_SECS`]. Anything else is `invalid-params` with reason
-/// `restart-preview`: a token used twice, with another target, after it expired, after the
-/// ledger forgot it, or one this ledger did not issue (including one from before a daemon
-/// restart).
+/// [`ConfirmationLedger::issue`] gives a token bound to the preview's target. A confirmation
+/// is then three steps, so that a token is used up only when the mount has been added:
+///
+/// 1. [`ConfirmationLedger::claim`] checks the token against the target and the lifetime and
+///    hands out the preview's payload inside a [`ConfirmationClaim`]. While the claim is
+///    held, the token is refused to every other confirmation, so two concurrent confirms of
+///    one token can never both add a mount.
+/// 2. The daemon adds the mount, outside any lock on the ledger.
+/// 3. On success, [`ConfirmationLedger::consume`] uses the token up; it takes the new mount,
+///    so it cannot be called before there is one. On a failure the user can correct or retry
+///    (`offline`, `needs-sign-in`, a `refused` such as `mount-point-not-empty`),
+///    [`ConfirmationLedger::release`] makes the token valid again until it expires.
+///
+/// A claim dropped without either step leaves the token refused until it expires: the ledger
+/// fails closed. Anything but an outstanding, unclaimed token issued for the target, within
+/// [`PREVIEW_LIFETIME_SECS`], is `invalid-params` with reason `restart-preview`: a token used
+/// up, claimed by another confirmation, offered with another target, expired, forgotten, or
+/// one this ledger did not issue (including one from before a daemon restart).
 ///
 /// A token is `c1.` + a 16-hex-digit sequence number + `.` + 16 hex digits of a SHA-256
 /// binding over the number and the target. It holds no daemon state and nothing readable of
@@ -613,6 +626,32 @@ struct PendingPreview<T> {
 pub struct ConfirmationLedger<T> {
     next: u64,
     pending: VecDeque<PendingPreview<T>>,
+}
+
+/// A confirmation in progress: the preview's payload, held while the daemon adds the mount.
+/// Give it back to the ledger it came from with [`ConfirmationLedger::consume`] or
+/// [`ConfirmationLedger::release`].
+#[must_use = "a claim must be consumed when the mount is added, or released on failure"]
+pub struct ConfirmationClaim<T> {
+    nonce: u64,
+    binding: String,
+    payload: T,
+}
+
+impl<T> ConfirmationClaim<T> {
+    /// What the preview recorded for finishing the mount.
+    #[must_use]
+    pub fn payload(&self) -> &T {
+        &self.payload
+    }
+}
+
+impl<T> std::fmt::Debug for ConfirmationClaim<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfirmationClaim")
+            .field("nonce", &self.nonce)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T> std::fmt::Debug for ConfirmationLedger<T> {
@@ -712,41 +751,72 @@ impl<T> ConfirmationLedger<T> {
             nonce,
             binding,
             issued_at: now_secs,
-            payload,
+            payload: Some(payload),
         });
         Ok(token)
     }
 
-    /// Accepts `token` for `target` once, returning the preview's payload.
+    /// Checks `token` for `target` and holds the preview for this confirmation. Nothing is
+    /// used up yet; see the type's documentation for the steps that follow.
     ///
     /// A token offered with another target is refused and stays valid for its own target,
-    /// since nothing happened. A redeemed or expired token is forgotten.
+    /// since nothing happened.
     ///
     /// # Errors
     ///
-    /// `invalid-params` with reason `restart-preview` for anything but an outstanding token
-    /// issued for `target`. The error repeats neither the token nor the target.
-    pub fn redeem(
+    /// `invalid-params` with reason `restart-preview` for anything but an outstanding,
+    /// unclaimed token issued for `target`. The error repeats neither the token nor the
+    /// target.
+    pub fn claim(
         &mut self,
         token: &ConfirmationToken,
         target: &MountTarget,
         now_secs: u64,
-    ) -> Result<T, RpcError> {
+    ) -> Result<ConfirmationClaim<T>, RpcError> {
         self.forget_expired(now_secs);
         let refused = || RpcError::restart_preview(method::MOUNT_ADD_CONFIRM);
         let (nonce, bound) = parse_token(token).ok_or_else(refused)?;
-        let index = self
-            .pending
-            .iter()
-            .position(|p| p.nonce == nonce && p.binding == bound)
-            .ok_or_else(refused)?;
         if target_binding(nonce, target) != bound {
             return Err(refused());
         }
+        let preview = self
+            .pending
+            .iter_mut()
+            .find(|p| p.nonce == nonce && p.binding == bound)
+            .ok_or_else(refused)?;
+        let payload = preview.payload.take().ok_or_else(refused)?;
+        Ok(ConfirmationClaim {
+            nonce,
+            binding: preview.binding.clone(),
+            payload,
+        })
+    }
+
+    /// The mount has been added: uses the claimed token up and returns the confirmation's
+    /// result. Taking the new mount here is what keeps the token alive until there is one.
+    /// If the preview was forgotten or expired meanwhile, there is nothing left to use up.
+    pub fn consume(
+        &mut self,
+        claim: ConfirmationClaim<T>,
+        mount: MountInfo,
+    ) -> MountAddConfirmResult {
         self.pending
-            .remove(index)
-            .map(|p| p.payload)
-            .ok_or_else(refused)
+            .retain(|p| !(p.nonce == claim.nonce && p.binding == claim.binding));
+        MountAddConfirmResult { mount }
+    }
+
+    /// The confirmation failed in a way the user can correct or retry: makes the token valid
+    /// again, for its own target, until it expires. A token that expired or was forgotten
+    /// while claimed stays gone.
+    pub fn release(&mut self, claim: ConfirmationClaim<T>, now_secs: u64) {
+        self.forget_expired(now_secs);
+        if let Some(preview) = self
+            .pending
+            .iter_mut()
+            .find(|p| p.nonce == claim.nonce && p.binding == claim.binding)
+        {
+            preview.payload = Some(claim.payload);
+        }
     }
 }
 
@@ -1769,6 +1839,30 @@ mod tests {
         }
     }
 
+    /// Claim then consume at once: a confirmation that added its mount.
+    trait Redeem<T> {
+        fn redeem(
+            &mut self,
+            token: &ConfirmationToken,
+            target: &MountTarget,
+            now: u64,
+        ) -> Result<T, RpcError>;
+    }
+
+    impl<T: Clone> Redeem<T> for ConfirmationLedger<T> {
+        fn redeem(
+            &mut self,
+            token: &ConfirmationToken,
+            target: &MountTarget,
+            now: u64,
+        ) -> Result<T, RpcError> {
+            let claim = self.claim(token, target, now)?;
+            let payload = claim.payload().clone();
+            let _ = self.consume(claim, worst_mount(0));
+            Ok(payload)
+        }
+    }
+
     fn mount_target(source: crate::methods::MountSource) -> MountTarget {
         MountTarget {
             account_id: mydrive_core::ids::AccountId::new("acct-work-1").unwrap(),
@@ -1901,6 +1995,90 @@ mod tests {
         assert!(is_restart_preview(
             &ledger.redeem(&first, &own, 0).unwrap_err()
         ));
+    }
+
+    /// WP-016 AC6 addendum: a token is used up only when the mount has been added. A claimed
+    /// token is refused to every other confirmation; released after a failure the user can
+    /// correct (`offline`, `needs-sign-in`, `mount-point-not-empty`), it is valid again for its
+    /// own target until it expires; consumed, it is gone.
+    #[test]
+    fn wp_016_ac6_token_survives_a_failed_confirmation() {
+        let own = mount_target(crate::methods::MountSource::OwnDrive);
+        let mut ledger = ConfirmationLedger::new();
+        let token = ledger.issue(&link(LINK), "finance", 100).unwrap();
+        for _failure in ["offline", "needs-sign-in", "mount-point-not-empty"] {
+            let claim = ledger.claim(&token, &link(LINK), 101).unwrap();
+            assert_eq!(claim.payload(), &"finance");
+            // Held: a second confirmation of the same token is refused meanwhile.
+            assert!(is_restart_preview(
+                &ledger.claim(&token, &link(LINK), 101).unwrap_err()
+            ));
+            ledger.release(claim, 102);
+        }
+        // Released, the binding still holds: another target is refused.
+        assert!(is_restart_preview(
+            &ledger.claim(&token, &own, 103).unwrap_err()
+        ));
+        // The mount is added: used up.
+        let claim = ledger.claim(&token, &link(LINK), 104).unwrap();
+        let mount = worst_mount(7);
+        let result = ledger.consume(claim, mount.clone());
+        assert_eq!(result.mount, mount);
+        assert!(is_restart_preview(
+            &ledger.claim(&token, &link(LINK), 105).unwrap_err()
+        ));
+        assert!(ledger.is_empty());
+
+        // A token that expires while claimed is not revived by its release.
+        let token = ledger.issue(&own, "late", 1_000).unwrap();
+        let claim = ledger.claim(&token, &own, 1_001).unwrap();
+        ledger.release(claim, 1_000 + PREVIEW_LIFETIME_SECS);
+        assert!(is_restart_preview(
+            &ledger
+                .claim(&token, &own, 1_000 + PREVIEW_LIFETIME_SECS)
+                .unwrap_err()
+        ));
+        // A claim dropped without consume or release fails closed: refused until expiry.
+        let token = ledger.issue(&own, "dropped", 2_000).unwrap();
+        drop(ledger.claim(&token, &own, 2_001).unwrap());
+        assert!(is_restart_preview(
+            &ledger.claim(&token, &own, 2_002).unwrap_err()
+        ));
+    }
+
+    /// WP-016 AC6 addendum: two concurrent confirmations of one token cannot both add a
+    /// mount. Each thread claims under the lock, "adds the mount" outside it, then consumes;
+    /// exactly one claim succeeds, however the threads interleave.
+    #[test]
+    fn wp_016_ac6_concurrent_confirms_add_one_mount() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+        for round in 0..200 {
+            let own = mount_target(crate::methods::MountSource::OwnDrive);
+            let ledger = Arc::new(Mutex::new(ConfirmationLedger::new()));
+            let token = ledger.lock().unwrap().issue(&own, round, 0).unwrap();
+            let added = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(4));
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    let (ledger, added, barrier) = (ledger.clone(), added.clone(), barrier.clone());
+                    let (token, own) = (token.clone(), own.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let claim = ledger.lock().unwrap().claim(&token, &own, 1);
+                        if let Ok(claim) = claim {
+                            added.fetch_add(1, Ordering::SeqCst);
+                            let _ = ledger.lock().unwrap().consume(claim, worst_mount(round));
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            assert_eq!(added.load(Ordering::SeqCst), 1, "round {round}");
+            assert!(ledger.lock().unwrap().is_empty());
+        }
     }
 
     /// The refusal repeats neither the token nor the target, which may be a sharing link.

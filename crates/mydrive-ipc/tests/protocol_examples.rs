@@ -1290,6 +1290,7 @@ fn local_paths_times_and_credentials_are_documented() {
         "Sign-in never creates a mount",
         "removing a mount never deletes anything on the server",
         "A mount with unsynced changes is not removed without confirmation",
+        "A token is used up only when the mount has been added.",
         "A `dry_run` never refuses",
         "is not refused over unsynced changes and has no `keep_unsynced`",
         "A file with changes not yet on the server is never replaced",

@@ -1494,7 +1494,8 @@ pub struct MountAddPreviewResult {
 pub struct MountAddConfirmParams {
     /// The same target as the preview; a token used with another target is refused.
     pub target: MountTarget,
-    /// The preview's token. Single use.
+    /// The preview's token. Used up when a confirmation adds the mount, and not before
+    /// ([`crate::paging::ConfirmationLedger`]).
     pub confirmation_token: ConfirmationToken,
     /// A mount point other than the proposed one.
     pub mount_point: Option<ProtocolPath>,
