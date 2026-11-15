@@ -59,13 +59,18 @@ memory; mount removal refusal bounded and with a typed "kept elsewhere" argument
   or their reviewers and verifiers) can run in parallel there. On the original 8-core, 8 GB
   machine seven parallel Rust builds overloaded it; run at most two there. Give each agent
   its own `CARGO_TARGET_DIR`.
-- The app registration is managed with a separate Azure CLI profile that exists only on the
-  original machine. On another machine, sign in again with a profile kept apart from any
-  work login. Nothing in the build needs it.
+- The app registration is managed with a separate Azure CLI profile, kept apart from any
+  work login. The build machine has one at `~/.config/azure-mydrive` (set `AZURE_CONFIG_DIR`
+  to use it). Nothing in the build needs it.
 - The real runs of WP-011 and WP-045 need the owner to sign in. Agents never do.
 
 ## Waiting on the owner
 
-Confirm D5 (what M1 lets a user do); confirm or reverse the Zlib licence allowance and the
-Linux-only audit targets; review the decisions in `open-questions.md`; publisher
-verification before a public release (Q22).
+Settled on 2026-11-15: D5 confirmed; the Zlib licence allowance and the Linux-only audit
+targets confirmed; the five decisions in `open-questions.md` accepted; publisher verification
+(Q22) deferred to M3 packaging.
+
+Still to come: the owner signs in for the real runs of WP-011 and WP-045 once those programs
+exist. One address serves as both the personal and the work account. The scratch document
+library goes in the owner's own tenant; a tenant where the owner is only a guest is never
+used.
