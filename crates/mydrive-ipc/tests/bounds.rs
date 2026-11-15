@@ -211,6 +211,7 @@ fn worst_mount_list() {
             read_only: true,
             drive_type: Some(DriveType::Other("\"".repeat(200))),
             item_count: Some(u64::MAX),
+            paused: true,
             paused_until: Some(u64::MAX),
         })
         .collect();
@@ -432,6 +433,7 @@ fn worst_mount_info() -> MountInfo {
         read_only: true,
         drive_type: Some(DriveType::Other("\"".repeat(200))),
         item_count: Some(u64::MAX),
+        paused: true,
         paused_until: Some(u64::MAX),
     }
 }

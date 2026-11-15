@@ -258,7 +258,12 @@ pub struct AccountListResult {
 }
 
 /// One mount in `mount.list`.
+///
+/// `paused` is always present and `paused_until` only with `paused` true: a mount with
+/// `paused_until` and `paused` false fails to deserialise rather than being read one way or
+/// the other.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "MountInfoWire")]
 pub struct MountInfo {
     /// The mount's ID.
     pub mount_id: MountId,
@@ -290,12 +295,62 @@ pub struct MountInfo {
     /// first enumeration, the items listed so far. Absent when not known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_count: Option<u64>,
+    /// True whenever the mount is paused, whatever `state` shows: a paused mount that is also
+    /// blocked shows `blocked` but still has `paused` true.
+    pub paused: bool,
     /// When the mount's pause ends, in whole seconds since the Unix epoch (UTC), as in the
-    /// `mount.pause` result. Present whenever the mount is paused with an end, whatever
-    /// `state` shows (a paused mount that is also blocked shows `blocked`). Absent when the
-    /// mount is not paused, or is paused until `mount.resume`.
+    /// `mount.pause` result. Only with `paused` true; absent for a pause until
+    /// `mount.resume`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_until: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct MountInfoWire {
+    mount_id: MountId,
+    account_id: AccountId,
+    drive_id: DriveId,
+    mount_point: ProtocolPath,
+    state: MountState,
+    #[serde(default)]
+    blocked_reason: Option<BlockedReason>,
+    #[serde(default)]
+    blocked_message: Option<String>,
+    read_only: bool,
+    #[serde(default)]
+    drive_type: Option<DriveType>,
+    #[serde(default)]
+    item_count: Option<u64>,
+    paused: bool,
+    #[serde(default)]
+    paused_until: Option<u64>,
+}
+
+impl TryFrom<MountInfoWire> for MountInfo {
+    type Error = String;
+
+    fn try_from(wire: MountInfoWire) -> Result<Self, String> {
+        if wire.paused_until.is_some() && !wire.paused {
+            return Err(format!(
+                "mount {} has paused_until but paused is false",
+                wire.mount_id
+            ));
+        }
+        Ok(Self {
+            mount_id: wire.mount_id,
+            account_id: wire.account_id,
+            drive_id: wire.drive_id,
+            mount_point: wire.mount_point,
+            state: wire.state,
+            blocked_reason: wire.blocked_reason,
+            blocked_message: wire.blocked_message,
+            read_only: wire.read_only,
+            drive_type: wire.drive_type,
+            item_count: wire.item_count,
+            paused: wire.paused,
+            paused_until: wire.paused_until,
+        })
+    }
 }
 
 /// `mount.list` result: one page, in byte order of `mount_id`.
@@ -2545,39 +2600,64 @@ mod tests {
         assert_eq!(r.unsynced_files, 2);
     }
 
-    /// `mount.list` tells "not paused", "paused with an end" and "paused until resumed"
-    /// apart from `state` and `paused_until`; `paused_until` is absent unless there is an
-    /// end, and uses the same representation as the `mount.pause` result.
+    /// `mount.list` tells all four combinations of blocked or not and paused or not apart
+    /// (`state` shows `blocked` over `paused`, `paused` is separate), and paused with an end
+    /// from paused until resumed. `paused_until` with `paused` false is refused, not guessed.
     #[test]
-    fn paused_until_distinguishes_pauses() {
-        let base = json!({"mount_id": "m", "account_id": "a", "drive_id": "d",
-                          "mount_point": "/m", "state": "active", "read_only": false});
-        let active: MountInfo = serde_json::from_value(base.clone()).unwrap();
-        assert_eq!(
-            (active.state.clone(), active.paused_until),
-            (MountState::Active, None)
-        );
-        let mut paused = base.clone();
-        paused["state"] = json!("paused");
-        let forever: MountInfo = serde_json::from_value(paused.clone()).unwrap();
-        assert_eq!(
-            (forever.state.clone(), forever.paused_until),
-            (MountState::Paused, None)
-        );
-        paused["paused_until"] = json!(1_794_790_800_u64);
-        let until: MountInfo = serde_json::from_value(paused.clone()).unwrap();
-        assert_eq!(until.paused_until, Some(1_794_790_800));
-        assert_eq!(serde_json::to_value(&until).unwrap(), paused);
-        assert!(
-            serde_json::to_value(&active)
-                .unwrap()
-                .get("paused_until")
-                .is_none()
-        );
+    fn paused_is_separate_from_state() {
+        let mount = |state: &str, paused: bool, until: Option<u64>| {
+            let mut v = json!({"mount_id": "m", "account_id": "a", "drive_id": "d",
+                               "mount_point": "/m", "state": state, "read_only": false,
+                               "paused": paused});
+            if state == "blocked" {
+                v["blocked_reason"] = json!("organisation-policy");
+            }
+            if let Some(t) = until {
+                v["paused_until"] = json!(t);
+            }
+            v
+        };
+        let cases = [
+            ("active", false, None),
+            ("paused", true, None),
+            ("paused", true, Some(1_794_790_800)),
+            ("blocked", false, None),
+            ("blocked", true, None),
+            ("blocked", true, Some(1_794_790_800)),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (state, paused, until) in cases {
+            let v = mount(state, paused, until);
+            let info: MountInfo = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&info).unwrap(), v, "{v}");
+            let blocked = info.state == MountState::Blocked;
+            assert!(
+                seen.insert((blocked, info.paused, info.paused_until)),
+                "{v}"
+            );
+        }
+        // Each of the four blocked/paused combinations was read distinctly.
+        let combos: std::collections::BTreeSet<(bool, bool)> =
+            seen.iter().map(|(b, p, _)| (*b, *p)).collect();
+        assert_eq!(combos.len(), 4);
+        // `paused_until` without `paused`, and a missing `paused`, do not parse.
+        for bad in [
+            mount("active", false, Some(1)),
+            mount("blocked", false, Some(1)),
+        ] {
+            let err = serde_json::from_value::<MountInfo>(bad).unwrap_err();
+            assert!(err.to_string().contains("paused is false"), "{err}");
+        }
+        let mut missing = mount("active", false, None);
+        missing.as_object_mut().unwrap().remove("paused");
+        assert!(serde_json::from_value::<MountInfo>(missing).is_err());
+        // The end has the representation of the `mount.pause` result.
         let pause: MountPauseResult =
             serde_json::from_value(json!({"paused_mounts": 1, "paused_until": 1_794_790_800_u64}))
                 .unwrap();
-        assert_eq!(pause.paused_until, until.paused_until);
+        let info: MountInfo =
+            serde_json::from_value(mount("paused", true, Some(1_794_790_800))).unwrap();
+        assert_eq!(pause.paused_until, info.paused_until);
     }
 
     /// A test challenge: 43 base64url characters, as an S256 digest is.
@@ -2954,7 +3034,7 @@ mod tests {
         let mounts: MountListResult = serde_json::from_value(json!({"mounts": [{
             "mount_id": "m1", "account_id": "a", "drive_id": "d",
             "mount_point": "/home/u/OneDrive", "state": "hibernating",
-            "blocked_reason": "solar-flare", "read_only": false
+            "blocked_reason": "solar-flare", "read_only": false, "paused": false
         }]}))
         .unwrap();
         assert_eq!(
@@ -3187,7 +3267,7 @@ mod tests {
         let mount: MountInfo = serde_json::from_value(json!({
             "mount_id": "m", "account_id": "a", "drive_id": "d", "mount_point": "/m",
             "state": "active", "blocked_reason": null, "blocked_message": null,
-            "read_only": false
+            "read_only": false, "paused": false
         }))
         .unwrap();
         assert_eq!(mount.blocked_message, None);

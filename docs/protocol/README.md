@@ -704,16 +704,17 @@ Parameters: optional `cursor`. Result: `mounts`, in byte order of `mount_id`, ea
 and, only when `blocked`, `blocked_reason` (a code, open) and `blocked_message` (text for
 people, at most 1 KiB); when known, `drive_type` (`personal`, `business` or
 `document-library`, open) and `item_count` (the items of the drive the daemon knows; while
-the mount is `resyncing` for its first enumeration, the items listed so far);
-`paused_until`, when the mount's pause ends, in seconds since the Unix epoch (UTC), as in
-the [`mount.pause`](#mountpause) result; and `next_cursor` while more remain
-([pagination](#pagination)).
+the mount is `resyncing` for its first enumeration, the items listed so far); `paused`,
+always present; `paused_until`, only while `paused` is true and the pause has an end; and
+`next_cursor` while more remain ([pagination](#pagination)).
 
-`paused_until` is present whenever the mount is paused with an end, and absent when it is
-not paused or is paused until `mount.resume`. So a mount whose `state` is `paused` and has
-no `paused_until` is paused until resumed. `state` shows `blocked` over `paused`: a blocked
-mount that is also paused shows its `paused_until` if the pause has an end, but a blocked
-mount paused until resumed cannot be told from a blocked mount that is not paused.
+**Pause is separate from `state`.** `paused` is `true` whenever the mount is paused, whatever
+`state` shows. `state` shows `blocked` over `paused`, so a blocked mount that is also paused
+has `state` `blocked` and `paused` `true`; a client reads blocked from `state` and paused from
+`paused`, and tells all four combinations apart. `paused_until` is when the pause ends, in
+seconds since the Unix epoch (UTC), as in the [`mount.pause`](#mountpause) result; with
+`paused` true and no `paused_until`, the mount is paused until `mount.resume`. A mount with
+`paused_until` and `paused` `false` is malformed, and the types refuse it.
 
 <!-- example: request -->
 ```json
@@ -723,7 +724,7 @@ mount paused until resumed cannot be told from a blocked mount that is not pause
 <!-- example: response mount.list -->
 ```json
 {"jsonrpc": "2.0", "id": 4, "result": {"mounts": [
-  {"mount_id": "example-site-documents", "account_id": "acct-work-1", "drive_id": "b!exampledriveid", "mount_point": "/home/user/Example/Site - Documents", "state": "blocked", "blocked_reason": "organisation-policy", "blocked_message": "The organisation does not allow access from unmanaged devices", "read_only": true}
+  {"mount_id": "example-site-documents", "account_id": "acct-work-1", "drive_id": "b!exampledriveid", "mount_point": "/home/user/Example/Site - Documents", "state": "blocked", "blocked_reason": "organisation-policy", "blocked_message": "The organisation does not allow access from unmanaged devices", "read_only": true, "paused": true}
 ], "next_cursor": "m1.6578616d706c652d736974652d646f63756d656e7473"}}
 ```
 
@@ -735,8 +736,8 @@ mount paused until resumed cannot be told from a blocked mount that is not pause
 <!-- example: response mount.list -->
 ```json
 {"jsonrpc": "2.0", "id": 5, "result": {"mounts": [
-  {"mount_id": "example-team-files", "account_id": "acct-work-1", "drive_id": "b!teamdriveid", "mount_point": "/home/user/Example/Team - Files", "state": "paused", "read_only": false, "drive_type": "document-library", "item_count": 1900, "paused_until": 1794790800},
-  {"mount_id": "personal", "account_id": "acct-personal-1", "drive_id": "0123456789abcdef", "mount_point": "/home/user/OneDrive", "state": "active", "read_only": false, "drive_type": "personal", "item_count": 14000}
+  {"mount_id": "example-team-files", "account_id": "acct-work-1", "drive_id": "b!teamdriveid", "mount_point": "/home/user/Example/Team - Files", "state": "paused", "read_only": false, "drive_type": "document-library", "item_count": 1900, "paused": true, "paused_until": 1794790800},
+  {"mount_id": "personal", "account_id": "acct-personal-1", "drive_id": "0123456789abcdef", "mount_point": "/home/user/OneDrive", "state": "active", "read_only": false, "drive_type": "personal", "item_count": 14000, "paused": false}
 ]}}
 ```
 
@@ -835,7 +836,7 @@ inside or contain another mount or the daemon's data directory.
 
 <!-- example: response mount.add.confirm -->
 ```json
-{"jsonrpc": "2.0", "id": 42, "result": {"mount": {"mount_id": "example-finance-documents", "account_id": "acct-work-1", "drive_id": "b!financedriveid", "mount_point": "/home/user/Example/Finance - Documents", "state": "resyncing", "read_only": false, "drive_type": "document-library", "item_count": 0}}}
+{"jsonrpc": "2.0", "id": 42, "result": {"mount": {"mount_id": "example-finance-documents", "account_id": "acct-work-1", "drive_id": "b!financedriveid", "mount_point": "/home/user/Example/Finance - Documents", "state": "resyncing", "read_only": false, "drive_type": "document-library", "item_count": 0, "paused": false}}}
 ```
 
 The same token again:

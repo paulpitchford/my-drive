@@ -205,6 +205,7 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
         read_only: false,
         drive_type: Some(DriveType::DocumentLibrary),
         item_count: Some(0),
+        paused: false,
         paused_until: None,
     };
     let mut ledger = ConfirmationLedger::new();

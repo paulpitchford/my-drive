@@ -830,7 +830,7 @@ fn accepts_unknown(field: &str) -> bool {
     });
     let mount = json!({
         "mount_id": "m", "account_id": "a", "drive_id": "d", "mount_point": "/m",
-        "state": "active", "read_only": false
+        "state": "active", "read_only": false, "paused": false
     });
     let account = json!({"account_id": "a", "kind": "personal", "state": "signed-in"});
     let unknown = Value::String(UNKNOWN.into());
