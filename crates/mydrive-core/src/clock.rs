@@ -82,6 +82,10 @@ pub trait Clock: Send + Sync {
     ///
     /// A deadline that has already passed gives a future that completes on its first poll.
     /// Dropping the future before it completes cancels the wait.
+    ///
+    /// A deadline the implementation cannot represent (for example one beyond the range of
+    /// its runtime's timer) means "never": the future stays pending for ever. It must not
+    /// panic, and it must not complete early.
     fn sleep_until(&self, deadline: MonotonicInstant) -> Sleep;
 }
 
@@ -90,7 +94,7 @@ pub trait Clock: Send + Sync {
 /// Cloning gives another handle to the same clock, so a test can keep one handle and give
 /// the code under test another (or an `Arc<dyn Clock>`). It is `Send + Sync` and needs no
 /// async runtime: [`ManualClock::advance`] wakes the waiters it releases through their
-/// [`Waker`]s, whatever executor polls them.
+/// [`Waker`]s, whatever executor polls them, in deadline order within each call.
 ///
 /// Monotonic time starts at [`MonotonicInstant::ZERO`]; wall-clock time starts at the value
 /// given to [`ManualClock::new`]. The two move independently.
@@ -128,8 +132,12 @@ impl ManualClock {
         }
     }
 
-    /// Moves monotonic time forward by `by` and wakes, in deadline order, every waiter whose
-    /// deadline is now reached or passed. Wall-clock time does not change.
+    /// Moves monotonic time forward by `by` and wakes every waiter whose deadline is now
+    /// reached or passed. Wall-clock time does not change.
+    ///
+    /// Within one call the waiters are woken in deadline order (equal deadlines in creation
+    /// order). The order holds only within a call; and waking is not polling, so an executor
+    /// may still poll the woken tasks in another order.
     ///
     /// Time saturates at the latest representable instant rather than overflowing.
     pub fn advance(&self, by: Duration) {
@@ -147,8 +155,8 @@ impl ManualClock {
             }
             released
         };
-        // Woken outside the lock: a waker may poll its future at once, and that poll takes
-        // the lock again.
+        // Woken (and so dropped) outside the lock: a waker may poll its future at once, and
+        // that poll takes the lock again.
         for waker in released {
             waker.wake();
         }
@@ -218,26 +226,30 @@ impl Future for ManualSleep {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Wakers are cloned and dropped only outside the lock: their clone and drop may run
+        // arbitrary code, including code that uses this clock.
+        let waker = cx.waker().clone();
         let mut state = lock(&self.shared);
-        if state.now >= self.key.0 {
-            state.waiters.remove(&self.key);
-            return Poll::Ready(());
-        }
-        // Re-polled with a different waker (the task moved): keep only the latest one.
-        match state.waiters.get_mut(&self.key) {
-            Some(waker) => waker.clone_from(cx.waker()),
-            None => {
-                state.waiters.insert(self.key, cx.waker().clone());
-            }
-        }
-        Poll::Pending
+        let (released, result) = if state.now >= self.key.0 {
+            (state.waiters.remove(&self.key), Poll::Ready(()))
+        } else {
+            // Re-polled with a different waker (the task moved): keep only the latest one.
+            (state.waiters.insert(self.key, waker), Poll::Pending)
+        };
+        drop(state);
+        drop(released);
+        result
     }
 }
 
 impl Drop for ManualSleep {
     fn drop(&mut self) {
-        // A cancelled wait leaves nothing behind and wakes no one.
-        lock(&self.shared).waiters.remove(&self.key);
+        // A cancelled wait leaves nothing behind and wakes no one. The removed waker is
+        // dropped after the lock is released.
+        let mut state = lock(&self.shared);
+        let released = state.waiters.remove(&self.key);
+        drop(state);
+        drop(released);
     }
 }
 
@@ -440,6 +452,85 @@ mod tests {
         assert_eq!(clock.pending_waiters(), 0);
     }
 
+    /// A waker whose drop calls back into the clock.
+    struct Reentrant {
+        clock: ManualClock,
+        dropped: Arc<AtomicUsize>,
+        woken: Arc<AtomicUsize>,
+    }
+
+    impl Wake for Reentrant {
+        fn wake(self: Arc<Self>) {
+            self.woken.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for Reentrant {
+        fn drop(&mut self) {
+            // Takes the clock's lock: deadlocks if the clock drops wakers while holding it.
+            let _ = self.clock.pending_waiters();
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Runs `body` on another thread and fails, rather than hangs, if it does not finish.
+    fn within_timeout(body: impl FnOnce() + Send + 'static) {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            body();
+            let _ = done.send(());
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(30)),
+            Ok(()),
+            "deadlocked or panicked"
+        );
+    }
+
+    /// Review S2: the clock never drops a waker while holding its lock, on any path that
+    /// releases a stored waker: a re-poll that replaces it, a cancelled (dropped) sleep, and an
+    /// advance that wakes it.
+    #[test]
+    fn waker_dropped_outside_the_lock() {
+        within_timeout(|| {
+            let clock = ManualClock::new(WALL);
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let woken = Arc::new(AtomicUsize::new(0));
+            let reentrant = || {
+                Waker::from(Arc::new(Reentrant {
+                    clock: clock.clone(),
+                    dropped: Arc::clone(&dropped),
+                    woken: Arc::clone(&woken),
+                }))
+            };
+            let poll = |sleep: &mut Sleep, waker: Waker| {
+                // The clock then holds the only reference to the waker.
+                sleep.as_mut().poll(&mut Context::from_waker(&waker))
+            };
+
+            // Re-poll: the old waker is replaced and dropped.
+            let mut sleep = clock.sleep_until(at(10));
+            assert_eq!(poll(&mut sleep, reentrant()), Poll::Pending);
+            assert_eq!(poll(&mut sleep, reentrant()), Poll::Pending);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+
+            // Cancel: dropping the sleep drops its stored waker.
+            drop(sleep);
+            assert_eq!(dropped.load(Ordering::SeqCst), 2);
+
+            // Advance: the released waker is woken and dropped.
+            let mut sleep = clock.sleep_until(at(10));
+            assert_eq!(poll(&mut sleep, reentrant()), Poll::Pending);
+            clock.advance(Duration::from_secs(10));
+            assert_eq!(woken.load(Ordering::SeqCst), 1);
+            assert_eq!(dropped.load(Ordering::SeqCst), 3);
+            assert_eq!(poll(&mut sleep, reentrant()), Poll::Ready(()));
+            drop(sleep);
+            assert_eq!(dropped.load(Ordering::SeqCst), 4);
+            assert_eq!(clock.pending_waiters(), 0);
+        });
+    }
+
     /// A waiter re-polled with a new waker is woken through the new one only, once.
     #[test]
     fn repoll_replaces_the_waker() {
@@ -518,8 +609,9 @@ mod tests {
         assert_eq!(clock.wall_now(), i64::MAX);
     }
 
-    /// AC6: the clock does no I/O and never reads the system time. The forbidden names are
-    /// split so that this test does not match itself.
+    /// AC6: the clock does no I/O and never reads the system time. This is a tripwire, not a
+    /// proof: it searches the source for the usual names, which the reviewer accepted. The
+    /// forbidden names are split so that this test does not match itself.
     #[test]
     fn source_reads_no_system_time_and_does_no_io() {
         let source = include_str!("clock.rs");

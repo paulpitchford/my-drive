@@ -20,7 +20,9 @@
 
 use std::fmt;
 
-use crate::names::{FORBIDDEN_SUBSTRING, NameContext, NameError, NameProblem, validate_name};
+use crate::names::{
+    FORBIDDEN_SUBSTRING, NameContext, NameError, NameProblem, find_case_collisions, validate_name,
+};
 
 /// The longest name, in bytes of UTF-8, that a conflict copy may have.
 ///
@@ -73,15 +75,21 @@ pub enum ConflictNameError {
         #[source]
         source: NameError,
     },
-    /// The extension is so long that no suffix and no stem fit within [`MAX_NAME_BYTES`]
-    /// without cutting the extension.
+    /// The extension is so long that, at copy number `number`, the suffix and at least one
+    /// character of the stem do not fit within [`MAX_NAME_BYTES`] without cutting the
+    /// extension.
+    ///
+    /// This can happen part-way through numbering: `-<host>` may fit, be taken, and
+    /// `-<host>-2` not fit. Every earlier candidate was then reported taken.
     #[error(
-        "cannot name a conflict copy of {name:?}: its extension leaves no room for the stem \
-         and the suffix within {MAX_NAME_BYTES} bytes"
+        "cannot name a conflict copy of {name:?}: with copy number {number} there is no room \
+         for the suffix within {MAX_NAME_BYTES} bytes without cutting the extension"
     )]
     NoRoom {
         /// The original name.
         name: String,
+        /// The copy number whose suffix did not fit (1 is the unnumbered `-<host>`).
+        number: u32,
     },
     /// Every candidate up to [`MAX_COPY_NUMBER`] was reported taken.
     #[error(
@@ -110,11 +118,17 @@ pub enum ConflictNameError {
 
 /// Chooses the name of the conflict copy of `name` made on host `host` (ADR-0012 R7).
 ///
-/// `context` is where the copy will live: the same folder as the original. `is_taken` is
-/// asked about each candidate in turn and must return true if that name is already used in
-/// the folder, locally or on the server. The server namespace is case-insensitive, so the
-/// predicate should compare as [`crate::names::find_case_collisions`] does. A candidate equal
-/// to `name` itself is never returned, whatever the predicate says.
+/// `context` is where the copy will live: the same folder as the original.
+///
+/// Collisions are split between this function and the caller:
+///
+/// - This function guarantees that the result does not collide with `name` itself,
+///   case-insensitively, as [`find_case_collisions`] defines a collision. A candidate that
+///   would is skipped without asking the predicate.
+/// - `is_taken` is responsible for every other existing name. It is asked about each
+///   remaining candidate in turn and must return true if that name collides with any name
+///   already used in the folder, locally or on the server, comparing the way
+///   [`find_case_collisions`] does (the server namespace is case-insensitive).
 ///
 /// `host` should be the short host name (without the domain); it is used as given apart from
 /// the replacements described in [`host_segment`].
@@ -126,7 +140,8 @@ pub enum ConflictNameError {
 /// # Errors
 ///
 /// [`ConflictNameError::InvalidName`] if `name` fails [`validate_name`];
-/// [`ConflictNameError::NoRoom`] if the extension is too long to leave room;
+/// [`ConflictNameError::NoRoom`] if the extension is too long to leave room for a suffix,
+/// possibly only once a number is needed;
 /// [`ConflictNameError::AllTaken`] after [`MAX_COPY_NUMBER`] taken candidates. The predicate
 /// is called at most [`MAX_COPY_NUMBER`] times, so the function always terminates.
 pub fn conflict_copy_name<F>(
@@ -154,6 +169,7 @@ where
         let candidate =
             assemble(stem, &suffix, extension).ok_or_else(|| ConflictNameError::NoRoom {
                 name: name.to_owned(),
+                number,
             })?;
         if let Err(source) = validate_name(&candidate, context) {
             return Err(ConflictNameError::CandidateInvalid {
@@ -162,7 +178,8 @@ where
                 source,
             });
         }
-        if candidate != name && !is_taken(&candidate) {
+        let collides_with_original = !find_case_collisions([candidate.as_str(), name]).is_empty();
+        if !collides_with_original && !is_taken(&candidate) {
             return Ok(candidate);
         }
         last_tried = candidate;
@@ -370,6 +387,20 @@ mod tests {
         );
     }
 
+    /// Review S1: the result never collides with the original name case-insensitively, as
+    /// `find_case_collisions` defines it, even if the predicate says it is free.
+    #[test]
+    fn result_never_collides_with_the_original_ignoring_case() {
+        let name = format!("{}-LAPTOP.txt", "a".repeat(244));
+        assert_eq!(name.len(), MAX_NAME_BYTES);
+        let result = conflict_copy_name(&name, "laptop", PERSONAL, |_| false).unwrap();
+        assert!(
+            crate::names::find_case_collisions([result.as_str(), name.as_str()]).is_empty(),
+            "{result:?} collides with {name:?}"
+        );
+        assert!(result.ends_with("-laptop-2.txt"), "{result}");
+    }
+
     /// AC2: the original name is never returned, even if the predicate says it is free. It
     /// can come up when shortening the stem removes exactly the part the suffix adds back.
     #[test]
@@ -455,8 +486,31 @@ mod tests {
         let name = format!("a.{}", "e".repeat(MAX_NAME_BYTES));
         assert_eq!(
             conflict_copy_name(&name, "laptop", PERSONAL, |_| false),
-            Err(ConflictNameError::NoRoom { name: name.clone() })
+            Err(ConflictNameError::NoRoom {
+                name: name.clone(),
+                number: 1
+            })
         );
+    }
+
+    /// Review N1: `NoRoom` can come part-way through numbering, when `-<host>` fits but is
+    /// taken and `-<host>-2` does not fit. The error names the copy number.
+    #[test]
+    fn no_room_once_a_number_is_needed() {
+        let name = format!("a.{}", "e".repeat(249));
+        assert_eq!(
+            conflict_copy_name(&name, "pc", PERSONAL, |_| false).unwrap(),
+            format!("a-pc.{}", "e".repeat(249))
+        );
+        let err = conflict_copy_name(&name, "pc", PERSONAL, |_| true).unwrap_err();
+        assert_eq!(
+            err,
+            ConflictNameError::NoRoom {
+                name: name.clone(),
+                number: 2
+            }
+        );
+        assert!(err.to_string().contains("copy number 2"), "{err}");
     }
 
     /// An invalid original name is a typed error.
@@ -513,8 +567,9 @@ mod tests {
         }
     }
 
-    /// AC6: conflict naming does no I/O and never reads the system time or host name. The
-    /// forbidden names are split so that this test does not match itself.
+    /// AC6: conflict naming does no I/O and never reads the system time or host name. This is
+    /// a tripwire, not a proof: it searches the source for the usual names, which the reviewer
+    /// accepted. The forbidden names are split so that this test does not match itself.
     #[test]
     fn source_reads_no_system_state_and_does_no_io() {
         let source = include_str!("conflict.rs");
@@ -548,7 +603,12 @@ mod tests {
     fn valid_name() -> impl Strategy<Value = (String, NameContext)> {
         (
             name_chars(300),
-            prop::option::of(name_chars(12)),
+            prop_oneof![
+                Just(None),
+                name_chars(12).prop_map(Some),
+                // Long enough, sometimes, that no suffix fits (review N2).
+                "[a-zé日😀]{40,250}".prop_map(Some),
+            ],
             prop::sample::select(ALL_CONTEXTS.to_vec()),
         )
             .prop_map(|(stem, ext, context)| {
@@ -581,11 +641,39 @@ mod tests {
         ]
     }
 
+    /// Whether copy number `number` fits with at least the stem's first character.
+    fn fits(stem: &str, segment: &str, number: u32, extension: &str) -> bool {
+        let first = stem.chars().next().map_or(0, char::len_utf8);
+        let suffix = Suffix {
+            host: segment,
+            number,
+        }
+        .to_string();
+        first + suffix.len() + extension.len() <= MAX_NAME_BYTES
+    }
+
+    /// The copy number among `candidates` whose suffix and extension end `result`.
+    fn copy_number(
+        result: &str,
+        segment: &str,
+        extension: &str,
+        candidates: &[u32],
+    ) -> Option<u32> {
+        candidates.iter().copied().find(|&number| {
+            let suffix = Suffix {
+                host: segment,
+                number,
+            };
+            result.ends_with(&format!("{suffix}{extension}"))
+        })
+    }
+
     proptest! {
         /// AC4: for any host and any valid name, the result is valid in the same context,
         /// at most 255 bytes, and differs from the original only by a stem shortened at a
         /// character boundary and the inserted suffix. With an extension of up to 100 bytes
-        /// it always succeeds.
+        /// it always succeeds; `NoRoom` is returned exactly when not even the stem's first
+        /// character fits beside the suffix and the extension (review N2).
         #[test]
         fn result_is_valid_and_bounded(
             (name, context) in valid_name(),
@@ -597,22 +685,26 @@ mod tests {
             if extension.len() <= 100 {
                 prop_assert!(result.is_ok(), "{:?}", result);
             }
-            let Ok(result) = result else {
-                prop_assert!(
-                    matches!(result, Err(ConflictNameError::NoRoom { .. })),
-                    "{:?}",
-                    result
+            if !fits(stem, &segment, 1, extension) {
+                prop_assert_eq!(
+                    result,
+                    Err(ConflictNameError::NoRoom { name: name.clone(), number: 1 })
                 );
                 return Ok(());
+            }
+            let Ok(result) = result else {
+                return Err(TestCaseError::fail(format!("{result:?} though the suffix fits")));
             };
             prop_assert_eq!(validate_name(&result, context), Ok(()));
             prop_assert!(result.len() <= MAX_NAME_BYTES, "{} bytes", result.len());
+            // Review S1: never a case-insensitive collision with the original.
+            prop_assert!(find_case_collisions([result.as_str(), name.as_str()]).is_empty());
             prop_assert!(result.ends_with(extension));
-            let suffix = format!("-{segment}");
-            let kept = &result[..result.len() - extension.len()];
-            let kept = kept.strip_suffix(suffix.as_str());
-            prop_assert!(kept.is_some(), "suffix {:?} missing from {:?}", suffix, result);
-            let kept = kept.unwrap_or_default();
+            // Normally `-<host>`; `-<host>-2` when the first collides with the original.
+            let number = copy_number(&result, &segment, extension, &[1, 2]);
+            prop_assert!(number.is_some(), "no suffix in {:?}", result);
+            let suffix = Suffix { host: &segment, number: number.unwrap_or(1) }.to_string();
+            let kept = &result[..result.len() - extension.len() - suffix.len()];
             prop_assert!(!kept.is_empty());
             // The suffix brings no control character into the name.
             prop_assert!(
@@ -631,49 +723,62 @@ mod tests {
             }
         }
 
-        /// AC2: the result is never a name the predicate reports as taken. When the first n
-        /// candidates are taken, the result is candidate n + 1, numbered n + 1.
+        /// AC2: the result is never a name the predicate reports as taken, and never collides
+        /// with the original. Candidates are asked about in number order, each once; the
+        /// predicate reports the first `taken_first` and a scattered set of later ones taken.
+        /// `NoRoom` comes exactly at the first number whose suffix does not fit (review N2).
         #[test]
         fn result_is_never_taken(
             (name, context) in valid_name(),
             host in any_host(),
             taken_first in 0_usize..40,
-            extra_taken in prop::collection::hash_set(name_chars(20), 0..10),
+            taken_later in prop::collection::hash_set(0_usize..60, 0..10),
         ) {
             let asked = RefCell::new(Vec::new());
+            let reported_taken = RefCell::new(HashSet::new());
             let result = conflict_copy_name(&name, &host, context, |c| {
                 let mut asked = asked.borrow_mut();
+                let index = asked.len();
                 asked.push(c.to_owned());
-                asked.len() <= taken_first || extra_taken.contains(c)
+                let taken = index < taken_first || taken_later.contains(&index);
+                if taken {
+                    reported_taken.borrow_mut().insert(c.to_owned());
+                }
+                taken
             });
             let asked = asked.into_inner();
-            let Ok(result) = result else {
-                // Only an extension too long for any copy, never "all taken" at this size.
-                prop_assert!(
-                    matches!(result, Err(ConflictNameError::NoRoom { .. })),
-                    "{:?}",
-                    result
-                );
-                return Ok(());
-            };
-            prop_assert_eq!(validate_name(&result, context), Ok(()));
-            prop_assert!(result.len() <= MAX_NAME_BYTES, "{} bytes", result.len());
-            prop_assert!(!extra_taken.contains(&result));
-            prop_assert_ne!(&result, &name);
-            let position = asked.iter().position(|c| *c == result);
-            prop_assert_eq!(position, Some(asked.len() - 1));
-            prop_assert!(asked.len() > taken_first);
+            let reported_taken = reported_taken.into_inner();
+            let (stem, extension) = split_extension(&name);
+            let segment = host_segment(&host, context);
             // Every candidate asked about is distinct, so a taken one is never re-offered.
             let distinct: HashSet<&String> = asked.iter().collect();
             prop_assert_eq!(distinct.len(), asked.len());
-            let segment = host_segment(&host, context);
-            // A candidate equal to the original is skipped without asking, which shifts the
-            // numbering; that needs the original to contain the suffix already.
-            if asked.len() > 1 && !name.contains(&format!("-{segment}")) {
-                let number = asked.len();
-                let (_, extension) = split_extension(&name);
-                let ending = format!("-{segment}-{number}{extension}");
-                prop_assert!(result.ends_with(&ending), "{:?} lacks {:?}", result, ending);
+            // At most one candidate (one that collides with the original) is skipped unasked.
+            let asked_count = u32::try_from(asked.len()).unwrap_or(u32::MAX);
+            match result {
+                Err(ConflictNameError::NoRoom { number, .. }) => {
+                    prop_assert!(!fits(stem, &segment, number, extension));
+                    prop_assert!(number == 1 || fits(stem, &segment, number - 1, extension));
+                    prop_assert!(number == asked_count + 1 || number == asked_count + 2);
+                    prop_assert_eq!(reported_taken.len(), asked.len());
+                }
+                Ok(result) => {
+                    prop_assert_eq!(validate_name(&result, context), Ok(()));
+                    prop_assert!(result.len() <= MAX_NAME_BYTES, "{} bytes", result.len());
+                    prop_assert!(!reported_taken.contains(&result));
+                    prop_assert!(
+                        find_case_collisions([result.as_str(), name.as_str()]).is_empty()
+                    );
+                    prop_assert_eq!(asked.last(), Some(&result));
+                    prop_assert!(asked.len() > taken_first);
+                    let number = copy_number(
+                        &result, &segment, extension, &[asked_count, asked_count + 1],
+                    );
+                    prop_assert!(number.is_some(), "{:?} is not candidate {}", result, asked_count);
+                }
+                Err(other) => {
+                    return Err(TestCaseError::fail(format!("unexpected {other:?}")));
+                }
             }
         }
     }
