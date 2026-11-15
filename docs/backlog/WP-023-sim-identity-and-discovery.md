@@ -6,7 +6,7 @@
 - **Depends on:** WP-014
 - **Gates:** — (its guesses about policy errors and read-only signals stay provisional until G2)
 - **Owned paths:** `crates/mydrive-graph-sim/src/identity.rs`, `src/authority.rs`,
-  `src/discovery.rs`, `src/lib.rs`, `src/server.rs`,
+  `src/discovery.rs`, `src/lib.rs`, `src/server.rs`, `src/log.rs`,
   `crates/mydrive-graph-sim/tests/identity_*.rs`, `tests/discovery_*.rs`,
   `crates/mydrive-graph-sim/docs/identity.md`, `crates/mydrive-graph/tests/sim_identity_*.rs`;
   additions only to the switch table and index in `crates/mydrive-graph-sim/README.md` and
@@ -83,6 +83,20 @@ Any switch you add goes in the README's switch table and the existing defaults t
 `tests/self_tests.rs`, and `docs/identity.md` gets a row in the README's index. WP-019 adds
 rows to the same table and test in this wave: add yours without reordering or rewording
 existing rows, so the two merge cleanly.
+
+The request log: `log.rs` is yours in this wave for two changes only. Add `Origin::Authority`
+for the authority's listener. Mask authority-issued access tokens where the log records the
+`authorization` header, keeping a non-secret prefix that tells tokens apart; the fixed token
+and tokens added through the control API are still logged in full, because existing tests
+read them. Nothing sent to the authority (codes, verifiers, refresh tokens) is logged.
+
+Personal accounts carry the consumer tenant ID `9188040d-6c67-4c5b-b112-36a304b66dad`, which
+is Microsoft's documented public constant, not account data. Every other tenant, object ID,
+user name and domain is obviously fake.
+
+The drive resource's own `name` stays fixed (it comes from files this package does not own);
+site and library names are served by this package's own routes. Making the drive name
+configurable is a follow-up.
 
 Existing tokens: the simulator today accepts one fixed bearer token per instance. Tokens the
 authority issues must be accepted by the Graph origin too, and the fixed token must keep
