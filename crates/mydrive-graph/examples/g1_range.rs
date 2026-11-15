@@ -1026,7 +1026,8 @@ pub(crate) fn check_account(
 }
 
 /// The raw HTTP side: requests sent by hand so every status and header can be reported.
-struct Probe {
+/// The G5 example uses it for its one Graph request.
+pub(crate) struct Probe {
     http: reqwest::Client,
     graph: Url,
     token: AccessToken,
@@ -1115,8 +1116,25 @@ async fn read_content(
     (info, full.then_some(kept))
 }
 
+/// The drive ID and `driveType` of a `/me/drive` body. The ID is used, never reported.
+pub(crate) fn parse_my_drive(body: &[u8]) -> Result<(DriveId, String), String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "the /me/drive body is not JSON")?;
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| DriveId::new(id).ok())
+        .ok_or("the /me/drive body has no drive ID")?;
+    let kind = value
+        .get("driveType")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| "not stated".to_owned(), |t| account::printable(t, 40));
+    Ok((id, kind))
+}
+
 impl Probe {
-    fn new(graph_base: &str, token: AccessToken) -> Result<Self, String> {
+    /// A probe of the Graph API at `graph_base`, sending `token`.
+    pub(crate) fn new(graph_base: &str, token: AccessToken) -> Result<Self, String> {
         let graph = Url::parse(graph_base).map_err(|_| "the Graph base URL is not a URL")?;
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1163,7 +1181,7 @@ impl Probe {
     }
 
     /// `GET /me/drive`: whether the drive was found, its `driveType`, and its ID.
-    async fn my_drive(&self) -> Result<(DriveId, String), String> {
+    pub(crate) async fn my_drive(&self) -> Result<(DriveId, String), String> {
         let url = self.graph_url(&["me", "drive"]);
         let response = self.send(&url, true, None).await?;
         let status = response.status().as_u16();
@@ -1182,18 +1200,7 @@ impl Probe {
                 )
             });
         }
-        let value: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|_| "the /me/drive body is not JSON")?;
-        let id = value
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|id| DriveId::new(id).ok())
-            .ok_or("the /me/drive body has no drive ID")?;
-        let kind = value
-            .get("driveType")
-            .and_then(serde_json::Value::as_str)
-            .map_or_else(|| "not stated".to_owned(), |t| account::printable(t, 40));
-        Ok((id, kind))
+        parse_my_drive(&body)
     }
 
     /// One request and its described response. A `200` or `206` body is read as `read`

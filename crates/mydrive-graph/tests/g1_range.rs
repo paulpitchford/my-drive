@@ -749,3 +749,17 @@ fn render_fixed_report() {
     }
     assert!(report.completed());
 }
+
+/// AC1: the `/me/drive` body gives the drive ID (used, never reported) and `driveType`.
+/// Tested on fixed input: the simulator has no `/me` routes until WP-023.
+#[test]
+fn me_drive_body_is_parsed() {
+    let (id, kind) = g1::parse_my_drive(br#"{"id":"B!AbC","driveType":"personal"}"#).unwrap();
+    assert_eq!(id.as_str(), "b!abc");
+    assert_eq!(kind, "personal");
+    let (_, kind) = g1::parse_my_drive(br#"{"id":"x"}"#).unwrap();
+    assert_eq!(kind, "not stated");
+    assert!(g1::parse_my_drive(b"nope").is_err());
+    assert!(g1::parse_my_drive(br#"{"driveType":"business"}"#).is_err());
+    assert!(g1::parse_my_drive(br#"{"id":""}"#).is_err());
+}
