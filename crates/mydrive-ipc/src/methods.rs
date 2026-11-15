@@ -1555,18 +1555,34 @@ pub struct MountAddConfirmResult {
 }
 
 /// `mount.remove` parameters. There is no parameter that could delete remote content:
-/// removing a mount never deletes anything on the server (ADR-0015, WP-016 AC7).
+/// removing a mount never deletes anything on the server (ADR-0015 R8, WP-016 AC7).
+///
+/// A mount with files whose changes are not yet on the server is not removed unless
+/// `keep_unsynced` is true: the daemon answers `refused` with reason `unsynced-changes`,
+/// counting and naming them ([`RpcError::unsynced_changes`]), so the user can confirm that
+/// those files will stay only on this computer (F12 step 11). Absent, `null` and `false` all
+/// mean "refuse". A dry run never refuses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MountRemoveParams {
     /// The mount to remove.
     pub mount_id: MountId,
-    /// True to report what removal would find, changing nothing.
+    /// True to report what removal would find, changing nothing. Never refused for unsynced
+    /// changes.
     #[serde(
         default,
         skip_serializing_if = "std::ops::Not::not",
         deserialize_with = "null_as_default"
     )]
     pub dry_run: bool,
+    /// True when the user has confirmed that files with changes not yet on the server will
+    /// stay only on this computer: removal then treats them like every other local file
+    /// (F12 step 11) and they are never uploaded. False refuses removal while there are any.
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        deserialize_with = "null_as_default"
+    )]
+    pub keep_unsynced: bool,
 }
 
 /// `mount.remove` result.
@@ -1581,8 +1597,9 @@ pub struct MountRemoveResult {
     pub mount_point: ProtocolPath,
     /// Fully local files whose content is (or would be) kept at the mount point.
     pub kept_files: u64,
-    /// Files whose changes are not yet on the server. A client warns before removing a mount
-    /// that has any.
+    /// Files whose changes are not yet on the server. For a dry run, how many a removal
+    /// without `keep_unsynced` would refuse over; after a removal, how many were kept only on
+    /// this computer (only possible with `keep_unsynced`).
     pub unsynced_files: u64,
 }
 
@@ -2241,6 +2258,7 @@ mod tests {
             MethodCall::MountRemove(MountRemoveParams {
                 mount_id: MountId::new("personal").unwrap(),
                 dry_run: false,
+                keep_unsynced: true,
             }),
             MethodCall::MountPause(MountPauseParams {
                 mount_id: None,
@@ -2526,8 +2544,9 @@ mod tests {
     }
 
     /// WP-016 AC7: `account.logout` and `mount.remove` have no parameter that could delete
-    /// remote content. Their parameters are exactly the ID and `dry_run`, and a field asking
-    /// for a delete is an unknown field: ignored, changing nothing in the decoded request.
+    /// remote content. Logout takes exactly the ID and `dry_run`; removal takes the ID,
+    /// `dry_run` and `keep_unsynced`, which only keeps local files. A field asking for a
+    /// delete is an unknown field: ignored, changing nothing in the decoded request.
     #[test]
     fn logout_and_remove_have_no_delete_parameter() {
         let logout =
@@ -2575,8 +2594,9 @@ mod tests {
         let remove = MethodCall::MountRemove(MountRemoveParams {
             mount_id: MountId::new("m").unwrap(),
             dry_run: true,
+            keep_unsynced: true,
         });
-        assert_eq!(keys(&remove), ["dry_run", "mount_id"]);
+        assert_eq!(keys(&remove), ["dry_run", "keep_unsynced", "mount_id"]);
         // A dry run is explicit; absent and null mean "do it", never something destructive.
         let MethodCall::MountRemove(p) = MethodCall::parse(
             method::MOUNT_REMOVE,
@@ -2598,6 +2618,61 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(r.unsynced_files, 2);
+    }
+
+    /// F12 step 11, WP-016 AC7 ruling: removal refuses over unsynced changes unless the
+    /// request carries `keep_unsynced: true`. Absent, `null` and `false` all mean refuse; any
+    /// other value is `invalid-params`, never read as a confirmation.
+    #[test]
+    fn f12_step_11_removal_refuses_unsynced_changes_by_default() {
+        let parse = |params: Value| match MethodCall::parse(method::MOUNT_REMOVE, Some(&params)) {
+            Ok(MethodCall::MountRemove(p)) => Ok(p),
+            Ok(other) => panic!("not a remove: {other:?}"),
+            Err(e) => Err(e),
+        };
+        for refuse in [
+            json!({"mount_id": "m"}),
+            json!({"mount_id": "m", "keep_unsynced": null}),
+            json!({"mount_id": "m", "keep_unsynced": false}),
+        ] {
+            assert!(!parse(refuse.clone()).unwrap().keep_unsynced, "{refuse}");
+        }
+        assert!(
+            parse(json!({"mount_id": "m", "keep_unsynced": true}))
+                .unwrap()
+                .keep_unsynced
+        );
+        for bad in [
+            json!("true"),
+            json!(1),
+            json!("yes"),
+            json!([true]),
+            json!({}),
+        ] {
+            let err = parse(json!({"mount_id": "m", "keep_unsynced": bad})).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{bad}");
+        }
+        // The refusal: `refused`, reason `unsynced-changes`, the full count and a sample.
+        let mount = MountId::new("example-site-documents").unwrap();
+        let files: Vec<ProtocolPath> = (0..50)
+            .map(|i| p(&format!("/home/u/Example/Site - Documents/f{i}.docx")))
+            .collect();
+        let err = RpcError::unsynced_changes(&mount, 50, files.clone());
+        assert_eq!(err.kind(), Some(ErrorCode::Refused));
+        assert_eq!(err.refusal_reason(), Some(RefusalReason::UnsyncedChanges));
+        assert_eq!(err.unsynced_files(), Some(50));
+        let named = err.unsynced_paths().unwrap();
+        assert_eq!(named, files[..crate::error::MAX_UNSYNCED_SAMPLE_PATHS]);
+        assert!(err.message.contains("keep_unsynced"), "{}", err.message);
+        // The error survives the wire unchanged.
+        let back: RpcError = serde_json::from_value(serde_json::to_value(&err).unwrap()).unwrap();
+        assert_eq!(back, err);
+        // Few files: all named; none offered: an empty list, with the count.
+        let err = RpcError::unsynced_changes(&mount, 2, files[..2].to_vec());
+        assert_eq!(err.unsynced_paths().unwrap(), files[..2]);
+        let err = RpcError::unsynced_changes(&mount, 7, Vec::new());
+        assert_eq!(err.unsynced_paths(), Some(Vec::new()));
+        assert_eq!(err.unsynced_files(), Some(7));
     }
 
     /// `mount.list` tells all four combinations of blocked or not and paused or not apart

@@ -136,7 +136,7 @@ uses a new value only when the daemon advertises it.
 | `account.state` | open | `signed-in`, `needs-sign-in` | Treat the account as not active; show the word |
 | `account.kind` | open | `personal`, `work` | Show the word |
 | `error.code` | open | the [error table](#errors) | Treat as a failure; show `message` |
-| `refused.data.reason` | open | `not-in-sync`, `pinned`, `in-use`, `remote-changed`, `insufficient-space`, `already-exists`, `not-a-file`, `name-not-allowed`, `mount-point-not-empty`, `mount-point-overlaps`, `already-mounted`, `no-access`, `unsupported-target` | Show `message` |
+| `refused.data.reason` | open | `not-in-sync`, `pinned`, `in-use`, `remote-changed`, `insufficient-space`, `already-exists`, `not-a-file`, `name-not-allowed`, `mount-point-not-empty`, `mount-point-overlaps`, `already-mounted`, `no-access`, `unsupported-target`, `unsynced-changes` | Show `message` |
 | `refused.data.sync` | open | `in-sync`, `pending-download`, `pending-upload`, `uploading`, `conflict`, `error`, `blocked` | Show the word |
 | `blocked-by-policy.data.reason` | open | `organisation-policy`, `tenant-refused` | Show `message` |
 | `read-only.data.reason` | open | `library-read-only`, `no-write-permission` | Show `message` |
@@ -653,7 +653,13 @@ Parameters: `account_id`, and optionally `dry_run` (`true` to report what signin
 find and change nothing; absent or `false` to sign out). There is no parameter that deletes
 anything: signing out removes the account's tokens from the Secret Service and never deletes
 local or remote content. The account's mounts stay configured; their local changes are kept
-and upload after the account signs in again (F01 "Sign-out").
+and upload after the account signs in again (F01 "Sign-out" step 3).
+
+Signing out, unlike [`mount.remove`](#mountremove), is not refused over unsynced changes and
+has no `keep_unsynced`: nothing is lost by it. F12 step 11's confirmation exists because
+removal discards a mount's record of pending changes, so they could never upload; sign-out
+keeps the mounts, their pending changes and the content, and only stops them uploading until
+the account signs in again (F01 "Sign-out" steps 3 and 4, F12 step 14).
 
 Result: `account_id`, `signed_out` (`false` for a dry run) and `unsynced_files`, the files in
 the account's mounts with changes not yet on the server. A client calls with `dry_run` first
@@ -884,16 +890,26 @@ The drive is already mounted:
 
 ### mount.remove
 
-Parameters: `mount_id`, and optionally `dry_run` (`true` to report and change nothing).
-There is no parameter that deletes remote content: **removing a mount never deletes anything
-on the server** (ADR-0015, J15). Each fully local file is kept in the mount point, which
-becomes a plain directory (ADR-0021); placeholders are not kept.
+Parameters: `mount_id`; optionally `dry_run` (`true` to report and change nothing); and
+optionally `keep_unsynced` (`true` when the user has confirmed that files with changes not yet
+on the server will stay only on this computer). There is no parameter that deletes remote
+content: **removing a mount never deletes anything on the server** (ADR-0015 R8, J15). Each
+fully local file is kept in the mount point, which becomes a plain directory (ADR-0021);
+placeholders are not kept.
+
+**A mount with unsynced changes is not removed without confirmation** (F12 step 11). If any
+file of the mount has changes not yet on the server and `keep_unsynced` is absent, `null` or
+`false`, the request is `refused` with reason `unsynced-changes` and nothing changes.
+`data.unsynced_files` is how many such files there are and `data.paths` names some of them:
+at most 20, taking at most 65,536 bytes together, in their JSON encoding. The client shows
+them, says that those changes will never reach the server, and asks; only on the user's yes
+does it repeat the request with `keep_unsynced: true`. Removal then treats those files like
+every other local file and never uploads them. A `dry_run` never refuses: it reports.
 
 Result: `mount_id`; `removed` (`false` for a dry run); `mount_point`, where the local copies
 are kept; `kept_files`, the fully local files kept there; and `unsynced_files`, the files whose
-changes are not yet on the server. A client calls with `dry_run` first and warns when
-`unsynced_files` is not zero. What the daemon does with unsynced changes on removal is
-decided by F12; it never drops them silently.
+changes are not yet on the server (for a dry run, how many a removal without `keep_unsynced`
+would refuse over; after a removal, how many stay only on this computer).
 
 <!-- example: request -->
 ```json
@@ -902,7 +918,7 @@ decided by F12; it never drops them silently.
 
 <!-- example: response mount.remove -->
 ```json
-{"jsonrpc": "2.0", "id": 46, "result": {"mount_id": "example-site-documents", "removed": false, "mount_point": "/home/user/Example/Site - Documents", "kept_files": 140, "unsynced_files": 0}}
+{"jsonrpc": "2.0", "id": 46, "result": {"mount_id": "example-site-documents", "removed": false, "mount_point": "/home/user/Example/Site - Documents", "kept_files": 140, "unsynced_files": 2}}
 ```
 
 <!-- example: request -->
@@ -910,9 +926,21 @@ decided by F12; it never drops them silently.
 {"jsonrpc": "2.0", "id": 47, "method": "mount.remove", "params": {"mount_id": "example-site-documents"}}
 ```
 
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 47, "error": {"code": 1004, "message": "mount example-site-documents was not removed: 2 file(s) have changes not yet on the server; remove it with keep_unsynced to keep those files only on this computer", "data": {"reason": "unsynced-changes", "unsynced_files": 2, "paths": ["/home/user/Example/Site - Documents/Q4 Plan/roadmap.docx", "/home/user/Example/Site - Documents/notes.md"]}}}
+```
+
+After the user confirms:
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 60, "method": "mount.remove", "params": {"mount_id": "example-site-documents", "keep_unsynced": true}}
+```
+
 <!-- example: response mount.remove -->
 ```json
-{"jsonrpc": "2.0", "id": 47, "result": {"mount_id": "example-site-documents", "removed": true, "mount_point": "/home/user/Example/Site - Documents", "kept_files": 140, "unsynced_files": 0}}
+{"jsonrpc": "2.0", "id": 60, "result": {"mount_id": "example-site-documents", "removed": true, "mount_point": "/home/user/Example/Site - Documents", "kept_files": 140, "unsynced_files": 2}}
 ```
 
 <!-- example: request -->
@@ -929,6 +957,7 @@ decided by F12; it never drops them silently.
 |---|---|---|
 | `invalid-params` | Malformed parameters | Fix the request |
 | `unknown-mount` | No mount has this ID | List mounts again |
+| `refused` | `unsynced-changes`, with `data.unsynced_files` and `data.paths`, when `keep_unsynced` is not `true` | Show the files and ask; repeat with `keep_unsynced: true` only on the user's yes |
 | `hello-required` | Before `hello` | Fix the client |
 | `not-ready` | The daemon is starting | Retry shortly |
 | `internal` | A daemon fault | Report it |
@@ -1431,7 +1460,7 @@ also tolerate a `data` of a shape they do not expect.
 | 1001 | `not-ready` | The daemon is still starting; retry later | | top level |
 | 1002 | `unknown-path` | Under a mount point, but no such item | | both |
 | 1003 | `not-in-a-mount` | Not under any mount point | | both |
-| 1004 | `refused` | Understood and refused; nothing changed | `reason`, `sync` for `not-in-sync`, `mount_id` for `already-mounted` | both |
+| 1004 | `refused` | Understood and refused; nothing changed | `reason`, `sync` for `not-in-sync`, `mount_id` for `already-mounted`, `unsynced_files` and `paths` for `unsynced-changes` | both |
 | 1005 | `needs-sign-in` | The account must sign in again | | both |
 | 1006 | `blocked-by-policy` | Organisation policy refuses access | `reason` | both |
 | 1007 | `read-only` | The item or its mount is read-only | `reason` | both |
@@ -1461,7 +1490,7 @@ repeated below.
 | `mount.list` | `invalid-params`, `hello-required`, `not-ready`, `internal` | — |
 | `mount.add.preview` | `invalid-params`, `unknown-account`, `needs-sign-in`, `blocked-by-policy`, `refused`, `offline`, `hello-required`, `not-ready`, `internal` | — |
 | `mount.add.confirm` | `invalid-params`, `unknown-account`, `needs-sign-in`, `blocked-by-policy`, `refused`, `offline`, `hello-required`, `not-ready`, `internal` | — |
-| `mount.remove` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.remove` | `invalid-params`, `unknown-mount`, `refused`, `hello-required`, `not-ready`, `internal` | — |
 | `mount.pause` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
 | `mount.resume` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
 | `item.status` | `invalid-params`, `not-in-a-mount`, `unknown-path`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `internal` |

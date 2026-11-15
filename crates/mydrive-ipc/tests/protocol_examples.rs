@@ -1289,6 +1289,9 @@ fn local_paths_times_and_credentials_are_documented() {
         "A request is never guessed at.",
         "Sign-in never creates a mount",
         "removing a mount never deletes anything on the server",
+        "A mount with unsynced changes is not removed without confirmation",
+        "A `dry_run` never refuses",
+        "is not refused over unsynced changes and has no `keep_unsynced`",
         "A file with changes not yet on the server is never replaced",
     ] {
         assert!(flat.contains(needle), "the catalogue must say {needle:?}");
@@ -1317,6 +1320,7 @@ fn new_reasons_have_examples() {
         (1004, "mount-point-not-empty"),
         (1004, "unsupported-target"),
         (1004, "not-in-sync"),
+        (1004, "unsynced-changes"),
         (-32602, "restart-preview"),
     ] {
         assert!(

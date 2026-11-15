@@ -12,7 +12,9 @@ use mydrive_core::ids::{AccountId, DriveId, MountId, TenantId};
 use mydrive_core::state::{EffectivePin, Hydration, ItemState, Modifiers, Pin, Sync};
 use mydrive_ipc::codec::{MAX_LINE_BYTES, encode_line};
 use mydrive_ipc::envelope::{ErrorResponse, Id, MAX_ID_BYTES, Notification, SuccessResponse};
-use mydrive_ipc::error::{ErrorCode, RpcError};
+use mydrive_ipc::error::{
+    ErrorCode, MAX_UNSYNCED_SAMPLE_BYTES, MAX_UNSYNCED_SAMPLE_PATHS, RpcError,
+};
 use mydrive_ipc::methods::{
     AccountInfo, ActionOutcome, AttemptId, AuthorizationUrl, ConfirmationToken, DaemonStatusResult,
     HelloParams, ItemExportParams, ItemExportResult, ItemImportParams, ItemImportResult, ItemInfo,
@@ -604,6 +606,7 @@ fn worst_mount_remove() {
         &MethodCall::MountRemove(MountRemoveParams {
             mount_id: MountId::new("m".repeat(64)).unwrap(),
             dry_run: true,
+            keep_unsynced: true,
         }),
         method::MOUNT_REMOVE,
     );
@@ -615,6 +618,20 @@ fn worst_mount_remove() {
         unsynced_files: u64::MAX,
     };
     assert_result_fits(&result, method::MOUNT_REMOVE);
+    // The refusal over unsynced changes, offered far more and far longer paths than it may
+    // name, of a character JSON escapes six-fold: the sample is cut to its bounds and fits.
+    let sample: Vec<ProtocolPath> = (0..10_000)
+        .map(|i| long_path(&format!("u{i}"), '\u{1}'))
+        .collect();
+    let err = RpcError::unsynced_changes(&MountId::new("m".repeat(64)).unwrap(), u64::MAX, sample);
+    let named = err.unsynced_paths().unwrap();
+    assert!(!named.is_empty() && named.len() <= MAX_UNSYNCED_SAMPLE_PATHS);
+    assert!(encoded_path_bytes(&named) <= MAX_UNSYNCED_SAMPLE_BYTES);
+    assert_eq!(err.unsynced_files(), Some(u64::MAX));
+    assert_fits(
+        &ErrorResponse::new(Some(worst_id()), err),
+        "unsynced-changes",
+    );
 }
 
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
@@ -769,6 +786,7 @@ fn one_call_per_variant() -> Vec<MethodCall> {
         MethodCall::MountRemove(MountRemoveParams {
             mount_id: MountId::new("m").unwrap(),
             dry_run: false,
+            keep_unsynced: false,
         }),
         MethodCall::MountPause(MountPauseParams::default()),
         MethodCall::MountResume(MountResumeParams::default()),

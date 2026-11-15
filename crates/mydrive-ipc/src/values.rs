@@ -187,6 +187,10 @@ open_enum! {
         /// `mount.add.*`: the target is not something this version can mount, for example a
         /// shared folder in another person's OneDrive (F09).
         UnsupportedTarget => "unsupported-target",
+        /// `mount.remove` without `keep_unsynced`: files in the mount have changes not yet on
+        /// the server; `data.unsynced_files` counts them and `data.paths` names some (F12
+        /// step 11).
+        UnsyncedChanges => "unsynced-changes",
     }
 }
 

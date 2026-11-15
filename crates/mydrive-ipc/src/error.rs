@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::path::ProtocolPath;
 use crate::values::{
     BlockedReason, InvalidParamsReason, LocalFileReason, ReadOnlyReason, RefusalReason,
     SignInFailure, WireSync,
@@ -211,6 +212,15 @@ pub(crate) fn truncate_to(text: &str, max: usize) -> String {
     out
 }
 
+/// The most paths a `refused` error with reason `unsynced-changes` names in `data.paths`.
+/// `data.unsynced_files` gives the full count.
+pub const MAX_UNSYNCED_SAMPLE_PATHS: usize = 20;
+
+/// The most bytes the paths of an `unsynced-changes` refusal take together, each counted in
+/// its minimal JSON string encoding, quotes included. One path of the longest form takes at
+/// most 24,578 bytes, so the sample always holds at least one path when there is one.
+pub const MAX_UNSYNCED_SAMPLE_BYTES: u64 = 64 * 1024;
+
 /// Structured detail for building `error.data`. Every field is optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ErrorData {
@@ -223,6 +233,12 @@ pub struct ErrorData {
     pub supported_versions: Option<Vec<u32>>,
     /// For `refused` with reason `already-mounted`: the mount that already has the drive.
     pub mount_id: Option<MountId>,
+    /// For `refused` with reason `unsynced-changes`: how many files have changes not yet on
+    /// the server.
+    pub unsynced_files: Option<u64>,
+    /// For `refused` with reason `unsynced-changes`: some of those files, at most
+    /// [`MAX_UNSYNCED_SAMPLE_PATHS`] taking at most [`MAX_UNSYNCED_SAMPLE_BYTES`].
+    pub paths: Option<Vec<ProtocolPath>>,
 }
 
 impl ErrorData {
@@ -242,6 +258,16 @@ impl ErrorData {
                 "mount_id".into(),
                 Value::String(mount_id.as_str().to_owned()),
             );
+        }
+        if let Some(count) = self.unsynced_files {
+            map.insert("unsynced_files".into(), Value::from(count));
+        }
+        if let Some(paths) = self.paths {
+            let paths = paths
+                .into_iter()
+                .map(|p| Value::String(p.as_str().to_owned()))
+                .collect();
+            map.insert("paths".into(), Value::Array(paths));
         }
         (!map.is_empty()).then_some(Value::Object(map))
     }
@@ -379,6 +405,20 @@ impl RpcError {
             .flatten()
     }
 
+    /// `data.unsynced_files`, if present and an unsigned integer (`refused` with
+    /// `unsynced-changes`).
+    #[must_use]
+    pub fn unsynced_files(&self) -> Option<u64> {
+        self.data_field("unsynced_files")
+    }
+
+    /// `data.paths`, if present and a list of valid protocol paths (`refused` with
+    /// `unsynced-changes`).
+    #[must_use]
+    pub fn unsynced_paths(&self) -> Option<Vec<ProtocolPath>> {
+        self.data_field("paths")
+    }
+
     /// `data.mount_id`, if present and a valid mount ID (`refused` with `already-mounted`).
     #[must_use]
     pub fn mount_id(&self) -> Option<MountId> {
@@ -461,6 +501,39 @@ impl RpcError {
         Self::new(ErrorCode::Refused, message).with_data(ErrorData {
             reason: Some(RefusalReason::AlreadyMounted.as_str().to_owned()),
             mount_id: Some(existing.clone()),
+            ..ErrorData::default()
+        })
+    }
+
+    /// `refused` with reason `unsynced-changes`, for `mount.remove` without `keep_unsynced` on
+    /// a mount whose files have changes not yet on the server (F12 step 11). `unsynced_files`
+    /// is the full count; `data.paths` names the first of `sample` that fit within
+    /// [`MAX_UNSYNCED_SAMPLE_PATHS`] and [`MAX_UNSYNCED_SAMPLE_BYTES`], so the error is
+    /// bounded however many files there are.
+    #[must_use]
+    pub fn unsynced_changes(
+        mount_id: &MountId,
+        unsynced_files: u64,
+        sample: impl IntoIterator<Item = ProtocolPath>,
+    ) -> Self {
+        let mut paths = Vec::new();
+        let mut bytes = 0u64;
+        for path in sample.into_iter().take(MAX_UNSYNCED_SAMPLE_PATHS) {
+            let cost = serde_json::to_string(path.as_str()).map_or(u64::MAX, |s| s.len() as u64);
+            if bytes.saturating_add(cost) > MAX_UNSYNCED_SAMPLE_BYTES {
+                break;
+            }
+            bytes += cost;
+            paths.push(path);
+        }
+        let message = format!(
+            "mount {mount_id} was not removed: {unsynced_files} file(s) have changes not yet on \
+             the server; remove it with keep_unsynced to keep those files only on this computer"
+        );
+        Self::new(ErrorCode::Refused, message).with_data(ErrorData {
+            reason: Some(RefusalReason::UnsyncedChanges.as_str().to_owned()),
+            unsynced_files: Some(unsynced_files),
+            paths: Some(paths),
             ..ErrorData::default()
         })
     }
