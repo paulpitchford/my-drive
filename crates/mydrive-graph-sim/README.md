@@ -54,6 +54,7 @@ Per drive, in `DriveOptions` (`add_drive_with`, `set_options`).
 | `rewrite` | `Later` | SharePoint libraries rewrite some uploaded files (rclone; research section 4). When the change shows is unverified; after the upload response, as a separate change, is harder. `InResponse` and `Off` exist. Libraries only. |
 | `rewrite_extensions` | `["doc", "docx", "xls", "xlsx", "ppt", "pptx", "eml", "msg", "tif", "tiff"]` | Office files (rclone), and eml, msg and TIFF as abraunegg reports (ADR-0012 context). |
 | `folder_conflict_default` | `Rename` | Create folder's default conflict behaviour is undocumented; silently creating `<name> 1` is harder than an error. |
+| `replace_status` | `Created` | The status of a successful upload that replaces a file is unverified; driveitem-put-content's update example shows `201`, and `201` is harder for a client that reads it as "created". `Ok` gives `200`. |
 
 ## Simulated
 

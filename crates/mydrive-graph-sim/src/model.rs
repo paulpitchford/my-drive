@@ -11,7 +11,7 @@ use crate::error::SimError;
 use crate::fault::Fault;
 use crate::log::LoggedRequest;
 use crate::time::START_SECS;
-use crate::write::{ConflictBehavior, RewriteMode};
+use crate::write::{ConflictBehavior, ReplaceStatus, RewriteMode};
 
 /// The kind of drive, as Graph's `driveType` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -153,6 +153,10 @@ pub struct DriveOptions {
     /// [`ConflictBehavior::Rename`], the harder case: the folder is created under another
     /// name without an error.
     pub folder_conflict_default: ConflictBehavior,
+    /// The status a successful upload that replaced an existing file answers. Unverified;
+    /// default [`ReplaceStatus::Created`], what driveitem-put-content's update example
+    /// shows and the harder case for a client that reads `201` as "a new item".
+    pub replace_status: ReplaceStatus,
 }
 
 /// The extensions [`DriveOptions::rewrite_extensions`] holds by default.
@@ -183,6 +187,7 @@ impl Default for DriveOptions {
                 .map(|ext| (*ext).to_owned())
                 .collect(),
             folder_conflict_default: ConflictBehavior::Rename,
+            replace_status: ReplaceStatus::Created,
         }
     }
 }

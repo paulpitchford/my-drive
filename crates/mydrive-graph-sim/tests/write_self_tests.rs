@@ -11,7 +11,7 @@ mod write_self_tests {
     use mydrive_core::ids::{DriveId, ItemId};
     use mydrive_graph_sim::{
         ConflictBehavior, DeltaRepeats, DriveOptions, DriveType, FolderDeletes, GraphSim, Method,
-        RewriteMode, StatusCode,
+        ReplaceStatus, RewriteMode, StatusCode,
     };
     use reqwest::redirect::Policy;
     use serde_json::{Value, json};
@@ -261,7 +261,7 @@ mod write_self_tests {
 
             let etag = current["eTag"].as_str().unwrap();
             let (status, replaced) = replace(&sim, &drive, &file, Some(etag), b"three").await;
-            assert_eq!(status, StatusCode::OK);
+            assert_eq!(status, StatusCode::CREATED);
             assert_eq!(replaced["id"], file.as_str());
             assert_eq!(replaced["size"], 5);
             assert_eq!(
@@ -292,12 +292,12 @@ mod write_self_tests {
             .create_file(&drive, &root, "f", b"one".to_vec())
             .unwrap();
         let (status, item) = replace(&sim, &drive, &file, Some("\"{stale},1\""), b"two").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
         assert_eq!(item["size"], 3);
         assert_eq!(download(&sim, &drive, &file).await, b"two");
         // The create-by-name form replacing an existing file ignores it too.
         let (status, item) = upload_new(&sim, &drive, &root, "f", None, b"three").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
         assert_eq!(item["id"], file.as_str());
     }
 
@@ -333,7 +333,7 @@ mod write_self_tests {
             .to_owned();
         let url = format!("{}/items/{root}:/f:/content", drive_url(&sim, &drive));
         let (status, _) = send(&sim, Method::PUT, &url, Some(&etag), Some(b"zz".to_vec())).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
     }
 
     /// AC2: a create with `conflictBehavior=fail` on a name that differs only in case
@@ -377,7 +377,7 @@ mod write_self_tests {
         assert_ne!(renamed["id"], file.as_str());
 
         let (status, replaced) = upload_new(&sim, &drive, &root, "Hello.Doc", None, b"rep").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
         assert_eq!(replaced["id"], file.as_str());
         assert_eq!(
             replaced["name"], "hello.doc",
@@ -392,6 +392,7 @@ mod write_self_tests {
         CreateFolder,
         Upload,
         Replace,
+        ReplaceByName,
         Rename,
         Move,
         RenameFolder,
@@ -399,10 +400,11 @@ mod write_self_tests {
         DeleteFolder,
     }
 
-    const STEPS: [Step; 8] = [
+    const STEPS: [Step; 9] = [
         Step::CreateFolder,
         Step::Upload,
         Step::Replace,
+        Step::ReplaceByName,
         Step::Rename,
         Step::Move,
         Step::RenameFolder,
@@ -454,6 +456,9 @@ mod write_self_tests {
             Step::Replace => sim
                 .modify_file(drive, &tree.old, b"replaced!".to_vec())
                 .unwrap(),
+            Step::ReplaceByName => sim
+                .modify_file(drive, &tree.old, b"replaced by name".to_vec())
+                .unwrap(),
             Step::Rename => sim.rename(drive, &tree.keep, "kept.txt").unwrap(),
             Step::Move => sim
                 .move_item(drive, &tree.keep, tree.new_folder.as_ref().unwrap())
@@ -486,7 +491,20 @@ mod write_self_tests {
             }
             Step::Replace => {
                 let (status, _) = replace(sim, drive, &tree.old, None, b"replaced!").await;
-                assert_eq!(status, StatusCode::OK);
+                assert_eq!(status, StatusCode::CREATED);
+            }
+            Step::ReplaceByName => {
+                let (status, item) = upload_new(
+                    sim,
+                    drive,
+                    &tree.dir,
+                    "OLD.TXT",
+                    Some("replace"),
+                    b"replaced by name",
+                )
+                .await;
+                assert_eq!(status, StatusCode::CREATED);
+                assert_eq!(id_of(&item), tree.old);
             }
             Step::Rename => {
                 let (status, _) =
@@ -534,6 +552,7 @@ mod write_self_tests {
             (DriveType::Personal, false),
             (DriveType::Personal, true),
             (DriveType::Business, false),
+            (DriveType::DocumentLibrary, false),
         ];
         for (drive_type, personal_folder_ctag) in cases {
             for delta_repeats in [DeltaRepeats::EveryChange, DeltaRepeats::LatestStateOnce] {
@@ -663,7 +682,7 @@ mod write_self_tests {
             // A replace of a listed file is rewritten too, and the quota counts what is
             // stored.
             let (status, _) = replace(&sim, &drive, &file, None, b"v2").await;
-            assert_eq!(status, StatusCode::OK);
+            assert_eq!(status, StatusCode::CREATED);
             let bytes = download(&sim, &drive, &file).await;
             assert_ne!(bytes, b"v2");
             let served = get_json(&sim, &item_url(&sim, &drive, &file)).await;
@@ -795,7 +814,7 @@ mod write_self_tests {
         }
         assert_eq!(log[5].header("if-match"), None);
         let statuses: Vec<u16> = log.iter().map(|r| r.status).collect();
-        assert_eq!(statuses, vec![200, 201, 412, 412, 201, 200]);
+        assert_eq!(statuses, vec![201, 201, 412, 412, 201, 201]);
     }
 
     /// AC7: a write that would take the drive past its quota answers `507
@@ -822,7 +841,7 @@ mod write_self_tests {
         let (status, _) = upload_new(&sim, &drive, &root, "four", None, b"1234").await;
         assert_eq!(status, StatusCode::CREATED);
         let (status, _) = replace(&sim, &drive, &file, None, b"123").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
         let used = get_json(&sim, &drive_url(&sim, &drive)).await["quota"]["used"].clone();
         assert_eq!(used, 7);
     }
@@ -851,7 +870,7 @@ mod write_self_tests {
 
         sim.set_locked(&drive, &file, false).unwrap();
         let (status, _) = replace(&sim, &drive, &file, None, b"2").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
         assert_eq!(
             delete(&sim, &drive, &dir, None).await,
             StatusCode::NO_CONTENT
@@ -1018,7 +1037,7 @@ mod write_self_tests {
 
         sim.advance_clock(90);
         let (status, item) = replace(&sim, &drive, &file, None, b"2").await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
         assert_eq!(
             item["fileSystemInfo"]["lastModifiedDateTime"],
             "2026-01-01T00:01:30Z"
@@ -1103,6 +1122,7 @@ mod write_self_tests {
             "rewrite",
             "rewrite_extensions",
             "folder_conflict_default",
+            "replace_status",
         ] {
             assert!(
                 doc.contains(&format!("`{switch}`")),
@@ -1114,5 +1134,116 @@ mod write_self_tests {
         assert!(doc.contains("graph_api_and_windows_parity.md"));
         let readme = include_str!("../README.md");
         assert!(readme.contains("(docs/write.md)"));
+    }
+
+    /// `replace_status` decides the status of a successful replace, for the replace by ID
+    /// and the create-by-name form under `replace`: `201` by default (the documented
+    /// example), `200` with `Ok`. A new file is always `201`.
+    #[tokio::test]
+    async fn replace_status_follows_the_switch() {
+        for (setting, expected) in [
+            (ReplaceStatus::Created, StatusCode::CREATED),
+            (ReplaceStatus::Ok, StatusCode::OK),
+        ] {
+            let options = DriveOptions {
+                replace_status: setting,
+                ..DriveOptions::default()
+            };
+            let (sim, drive, root) = sim_with(DriveType::Personal, options).await;
+            let file = sim
+                .create_file(&drive, &root, "f.txt", b"1".to_vec())
+                .unwrap();
+            let (status, item) = replace(&sim, &drive, &file, None, b"22").await;
+            assert_eq!(status, expected, "{setting:?} by id");
+            assert_eq!(item["size"], 2);
+            let (status, item) =
+                upload_new(&sim, &drive, &root, "F.TXT", Some("replace"), b"333").await;
+            assert_eq!(status, expected, "{setting:?} by name");
+            assert_eq!(item["id"], file.as_str());
+            let (status, _) = upload_new(&sim, &drive, &root, "new.txt", None, b"4").await;
+            assert_eq!(status, StatusCode::CREATED, "{setting:?} new file");
+        }
+    }
+
+    /// An update naming `@microsoft.graph.conflictBehavior`, in the query string or the
+    /// body, answers `400` and changes nothing: what Graph does with it is unknown and may
+    /// be destructive, so the simulator refuses rather than answer a harmless `409`.
+    #[tokio::test]
+    async fn update_with_conflict_behaviour_is_400_and_changes_nothing() {
+        let (sim, drive, root) = sim_with(DriveType::Personal, DriveOptions::default()).await;
+        let file = sim.create_file(&drive, &root, "a", b"1".to_vec()).unwrap();
+        sim.create_file(&drive, &root, "b", b"2".to_vec()).unwrap();
+        let before = snapshot(&sim, &drive, &[&file]).await;
+        let body = json!({"name": "b", "@microsoft.graph.conflictBehavior": "replace"});
+        let (status, error) = patch(&sim, &drive, &file, None, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not simulated")
+        );
+        let url = format!(
+            "{}?@microsoft.graph.conflictBehavior=rename",
+            item_url(&sim, &drive, &file)
+        );
+        let body = serde_json::to_vec(&json!({"name": "c"})).unwrap();
+        let (status, _) = send(&sim, Method::PATCH, &url, None, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_unchanged(&sim, &drive, &[&file], &before).await;
+    }
+
+    /// The quota is checked against the size stored at commit: in `Later` mode the
+    /// uploaded size, so a 90-byte document fits a 100-byte quota and the rewrite that
+    /// follows leaves the drive above it; in `InResponse` mode the rewritten size, so the
+    /// same upload answers `507` and stores nothing.
+    #[tokio::test]
+    async fn quota_checks_the_size_stored_at_commit_in_each_rewrite_mode() {
+        let document = vec![b'x'; 90];
+        for mode in [RewriteMode::Later, RewriteMode::InResponse] {
+            let options = DriveOptions {
+                rewrite: mode,
+                quota_bytes: 100,
+                ..DriveOptions::default()
+            };
+            let (sim, drive, root) = sim_with(DriveType::DocumentLibrary, options).await;
+            let (status, _) = upload_new(&sim, &drive, &root, "d.docx", None, &document).await;
+            let used = get_json(&sim, &drive_url(&sim, &drive)).await["quota"]["used"]
+                .as_u64()
+                .unwrap();
+            match mode {
+                RewriteMode::Later => {
+                    assert_eq!(status, StatusCode::CREATED);
+                    assert!(used > 100, "the later rewrite leaves {used} bytes used");
+                }
+                _ => {
+                    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+                    assert_eq!(used, 0);
+                    let (feed, _) = enumerate(&sim, &drive).await;
+                    assert_eq!(feed.len(), 1, "only the root: {feed:?}");
+                }
+            }
+        }
+    }
+
+    /// The documented check order of a simple upload: the size limit comes before an
+    /// unknown item for the replace by ID, and a bad conflict behaviour before the size
+    /// limit for the create-by-name form.
+    #[tokio::test]
+    async fn simple_upload_refusal_order() {
+        let options = DriveOptions {
+            simple_upload_max_bytes: 4,
+            ..DriveOptions::default()
+        };
+        let (sim, drive, root) = sim_with(DriveType::Personal, options).await;
+        let missing = ItemId::new("NO-SUCH-ITEM").unwrap();
+        let (status, _) = replace(&sim, &drive, &missing, None, b"too large").await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let (status, _) = replace(&sim, &drive, &missing, None, b"ok").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = upload_new(&sim, &drive, &root, "n", Some("never"), b"too large").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = upload_new(&sim, &drive, &missing, "n", None, b"too large").await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

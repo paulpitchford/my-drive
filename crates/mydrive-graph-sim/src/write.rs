@@ -42,13 +42,35 @@ pub enum ConflictBehavior {
 }
 
 impl ConflictBehavior {
-    /// Parses the wire value, ignoring ASCII case.
-    fn parse(value: &str) -> Option<Self> {
+    /// Parses the wire value, ignoring ASCII case (the case rule is the simulator's
+    /// choice, unverified). Upload sessions (WP-020) use it for the session's item body.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "fail" => Some(Self::Fail),
             "replace" => Some(Self::Replace),
             "rename" => Some(Self::Rename),
             _ => None,
+        }
+    }
+}
+
+/// The status a successful upload that replaced an existing file answers.
+///
+/// driveitem-put-content's example for "Updating an existing file" shows `201 Created`;
+/// plain HTTP would say `200 OK`. Which one Graph sends is unverified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReplaceStatus {
+    /// `200 OK`.
+    Ok,
+    /// `201 Created`, as the documented example shows.
+    Created,
+}
+
+impl ReplaceStatus {
+    fn status(self) -> StatusCode {
+        match self {
+            Self::Ok => StatusCode::OK,
+            Self::Created => StatusCode::CREATED,
         }
     }
 }
@@ -104,7 +126,8 @@ pub(crate) fn routes() -> Router<Arc<Shared>> {
 
 // ---- refusals --------------------------------------------------------------------------
 
-fn name_conflict() -> Response {
+/// `409 nameAlreadyExists`: the name is taken and the conflict behaviour is `fail`.
+pub(crate) fn name_conflict() -> Response {
     graph_error(
         StatusCode::CONFLICT,
         "nameAlreadyExists",
@@ -112,7 +135,8 @@ fn name_conflict() -> Response {
     )
 }
 
-fn precondition_failed() -> Response {
+/// `412 resourceModified`: an `If-Match` value matched neither eTag nor cTag.
+pub(crate) fn precondition_failed() -> Response {
     graph_error(
         StatusCode::PRECONDITION_FAILED,
         "resourceModified",
@@ -120,7 +144,8 @@ fn precondition_failed() -> Response {
     )
 }
 
-fn locked() -> Response {
+/// `423 resourceLocked`: the item is locked (`GraphSim::set_locked`).
+pub(crate) fn locked() -> Response {
     graph_error(
         StatusCode::LOCKED,
         "resourceLocked",
@@ -128,7 +153,8 @@ fn locked() -> Response {
     )
 }
 
-fn quota_exceeded() -> Response {
+/// `507 quotaLimitReached`: the write would take the drive past its quota.
+pub(crate) fn quota_exceeded() -> Response {
     graph_error(
         StatusCode::INSUFFICIENT_STORAGE,
         "quotaLimitReached",
@@ -174,7 +200,7 @@ pub(crate) struct Refusal {
 
 impl Refusal {
     /// `400 invalidRequest` with `message`.
-    fn bad(message: &'static str) -> Self {
+    pub(crate) fn bad(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalidRequest",
@@ -195,9 +221,10 @@ fn json_response(status: StatusCode, body: Value) -> Response {
 
 // ---- request parts ---------------------------------------------------------------------
 
-/// The `If-Match` header, if sent. A value that is not visible ASCII is kept as a value
-/// no tag can equal, so it fails the precondition rather than being ignored.
-fn if_match(headers: &HeaderMap) -> Option<String> {
+/// The `If-Match` header, if sent. Only the first `If-Match` header line is read; a
+/// second one is ignored. A value that is not visible ASCII is kept as a value no tag can
+/// equal, so it fails the precondition rather than being ignored.
+pub(crate) fn if_match(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::IF_MATCH)
         .map(|value| value.to_str().unwrap_or("\u{0}").to_owned())
@@ -207,7 +234,7 @@ fn if_match(headers: &HeaderMap) -> Option<String> {
 /// served, or a list of quoted tags (RFC 9110) holding one of them. Update and delete
 /// document "the eTag (or cTag)". Tags contain commas, so the list is split by quotes,
 /// not by commas.
-fn precondition_holds(value: &str, item: &Item) -> bool {
+pub(crate) fn precondition_holds(value: &str, item: &Item) -> bool {
     let (etag, ctag) = (item.etag(), item.ctag());
     let value = value.trim();
     if value == "*" || value == etag || value == ctag {
@@ -241,13 +268,31 @@ fn usable_name(name: &str) -> bool {
 }
 
 /// The conflict behaviour from the query string, if any. The driveItem resource says it
-/// "should be included in the URL instead of the body".
-fn conflict_in_query(query: &HashMap<String, String>) -> Result<Option<ConflictBehavior>, Refusal> {
+/// "should be included in the URL instead of the body". An unknown value is a `400`.
+pub(crate) fn conflict_in_query(
+    query: &HashMap<String, String>,
+) -> Result<Option<ConflictBehavior>, Refusal> {
     match query.get(CONFLICT_BEHAVIOR) {
         None => Ok(None),
         Some(value) => ConflictBehavior::parse(value)
             .map(Some)
             .ok_or_else(|| Refusal::bad("Invalid @microsoft.graph.conflictBehavior value.")),
+    }
+}
+
+/// The conflict behaviour from a JSON request body's `@microsoft.graph.conflictBehavior`
+/// property, if any. Anything but a known string value is a `400`.
+pub(crate) fn conflict_in_body(
+    fields: &Map<String, Value>,
+) -> Result<Option<ConflictBehavior>, Refusal> {
+    match fields.get(CONFLICT_BEHAVIOR) {
+        None => Ok(None),
+        Some(Value::String(value)) => ConflictBehavior::parse(value)
+            .map(Some)
+            .ok_or_else(|| Refusal::bad("Invalid @microsoft.graph.conflictBehavior value.")),
+        Some(_) => Err(Refusal::bad(
+            "Invalid @microsoft.graph.conflictBehavior value.",
+        )),
     }
 }
 
@@ -295,8 +340,15 @@ pub(crate) fn parse_timestamp(text: &str) -> Option<i64> {
                 Some(b'-') => -1,
                 _ => return None,
             };
-            let hh: i64 = rest.get(1..3)?.parse().ok()?;
-            let mm: i64 = rest.get(4..6)?.parse().ok()?;
+            let digits = |range: std::ops::Range<usize>| -> Option<i64> {
+                let part = rest.get(range)?;
+                if part.bytes().all(|b| b.is_ascii_digit()) {
+                    part.parse().ok()
+                } else {
+                    None
+                }
+            };
+            let (hh, mm) = (digits(1..3)?, digits(4..6)?);
             if rest.len() != 6 || rest.as_bytes().get(3) != Some(&b':') || hh > 23 || mm > 59 {
                 return None;
             }
@@ -347,8 +399,8 @@ pub(crate) fn parse_file_system_info(value: Option<&Value>) -> Result<FileTimes,
     })
 }
 
-/// A request body that must be a JSON object.
-fn json_object(body: &[u8]) -> Result<Map<String, Value>, Refusal> {
+/// A request body that must be a JSON object; anything else is a `400`.
+pub(crate) fn json_object(body: &[u8]) -> Result<Map<String, Value>, Refusal> {
     match serde_json::from_slice::<Value>(body) {
         Ok(Value::Object(map)) => Ok(map),
         _ => Err(Refusal::bad("The request body must be a JSON object.")),
@@ -453,7 +505,8 @@ pub(crate) struct UploadCommit {
 }
 
 /// Commits a completed upload to the model and returns the response for it: `201
-/// Created` with the new driveItem, or `200 OK` with the replaced one.
+/// Created` with the new driveItem, or the replaced one with the status
+/// [`DriveOptions::replace_status`](crate::DriveOptions) names (default `201`).
 ///
 /// Refusals change nothing at all and answer, in this order of checking: `404
 /// itemNotFound` (drive, item or parent), `400 invalidRequest` (a folder as the target,
@@ -466,7 +519,10 @@ pub(crate) struct UploadCommit {
 /// The stored hash is the quickXorHash, the one hash the model keeps for every drive
 /// type. On a document library, a file whose extension is listed is rewritten according
 /// to [`RewriteMode`]; content, size and hash always describe the same stored bytes, and
-/// under [`RewriteMode::Later`] the response describes the uploaded version.
+/// under [`RewriteMode::Later`] the response describes the uploaded version. The quota is
+/// checked against the size that is stored at commit: the rewritten size under
+/// [`RewriteMode::InResponse`], the uploaded size under [`RewriteMode::Later`] (whose
+/// rewrite follows and may leave the drive above its quota).
 ///
 /// The caller holds the state lock; `shared` is needed only for the download URL in the
 /// response. The body size limit of a simple upload is the caller's business, not this
@@ -582,7 +638,7 @@ pub(crate) fn commit_upload(shared: &Shared, state: &mut State, commit: UploadCo
     let status = if created {
         StatusCode::CREATED
     } else {
-        StatusCode::OK
+        d.options.replace_status.status()
     };
     match render(shared, state, &drive, &id, snapshot.as_ref()) {
         Some(body) => json_response(status, body),
@@ -745,13 +801,9 @@ fn create_folder_in(
     if !fields.get("folder").is_some_and(Value::is_object) {
         return bad_request("Only folders can be created here; the body needs a folder facet.");
     }
-    let in_body = match fields.get(CONFLICT_BEHAVIOR) {
-        None => None,
-        Some(Value::String(value)) => match ConflictBehavior::parse(value) {
-            Some(conflict) => Some(conflict),
-            None => return bad_request("Invalid @microsoft.graph.conflictBehavior value."),
-        },
-        Some(_) => return bad_request("Invalid @microsoft.graph.conflictBehavior value."),
+    let in_body = match conflict_in_body(&fields) {
+        Ok(in_body) => in_body,
+        Err(refusal) => return refusal.into_response(),
     };
     let conflict = match conflict_in_query(query) {
         Ok(in_query) => in_query.or(in_body).unwrap_or(default),
@@ -838,10 +890,14 @@ fn parse_update(fields: &Map<String, Value>, drive: &DriveId) -> Result<Update, 
 }
 
 /// `PATCH /drives/{d}/items/{id}`: rename, move and/or set `fileSystemInfo`, as one
-/// change. Other properties are ignored.
+/// change. Other properties are ignored, except `@microsoft.graph.conflictBehavior`, in
+/// the query string or the body, which answers `400`: what Graph does with it on update
+/// is unknown, and it may replace the item in the way. A simulator that answered a
+/// harmless `409` instead would hide a destructive client bug.
 async fn update_item(
     AxState(shared): AxState<Arc<Shared>>,
     Path((drive, item)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -859,7 +915,17 @@ async fn update_item(
     if d.live(&item).is_err() {
         return not_found();
     }
-    let update = match json_object(&body).and_then(|fields| parse_update(&fields, &drive)) {
+    let fields = match json_object(&body) {
+        Ok(fields) => fields,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if query.contains_key(CONFLICT_BEHAVIOR) || fields.contains_key(CONFLICT_BEHAVIOR) {
+        return bad_request(
+            "@microsoft.graph.conflictBehavior on update is not simulated: Graph may replace \
+             the item in the way.",
+        );
+    }
+    let update = match parse_update(&fields, &drive) {
         Ok(update) => update,
         Err(refusal) => return refusal.into_response(),
     };
@@ -975,6 +1041,8 @@ mod tests {
             "2026-01-01T00:00:00.Z",
             "2026-01-01T24:00:00Z",
             "2026-01-01T00:00:00+0100",
+            "2026-01-01T00:00:00-+1:00",
+            "2026-01-01T00:00:00+01:+0",
             "not a date",
         ] {
             assert_eq!(parse_timestamp(bad), None, "{bad}");
@@ -1080,7 +1148,7 @@ mod tests {
             file_times: FileTimes::default(),
         };
         let (status, replaced) = body_of(commit_upload(&shared, &mut shared.lock(), current));
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::CREATED);
         assert_eq!(replaced["size"], 5);
         assert_ne!(replaced["eTag"], item["eTag"]);
     }

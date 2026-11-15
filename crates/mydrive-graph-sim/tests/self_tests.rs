@@ -9,7 +9,6 @@ mod self_tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
-    use mydrive_graph_sim::{ConflictBehavior, RewriteMode};
     use mydrive_graph_sim::{
         DeltaRepeats, DownloadMode, DriveOptions, DriveType, Fault, FolderDeletes, GraphSim,
         Method, Origin, RangeMode, StatusCode,
@@ -486,6 +485,8 @@ mod self_tests {
     /// list exactly these switches with exactly these defaults.
     #[test]
     fn drive_option_defaults_match_the_table_and_the_readme() {
+        use mydrive_graph_sim::{ConflictBehavior, ReplaceStatus, RewriteMode};
+
         let DriveOptions {
             download,
             range,
@@ -504,6 +505,7 @@ mod self_tests {
             rewrite,
             rewrite_extensions,
             folder_conflict_default,
+            replace_status,
         } = DriveOptions::default();
         assert_eq!(download, DownloadMode::Redirect);
         assert_eq!(range, RangeMode::Honoured);
@@ -527,6 +529,7 @@ mod self_tests {
             ]
         );
         assert_eq!(folder_conflict_default, ConflictBehavior::Rename);
+        assert_eq!(replace_status, ReplaceStatus::Created);
 
         let actual: std::collections::BTreeMap<String, String> = [
             ("download", format!("`{download:?}`")),
@@ -558,6 +561,7 @@ mod self_tests {
                 "folder_conflict_default",
                 format!("`{folder_conflict_default:?}`"),
             ),
+            ("replace_status", format!("`{replace_status:?}`")),
         ]
         .into_iter()
         .map(|(name, default)| (name.to_owned(), default))
