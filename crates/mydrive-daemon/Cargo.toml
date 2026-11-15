@@ -16,14 +16,16 @@ path = "src/lib.rs"
 name = "mydrived"
 path = "src/main.rs"
 
-# Prepared by WP-014 so the M1 daemon work package does not edit this file. No direct
-# dependency on mydrive-core: the crate diagram has no daemon-to-core edge (ADR-0004 R3).
+# Prepared by WP-014 so the M1 daemon work package does not edit this file. `toml` reads
+# `config.toml`.
 [dependencies]
 anyhow.workspace = true
+mydrive-core.workspace = true
 mydrive-engine.workspace = true
 mydrive-ipc.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
+toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
