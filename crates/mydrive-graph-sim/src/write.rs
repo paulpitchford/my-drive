@@ -42,10 +42,13 @@ pub enum ConflictBehavior {
 }
 
 impl ConflictBehavior {
-    /// Parses the wire value, ignoring ASCII case (the case rule is the simulator's
-    /// choice, unverified). Upload sessions (WP-020) use it for the session's item body.
+    /// Parses the wire value, accepting only the documented spellings exactly. Whether
+    /// Graph reads other spellings (`Fail`, `FAIL`) is unverified; if it ignored one it
+    /// would fall back to its default, which for PUT is the destructive `replace`, so the
+    /// simulator refuses any other spelling rather than act on it. Upload sessions
+    /// (WP-020) use it for the session's item body.
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value.to_ascii_lowercase().as_str() {
+        match value {
             "fail" => Some(Self::Fail),
             "replace" => Some(Self::Replace),
             "rename" => Some(Self::Rename),
@@ -267,12 +270,39 @@ fn usable_name(name: &str) -> bool {
     !name.is_empty() && !name.contains('/')
 }
 
+/// Whether `key` names the conflict behaviour in some spelling, exact or not. Used where
+/// the parameter is refused outright, so that no spelling slips past the refusal.
+fn names_conflict_behavior(key: &str) -> bool {
+    key.eq_ignore_ascii_case(CONFLICT_BEHAVIOR)
+}
+
+/// The value of the conflict-behaviour parameter among `entries` (query parameters or
+/// body properties), if present under its documented spelling. A key that differs from it
+/// only in ASCII case is a `400`: Graph may read it or may ignore it and fall back to the
+/// default (for PUT, `replace`), so neither reading nor ignoring it is safe to simulate.
+fn conflict_entry<'a, V: 'a>(
+    entries: impl IntoIterator<Item = (&'a String, &'a V)>,
+) -> Result<Option<&'a V>, Refusal> {
+    let mut found = None;
+    for (key, value) in entries {
+        if key == CONFLICT_BEHAVIOR {
+            found = Some(value);
+        } else if names_conflict_behavior(key) {
+            return Err(Refusal::bad(
+                "Unrecognised spelling of @microsoft.graph.conflictBehavior.",
+            ));
+        }
+    }
+    Ok(found)
+}
+
 /// The conflict behaviour from the query string, if any. The driveItem resource says it
-/// "should be included in the URL instead of the body". An unknown value is a `400`.
+/// "should be included in the URL instead of the body". An unknown value, or the
+/// parameter name in another case, is a `400`.
 pub(crate) fn conflict_in_query(
     query: &HashMap<String, String>,
 ) -> Result<Option<ConflictBehavior>, Refusal> {
-    match query.get(CONFLICT_BEHAVIOR) {
+    match conflict_entry(query)? {
         None => Ok(None),
         Some(value) => ConflictBehavior::parse(value)
             .map(Some)
@@ -281,11 +311,12 @@ pub(crate) fn conflict_in_query(
 }
 
 /// The conflict behaviour from a JSON request body's `@microsoft.graph.conflictBehavior`
-/// property, if any. Anything but a known string value is a `400`.
+/// property, if any. Anything but a known string value, or the property name in another
+/// case, is a `400`.
 pub(crate) fn conflict_in_body(
     fields: &Map<String, Value>,
 ) -> Result<Option<ConflictBehavior>, Refusal> {
-    match fields.get(CONFLICT_BEHAVIOR) {
+    match conflict_entry(fields)? {
         None => Ok(None),
         Some(Value::String(value)) => ConflictBehavior::parse(value)
             .map(Some)
@@ -510,8 +541,8 @@ pub(crate) struct UploadCommit {
 ///
 /// Refusals change nothing at all and answer, in this order of checking: `404
 /// itemNotFound` (drive, item or parent), `400 invalidRequest` (a folder as the target,
-/// a parent that is a file, an unusable name, conflict behaviour `replace` onto a folder
-/// answers `409` instead), `409 nameAlreadyExists` (behaviour `fail`), `423
+/// a parent that is a file, an unusable name), `409 nameAlreadyExists` (behaviour `fail`,
+/// or behaviour `replace` when the name is taken by a folder), `423
 /// resourceLocked` (the file being replaced is locked), `412 resourceModified` (the
 /// `If-Match` value matches neither eTag nor cTag) and `507 quotaLimitReached` (the
 /// drive's live files would exceed [`DriveOptions::quota_bytes`](crate::DriveOptions)).
@@ -890,9 +921,9 @@ fn parse_update(fields: &Map<String, Value>, drive: &DriveId) -> Result<Update, 
 }
 
 /// `PATCH /drives/{d}/items/{id}`: rename, move and/or set `fileSystemInfo`, as one
-/// change. Other properties are ignored, except `@microsoft.graph.conflictBehavior`, in
-/// the query string or the body, which answers `400`: what Graph does with it on update
-/// is unknown, and it may replace the item in the way. A simulator that answered a
+/// change. Other properties are ignored, except `@microsoft.graph.conflictBehavior` (in any
+/// ASCII case), in the query string or the body, which answers `400`: what Graph does with
+/// it on update is unknown, and it may replace the item in the way. A simulator that answered a
 /// harmless `409` instead would hide a destructive client bug.
 async fn update_item(
     AxState(shared): AxState<Arc<Shared>>,
@@ -919,7 +950,10 @@ async fn update_item(
         Ok(fields) => fields,
         Err(refusal) => return refusal.into_response(),
     };
-    if query.contains_key(CONFLICT_BEHAVIOR) || fields.contains_key(CONFLICT_BEHAVIOR) {
+    // In any ASCII case: a key spelled differently must not get past the refusal.
+    if query.keys().any(|key| names_conflict_behavior(key))
+        || fields.keys().any(|key| names_conflict_behavior(key))
+    {
         return bad_request(
             "@microsoft.graph.conflictBehavior on update is not simulated: Graph may replace \
              the item in the way.",

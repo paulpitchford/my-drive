@@ -1193,6 +1193,122 @@ mod write_self_tests {
         assert_unchanged(&sim, &drive, &[&file], &before).await;
     }
 
+    /// An update with the conflict-behaviour name in another case, in the query string or
+    /// the body, is refused like the documented spelling: a misspelt name must not get a
+    /// destructive rename past the guard.
+    #[tokio::test]
+    async fn update_with_conflict_behaviour_in_another_case_is_400_and_changes_nothing() {
+        let (sim, drive, root) = sim_with(DriveType::Personal, DriveOptions::default()).await;
+        let file = sim.create_file(&drive, &root, "a", b"1".to_vec()).unwrap();
+        sim.create_file(&drive, &root, "taken", b"2".to_vec())
+            .unwrap();
+        let before = snapshot(&sim, &drive, &[&file]).await;
+        for key in [
+            "@microsoft.graph.conflictbehavior",
+            "@MICROSOFT.GRAPH.CONFLICTBEHAVIOR",
+        ] {
+            let url = format!("{}?{key}=replace", item_url(&sim, &drive, &file));
+            let body = serde_json::to_vec(&json!({"name": "taken"})).unwrap();
+            let (status, error) = send(&sim, Method::PATCH, &url, None, Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{key} in the query");
+            assert_eq!(error["error"]["code"], "invalidRequest");
+            let mut body = serde_json::Map::new();
+            body.insert("name".to_owned(), json!("taken"));
+            body.insert(key.to_owned(), json!("replace"));
+            let (status, _) = patch(&sim, &drive, &file, None, Value::Object(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{key} in the body");
+        }
+        assert_unchanged(&sim, &drive, &[&file], &before).await;
+    }
+
+    /// The conflict behaviour is read only in its documented spelling, on every route that
+    /// reads it: create by name (query string) and both create-folder routes (query string
+    /// and body). A value in another case (`Fail`) or the name in another case answers
+    /// `400` and changes nothing, so a client that misspells `fail` cannot pass a "never
+    /// overwrite" test that real Graph might fail by falling back to `replace`.
+    #[tokio::test]
+    async fn conflict_behaviour_in_another_spelling_is_400_and_changes_nothing() {
+        let (sim, drive, root) = sim_with(DriveType::Personal, DriveOptions::default()).await;
+        let file = sim
+            .create_file(&drive, &root, "report.docx", b"keep me".to_vec())
+            .unwrap();
+        sim.create_folder(&drive, &root, "Docs").unwrap();
+        let before = snapshot(&sim, &drive, &[&file]).await;
+        let key = "@microsoft.graph.conflictBehavior";
+        let base = drive_url(&sim, &drive);
+        let folder_routes = [
+            format!("{base}/items/{root}/children"),
+            format!("{base}/root/children"),
+        ];
+        let mut cases: Vec<(String, Method, String, Option<Vec<u8>>)> = Vec::new();
+        for value in ["Fail", "FAIL", "Replace", "Rename", " fail"] {
+            let url = format!("{base}/items/{root}:/report.docx:/content?{key}={value}");
+            cases.push((
+                format!("upload value {value:?}"),
+                Method::PUT,
+                url,
+                Some(b"overwritten".to_vec()),
+            ));
+        }
+        for spelt in [
+            "@microsoft.graph.conflictbehavior",
+            "@Microsoft.Graph.ConflictBehavior",
+        ] {
+            let url = format!("{base}/items/{root}:/report.docx:/content?{spelt}=fail");
+            cases.push((
+                format!("upload name {spelt}"),
+                Method::PUT,
+                url,
+                Some(b"overwritten".to_vec()),
+            ));
+        }
+        let both = format!(
+            "{base}/items/{root}:/report.docx:/content?{key}=fail&@microsoft.graph.conflictbehavior=replace"
+        );
+        cases.push((
+            "upload both spellings".to_owned(),
+            Method::PUT,
+            both,
+            Some(b"overwritten".to_vec()),
+        ));
+        for route in &folder_routes {
+            let folder = |fields: Value| Some(serde_json::to_vec(&fields).unwrap());
+            for value in ["Fail", "RENAME"] {
+                cases.push((
+                    format!("{route} body value {value}"),
+                    Method::POST,
+                    route.clone(),
+                    folder(json!({"name": "docs", "folder": {}, key: value})),
+                ));
+                cases.push((
+                    format!("{route} query value {value}"),
+                    Method::POST,
+                    format!("{route}?{key}={value}"),
+                    folder(json!({"name": "docs", "folder": {}})),
+                ));
+            }
+            let spelt = "@microsoft.graph.conflictbehavior";
+            cases.push((
+                format!("{route} body name"),
+                Method::POST,
+                route.clone(),
+                folder(json!({"name": "docs", "folder": {}, spelt: "fail"})),
+            ));
+            cases.push((
+                format!("{route} query name"),
+                Method::POST,
+                format!("{route}?{spelt}=fail"),
+                folder(json!({"name": "docs", "folder": {}})),
+            ));
+        }
+        for (label, method, url, body) in cases {
+            let (status, error) = send(&sim, method, &url, None, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}: {error}");
+            assert_eq!(error["error"]["code"], "invalidRequest", "{label}");
+        }
+        assert_unchanged(&sim, &drive, &[&file], &before).await;
+    }
+
     /// The quota is checked against the size stored at commit: in `Later` mode the
     /// uploaded size, so a 90-byte document fits a 100-byte quota and the rewrite that
     /// follows leaves the drive above it; in `InResponse` mode the rewritten size, so the
