@@ -489,7 +489,13 @@ types enforce what they can without knowing the authority. The URL must:
   parameter named `code`, `code_verifier`, `client_secret`, `client_assertion`, `assertion`,
   `access_token`, `refresh_token`, `id_token`, `token` or `password`, in any case;
 - name each parameter once, in plain (not percent-encoded) characters;
+- contain no `;` anywhere, since parameters are told apart by `&` only and a `;` separator
+  could carry one past these checks;
 - be printable ASCII with no fragment, at most 4,096 bytes.
+
+These checks look at parameter **names**. No value is inspected except those of
+`code_challenge` and `code_challenge_method`, so a secret in the value of another parameter is
+not caught by the types; the daemon builds the URL from the challenge and `state` only.
 
 The attempt ID is at most 40 characters from `a-z`, `0-9` and `-`, and a confirmation token
 at most 40 from `a-z`, `0-9` and `.`: both too short to hold a verifier (at least 43

@@ -133,7 +133,8 @@ pub struct HelloResult {
     /// The chosen protocol major version.
     pub protocol_version: u32,
     /// Optional features the daemon offers. An open set: clients ignore capabilities they do
-    /// not know (ADR-0009 R5, ADR-0019). Version 1 defines none.
+    /// not know (ADR-0009 R5, ADR-0019). Version 1 defines one,
+    /// [`CAPABILITY_IMPORT_EXPORT`], which offers `item.import` and `item.export`.
     pub capabilities: Vec<String>,
     /// Size limits the client must respect (ADR-0020 R5).
     pub limits: Limits,
@@ -969,12 +970,19 @@ validated_string_serde!(AttemptId);
 /// - user information in the authority (`user:pass@host`);
 /// - a character outside printable ASCII, or a space;
 /// - a fragment;
+/// - a `;` anywhere: the query is split into parameters on `&` only, so a `;` separator (in
+///   the query, or as a path parameter) could otherwise carry a parameter past the name
+///   check;
 /// - a query parameter named like a credential (`code`, `code_verifier`, `client_secret`,
 ///   `access_token`, `refresh_token`, `id_token`, `token`, `password`, `assertion`,
 ///   `client_assertion`), a parameter name that is percent-encoded or empty, or a repeated
 ///   parameter;
 /// - a `code_challenge` that is not 43 base64url characters (the S256 digest), or more than
 ///   [`MAX_AUTHORIZATION_URL_BYTES`] bytes in all.
+///
+/// Parameter values other than `code_challenge` and `code_challenge_method` are not
+/// inspected: a secret placed in the value of an innocently named parameter is not caught
+/// here. That is the daemon's rule (it builds the URL from the challenge and `state` only).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AuthorizationUrl(String);
 
@@ -1012,6 +1020,9 @@ fn authorization_url_problem(url: &str) -> Option<&'static str> {
     }
     if url.contains('#') {
         return Some("an authorisation URL has no fragment");
+    }
+    if url.contains(';') {
+        return Some("an authorisation URL has no ';', which could hide a parameter");
     }
     let (rest, secure) = if let Some(rest) = url.strip_prefix("https://") {
         (rest, true)
@@ -2777,6 +2788,10 @@ mod tests {
             auth_url("&token=t"),
             auth_url("&password=p"),
             auth_url("&code%5Fverifier=x"),
+            auth_url(";code=x"),
+            auth_url("&prompt=login;code=x"),
+            auth_url("&prompt=login;"),
+            auth_url("").replace("/authorize?", "/authorize;code=x?"),
             auth_url("&=x"),
             auth_url("&state=again"),
             auth_url("#code=x"),
