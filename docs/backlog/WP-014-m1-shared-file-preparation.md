@@ -51,6 +51,10 @@ router or operation list. Wave 1 to 3 showed these are where parallel work colli
   feature files; the README becomes an index linking one document per feature under
   `docs/`. Declare the files later packages will own: `write.rs`, `session.rs`, `delta.rs`,
   `throttle.rs`, `identity.rs`, `authority.rs`, `discovery.rs`, as documented stubs.
+  Each stub file except `delta.rs` defines an empty state struct held as a field of the
+  model's `State`, and `lib.rs` re-exports each such file's public items with a glob, so a
+  later package adds state and public types in its own file without editing `model.rs` or
+  `lib.rs`.
 
 ## Out of scope
 

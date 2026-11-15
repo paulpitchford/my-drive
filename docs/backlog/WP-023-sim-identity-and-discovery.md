@@ -6,8 +6,9 @@
 - **Depends on:** WP-014
 - **Gates:** — (its guesses about policy errors and read-only signals stay provisional until G2)
 - **Owned paths:** `crates/mydrive-graph-sim/src/identity.rs`, `src/authority.rs`,
-  `src/discovery.rs`, `crates/mydrive-graph-sim/tests/identity_*.rs`,
-  `tests/discovery_*.rs`, `crates/mydrive-graph-sim/docs/identity.md`
+  `src/discovery.rs`, `src/lib.rs`, `src/server.rs`,
+  `crates/mydrive-graph-sim/tests/identity_*.rs`, `tests/discovery_*.rs`,
+  `crates/mydrive-graph-sim/docs/identity.md`, `crates/mydrive-graph/tests/sim_identity_*.rs`
 - **ADRs:** ADR-0010, ADR-0015, ADR-0017
 - **Flows / journeys:** F01, F09, J01, J11, J13
 
@@ -46,9 +47,8 @@ reused. Give the simulator its own authority and the identity and discovery endp
 - AC4: A blocked library answers `403` with the configured code on every route while another
   drive of the same tenant works.
 - AC5: The existing loopback and paste sign-in flows in `mydrive-graph` complete against this
-  authority (one test each, in this crate's tests, using `mydrive-graph` as a dev-dependency
-  only if the architecture check allows it; otherwise a plain HTTP client that performs the
-  same exchange, and say which).
+  authority: one test each, in `crates/mydrive-graph/tests/sim_identity_*.rs`. The simulator
+  may not depend on `mydrive-graph`, even for tests (the architecture check refuses it).
 - AC6: A personal account's `/me/drive` is a personal drive; a work account's is a business
   drive; drive IDs follow the mixed-case switch if one exists.
 - AC7: No token the authority issues is written to the request log in full.
@@ -60,6 +60,24 @@ reused. Give the simulator its own authority and the identity and discovery endp
 - Self-tests per criterion.
 
 ## Notes
+
+Shared files, as WP-014 left them: `identity::routes()` and `discovery::routes()` are already
+merged into the Graph router; `lib.rs` re-exports everything public in your three files with
+a glob; `State` (in `model.rs`, owned by WP-019 in this wave: do not edit it) holds
+`identity::IdentityState`, `discovery::DiscoveryState` and `authority::AuthorityState`, so
+accounts, tenants, tokens, codes and links live in your own structs. The authority is not
+wired: it needs its own listener, started in `lib.rs`, and its own router in `server.rs`,
+with the request log applied and AC7 holding. You own both files in this wave; keep the
+existing listeners, routers and middleware order as they are.
+
+Blocked and read-only libraries are checked in `server.rs`, in a layer in front of every
+drive route, so that WP-019's write handlers (built in parallel) need no change: a read-only
+library refuses any request whose method writes. Say in `docs/identity.md` where the layer
+sits relative to the token check and the fault layer, and why.
+
+Existing tokens: the simulator today accepts one fixed bearer token per instance. Tokens the
+authority issues must be accepted by the Graph origin too, and the fixed token must keep
+working, because every existing test uses it.
 
 The dev-only rule (ADR-0017 R1) and the architecture check allow the simulator as a
 dev-dependency of other crates, not the reverse; check before adding any dependency here.

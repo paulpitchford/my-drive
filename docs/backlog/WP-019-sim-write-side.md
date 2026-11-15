@@ -6,7 +6,8 @@
 - **Depends on:** WP-014
 - **Gates:** —
 - **Owned paths:** `crates/mydrive-graph-sim/src/model.rs`, `src/write.rs`,
-  `crates/mydrive-graph-sim/tests/write_*.rs`, `crates/mydrive-graph-sim/docs/write.md`
+  `crates/mydrive-graph-sim/tests/write_*.rs`, `crates/mydrive-graph-sim/docs/write.md`,
+  `crates/mydrive-graph/tests/sim_write_*.rs`
 - **ADRs:** ADR-0017, ADR-0012, ADR-0011
 - **Flows / journeys:** F04, F07, F12
 
@@ -59,9 +60,19 @@ conflict work can be tested without a real account.
 ## Required tests
 
 - Self-tests per criterion with a plain HTTP client, and one that drives a write and then
-  reads the result back through the existing `mydrive-graph` client.
+  reads the result back through the existing `mydrive-graph` client. That one lives in
+  `crates/mydrive-graph/tests/sim_write_*.rs`: the simulator may not depend on
+  `mydrive-graph`, even for tests (the architecture check refuses it).
 
 ## Notes
+
+Shared files, as WP-014 left them: the write routes returned by `write::routes()` are already
+merged into the Graph router; `lib.rs` re-exports everything public in `write.rs` with a
+glob; `State` holds a `write::WriteState` for state that is not part of the item model. So
+declare new public types (switches, modes) in `write.rs`, not `model.rs`, whose public types
+are re-exported by name from `lib.rs`. New fields on the existing `DriveOptions` are fine.
+Do not edit `lib.rs` or `server.rs` (WP-023 owns them in this wave). Refusing writes on a
+read-only library is WP-023's, done before a request reaches your handlers.
 
 Follow the simulator's rule: the default is what Microsoft documents; where that is unknown,
 a switch whose default is harder for a client. The research note
