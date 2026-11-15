@@ -8,7 +8,8 @@
 - **Owned paths:** root `Cargo.toml`, `Cargo.lock`, every crate's `Cargo.toml`;
   `crates/mydrive-engine/src/**`; `crates/mydrive-daemon/src/**`;
   `crates/mydrive-core/src/lib.rs`; `crates/mydrive-graph/src/lib.rs`,
-  `crates/mydrive-graph/src/client/mod.rs` and new files beside it;
+  `crates/mydrive-graph/src/client/mod.rs`, `client/error.rs` (where `Operation` lives) and
+  new files beside them;
   `crates/mydrive-graph-sim/src/**` and `crates/mydrive-graph-sim/README.md`,
   `crates/mydrive-graph-sim/docs/**`; `crates/mydrive-ipc/src/lib.rs`
 - **ADRs:** ADR-0003, ADR-0004, ADR-0018, ADR-0023
@@ -25,8 +26,11 @@ router or operation list. Wave 1 to 3 showed these are where parallel work colli
 - **Manifests.** Give each crate the workspace dependencies M1 will need, so later packages
   do not edit `Cargo.toml`: engine (core, store, graph, tokio, tracing, thiserror; dev:
   graph-sim, tempfile, proptest); daemon (core, engine, ipc, tokio, tracing, anyhow, serde,
-  and whatever reads `config.toml`); cli (core, ipc, clap, serde_json, anyhow); ipc (tokio
-  for the server). Add a library target to `mydrive-daemon` beside its binary so tests can
+  and `toml` to read `config.toml`); cli (ipc, clap, serde_json, anyhow; not core, because
+  ADR-0004 R3 limits the CLI to `mydrive-ipc`; if the CLI needs to name a core type, the
+  package that builds the IPC client re-exports it from `mydrive-ipc`); ipc (tokio for the server); simulator (`sha2`). `toml` is added to
+  `[workspace.dependencies]` with the lead's approval (MIT OR Apache-2.0). The overview's
+  crate diagram gains the edge daemon to core for this package. Add a library target to `mydrive-daemon` beside its binary so tests can
   run the daemon in-process.
 - **Engine module tree.** Declare, as documented empty modules, everything later packages
   will fill: `api`, `db`, `backing`, `clock`, `error`, `events`, `config`, `scheduler`,
