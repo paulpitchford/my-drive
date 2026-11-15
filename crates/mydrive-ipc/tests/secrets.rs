@@ -12,7 +12,7 @@ use mydrive_core::ids::{AccountId, DriveId, MountId, TenantId};
 use mydrive_core::state::{EffectivePin, Hydration, ItemState, Modifiers, Pin, Sync};
 use mydrive_ipc::codec::encode_line;
 use mydrive_ipc::envelope::{ErrorResponse, Id, SuccessResponse};
-use mydrive_ipc::error::RpcError;
+use mydrive_ipc::error::{ErrorCode, RpcError};
 use mydrive_ipc::methods::{
     AccountInfo, AttemptId, AuthorizationUrl, ConfirmationToken, HelloParams, ItemExportResult,
     ItemImportResult, ItemInfo, LocalPath, LoginFinishResult, LoginStartResult, LogoutResult,
@@ -22,7 +22,9 @@ use mydrive_ipc::methods::{
 };
 use mydrive_ipc::paging::ConfirmationLedger;
 use mydrive_ipc::path::ProtocolPath;
-use mydrive_ipc::values::{AccountKind, AccountState, DriveType, MountState, SignInFailure};
+use mydrive_ipc::values::{
+    AccountKind, AccountState, DriveType, ItemReason, MountState, SignInFailure,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -173,10 +175,23 @@ fn adr_0010_r6_value_types_refuse_secrets() {
     }
     // Secrets in the authorisation URL: as their own parameters, in any case, or with the
     // verifier as a `plain` challenge.
-    let smuggled = [
+    let smuggled = smuggled_urls();
+    for url in smuggled {
+        let err = AuthorizationUrl::new(url.clone()).unwrap_err();
+        assert_clean(err.to_string().as_bytes(), "AuthorizationUrl error");
+        assert!(serde_json::from_value::<AuthorizationUrl>(json!(url)).is_err());
+    }
+}
+
+/// Planted authorisation URLs: each smuggles a secret past a rule `AuthorizationUrl` checks.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn smuggled_urls() -> Vec<String> {
+    vec![
         authorize_url(&format!("&code_verifier={VERIFIER}")),
         authorize_url(&format!("&Code_Verifier={VERIFIER}")),
         authorize_url(&format!("&code={CODE}")),
+        authorize_url(&format!(";code={CODE}")),
+        authorize_url(&format!("&x=1;code={CODE}")),
         authorize_url(&format!("&access_token={ACCESS_TOKEN}")),
         authorize_url(&format!("&refresh_token={REFRESH_TOKEN}")),
         authorize_url(&format!("&id_token={ID_TOKEN}")),
@@ -187,23 +202,56 @@ fn adr_0010_r6_value_types_refuse_secrets() {
             .replace(&challenge(), VERIFIER)
             .replace("code_challenge_method=S256", "code_challenge_method=plain"),
         authorize_url("").replace("https://", &format!("https://{CODE}@")),
-    ];
-    for url in smuggled {
-        let err = AuthorizationUrl::new(url.clone()).unwrap_err();
-        assert_clean(err.to_string().as_bytes(), "AuthorizationUrl error");
-        assert!(serde_json::from_value::<AuthorizationUrl>(json!(url)).is_err());
-    }
+        authorize_url("").replace("/authorize?", &format!("/authorize;code={CODE}?")),
+    ]
 }
 
-/// WP-016 AC3, ADR-0010 R6: every result added by WP-016, built from a sign-in whose
-/// verifier, code and tokens are planted, carries none of them; the authorisation URL is the
-/// only sign-in datum and holds the S256 challenge and `state`, not the verifier.
+/// A value of a checked type built from planted material: the first planted attempt the type
+/// accepts, or else `fallback`. If a check ever lets a secret through, the secret flows into
+/// the result and the search of the encoded bytes finds it.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn from_planted<T, E>(attempts: impl IntoIterator<Item = Result<T, E>>, fallback: T) -> T {
+    attempts
+        .into_iter()
+        .find_map(Result::ok)
+        .unwrap_or(fallback)
+}
+
+/// WP-016 AC3, ADR-0010 R6: every result added by WP-016 is built with each of its checked
+/// fields made from planted secrets, and its encoded bytes carry none of them.
+///
+/// What the types protect, and so what this test can catch: `attempt_id` and
+/// `confirmation_token` (too short and in too small an alphabet for a verifier, code or
+/// token), `authorization_url` (no credential parameter, S256 only), and the confirmation
+/// token the ledger derives from a planted sharing link. The other text fields of these
+/// results (identifiers, paths, open-set values, display names, messages) are not protected
+/// by any type: [`unprotected_fields_accept_any_text`] shows they would carry a secret, and
+/// the catalogue says so. Keeping secrets out of them is the daemon's rule, tested there.
 #[test]
 fn adr_0010_r6_no_new_result_carries_a_secret() {
     let mut covered = BTreeSet::new();
-    let url = AuthorizationUrl::new(authorize_url("")).unwrap();
+    // The credentials themselves, as given and lowercased (the ID alphabets are lowercase).
+    let planted: Vec<String> = [VERIFIER, CODE, ACCESS_TOKEN, REFRESH_TOKEN, ID_TOKEN, LINK]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([pasted()])
+        .flat_map(|s| [s.to_ascii_lowercase(), s])
+        .collect();
+    let attempt_id = from_planted(
+        planted.iter().cloned().map(AttemptId::new),
+        AttemptId::new("attempt-7f3a").unwrap(),
+    );
+    let url = from_planted(
+        smuggled_urls().into_iter().map(AuthorizationUrl::new),
+        AuthorizationUrl::new(authorize_url("")).unwrap(),
+    );
     assert!(url.as_str().contains(&challenge()));
     assert!(url.as_str().contains(STATE));
+    let mut ledger = ConfirmationLedger::new();
+    let token = from_planted(
+        planted.iter().cloned().map(ConfirmationToken::new),
+        ledger.issue(&link_target(), "payload", 0).unwrap(),
+    );
     let account = AccountInfo {
         account_id: AccountId::new("acct-personal-1").unwrap(),
         kind: AccountKind::Personal,
@@ -213,8 +261,6 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
         display_name: Some("Sam Example".into()),
     };
     let mount = mount();
-    let mut ledger = ConfirmationLedger::new();
-    let token = ledger.issue(&link_target(), "payload", 0).unwrap();
     for name in method::ALL {
         let line = match *name {
             // Results that existed before WP-016 carry no new field that could hold one.
@@ -228,10 +274,12 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
             | method::ITEM_HYDRATE
             | method::ITEM_DEHYDRATE
             | method::STATUS_SUBSCRIBE => continue,
+            // Checked fields: both, from planted material.
             method::ACCOUNT_LOGIN_START => result_line(&LoginStartResult {
-                attempt_id: AttemptId::new("attempt-7f3a").unwrap(),
+                attempt_id: attempt_id.clone(),
                 authorization_url: url.clone(),
             }),
+            // No checked field: identifiers, a path and display names only.
             method::ACCOUNT_LOGIN_FINISH => result_line(&LoginFinishResult {
                 account: account.clone(),
                 proposed_mount: Some(ProposedMount {
@@ -240,11 +288,14 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
                     mount_point: ProtocolPath::new("/home/user/OneDrive").unwrap(),
                 }),
             }),
+            // No checked field: an identifier and a count.
             method::ACCOUNT_LOGOUT => result_line(&LogoutResult {
                 account_id: account.account_id.clone(),
                 signed_out: true,
                 unsynced_files: 3,
             }),
+            // Checked: the token, derived by the ledger from a planted link, or a planted
+            // token if `ConfirmationToken` ever accepted one.
             method::MOUNT_ADD_PREVIEW => result_line(&MountAddPreviewResult {
                 confirmation_token: token.clone(),
                 account_id: AccountId::new("acct-work-1").unwrap(),
@@ -256,9 +307,11 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
                 read_only: false,
                 mount_point: mount.mount_point.clone(),
             }),
+            // No checked field: the mount's identifiers, path and names.
             method::MOUNT_ADD_CONFIRM => result_line(&MountAddConfirmResult {
                 mount: mount.clone(),
             }),
+            // No checked field: an identifier, a path and counts.
             method::MOUNT_REMOVE => result_line(&MountRemoveResult {
                 mount_id: mount.mount_id.clone(),
                 removed: true,
@@ -266,11 +319,13 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
                 kept_files: 140,
                 unsynced_files: 0,
             }),
+            // Counts and a time: no text at all.
             method::MOUNT_PAUSE => result_line(&MountPauseResult {
                 paused_mounts: 4,
                 paused_until: Some(1_794_790_800),
             }),
             method::MOUNT_RESUME => result_line(&MountResumeResult { resumed_mounts: 4 }),
+            // No checked field: paths, item state and a count.
             method::ITEM_IMPORT => result_line(&ItemImportResult {
                 path: ProtocolPath::new("/home/user/OneDrive/a.pdf").unwrap(),
                 item: item(),
@@ -291,6 +346,143 @@ fn adr_0010_r6_no_new_result_carries_a_secret() {
     assert_eq!(method::NOTIFICATIONS, [method::STATUS_CHANGED]);
     // The confirmation token holds nothing of the link.
     assert_clean(token.as_str().as_bytes(), "confirmation token");
+}
+
+/// WP-016 AC3, stated plainly: the protocol types do **not** protect the free-text and
+/// identifier fields of results. Each accepts a planted secret in a form its rule allows, and
+/// the encoded result carries it. This pins down what the catalogue's "What the types check"
+/// paragraph says is the daemon's rule, not the types'. If a type starts refusing one of
+/// these, move the field to [`adr_0010_r6_no_new_result_carries_a_secret`] and the
+/// catalogue's checked list.
+#[test]
+fn unprotected_fields_accept_any_text() {
+    let lowercase_verifier: String = VERIFIER
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let carried = [
+        (
+            "account_id",
+            result_line(&LogoutResult {
+                account_id: AccountId::new(CODE).unwrap(),
+                signed_out: true,
+                unsynced_files: 0,
+            }),
+            CODE.to_owned(),
+        ),
+        (
+            "user_name",
+            result_line(&AccountInfo {
+                user_name: Some(ACCESS_TOKEN.into()),
+                ..mount_account()
+            }),
+            ACCESS_TOKEN.to_owned(),
+        ),
+        (
+            "tenant_id",
+            result_line(&AccountInfo {
+                tenant_id: Some(TenantId::new(REFRESH_TOKEN).unwrap()),
+                ..mount_account()
+            }),
+            REFRESH_TOKEN.to_owned(),
+        ),
+        (
+            "mount_id",
+            result_line(&MountInfo {
+                mount_id: MountId::new(lowercase_verifier.clone()).unwrap(),
+                ..mount()
+            }),
+            lowercase_verifier,
+        ),
+        (
+            "drive_id",
+            result_line(&MountInfo {
+                drive_id: DriveId::new(ID_TOKEN).unwrap(),
+                ..mount()
+            }),
+            // Drive IDs are kept in lowercase.
+            ID_TOKEN.to_ascii_lowercase(),
+        ),
+        (
+            "mount_point",
+            result_line(&MountInfo {
+                mount_point: ProtocolPath::new(format!("/home/user/{CODE}")).unwrap(),
+                ..mount()
+            }),
+            CODE.to_owned(),
+        ),
+        (
+            "drive_type (open set)",
+            result_line(&MountInfo {
+                drive_type: Some(DriveType::from_wire(CODE)),
+                ..mount()
+            }),
+            CODE.to_owned(),
+        ),
+        (
+            "blocked_message",
+            result_line(&MountInfo {
+                blocked_message: Some(LINK.into()),
+                ..mount()
+            }),
+            LINK.to_owned(),
+        ),
+        (
+            "export destination",
+            result_line(&ItemExportResult {
+                path: ProtocolPath::new("/home/user/OneDrive/a.pdf").unwrap(),
+                destination: LocalPath::new(format!("/home/user/{CODE}")).unwrap(),
+                bytes_copied: 1,
+            }),
+            CODE.to_owned(),
+        ),
+        (
+            "item message",
+            result_line(&item().with_reason(ItemReason::DownloadFailed, CODE)),
+            CODE.to_owned(),
+        ),
+        (
+            "error message",
+            error_line(RpcError::new(ErrorCode::Internal, CODE)),
+            CODE.to_owned(),
+        ),
+    ];
+    for (field, line, secret) in carried {
+        let text = String::from_utf8_lossy(&line);
+        assert!(
+            text.contains(&secret),
+            "{field} no longer carries arbitrary text; it is now checked"
+        );
+    }
+    let catalogue = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/protocol/README.md"),
+    )
+    .unwrap()
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ");
+    for needle in [
+        "Only three values a client receives are checked by the protocol types",
+        "The types cannot tell any of these from a secret",
+    ] {
+        assert!(
+            catalogue.contains(needle),
+            "the catalogue must say {needle:?}"
+        );
+    }
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn mount_account() -> AccountInfo {
+    AccountInfo {
+        account_id: AccountId::new("acct-personal-1").unwrap(),
+        kind: AccountKind::Personal,
+        tenant_id: None,
+        state: AccountState::SignedIn,
+        user_name: None,
+        display_name: None,
+    }
 }
 
 /// WP-016 AC3: every error the protocol layer builds for sign-in and for a confirmation is

@@ -510,10 +510,18 @@ expected and repeats no value from the request. Sign-in errors are `sign-in-fail
 reason code and a fixed message for each reason, built from nothing the client sent; the
 identity platform's own error text from a redirect is not passed on.
 
-Free text remains in a few places, each capped at 1 KiB and each with one content rule:
-`message` (the daemon's description of an error, which never quotes a credential or sharing
-link), and `user_name`, `display_name`, `drive_name` and `site_name` (names as Graph reports
-them, for display only).
+**What the types check, and what they do not.** Only three values a client receives are
+checked by the protocol types so that they cannot hold a secret: `attempt_id` and
+`confirmation_token` (too short, in too small an alphabet) and `authorization_url` (the rules
+above). Everything else a result, notification or error carries is text within its own rule:
+identifiers (`account_id`, `tenant_id`, `drive_id`, `mount_id`), paths (`mount_point`, item
+paths, an export `destination`), values of open sets, the names `user_name`, `display_name`,
+`drive_name` and `site_name`, `blocked_message`, an item's `message`, and every error
+`message`. Names and messages are capped at 1 KiB and paths at 4,096 bytes, but none is
+filtered. The types cannot tell any of these from a secret. The daemon fills them only from
+Graph metadata and its own state, never from a token, code, verifier, pasted address or
+sharing link, and an error `message` never quotes one; that is the daemon's rule to keep and
+to test, not something these types enforce.
 
 ### account.login.start
 
