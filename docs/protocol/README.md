@@ -172,7 +172,8 @@ uses a new value only when the daemon advertises it.
 ## Connections
 
 1. Connect and send `hello`. Any other request first gets `hello-required` and has no
-   effect. A second `hello` on the same connection gets `invalid-request`.
+   effect, whatever its parameters and whether or not the method exists: a request is
+   admitted by its method name before its parameters are checked. A second `hello` on the same connection gets `invalid-request`.
 2. Send requests and read responses. **Match each response to its request by `id`**:
    responses may arrive in a different order from the requests.
 3. The daemon sends no response to a notification (a message without `id`) from a client,
@@ -1262,7 +1263,8 @@ sample shows two of the 6,999 skipped files.
 
 ### item.import
 
-Offered only while `hello` advertises `item-import-export`; otherwise `method-not-found`.
+Offered only while `hello` advertises `item-import-export`; otherwise `method-not-found`,
+whatever the parameters, exactly as for a method that does not exist.
 
 Parameters: `source`, a [local path](#conventions) to a regular file; `destination`, the
 file's path in a mount, whose parent folder must exist; and `mode` (open, request only;
@@ -1339,7 +1341,8 @@ A source that is not an absolute, canonical path:
 
 ### item.export
 
-Offered only while `hello` advertises `item-import-export`; otherwise `method-not-found`.
+Offered only while `hello` advertises `item-import-export`; otherwise `method-not-found`,
+whatever the parameters, exactly as for a method that does not exist.
 
 Parameters: `source`, a file in a mount; `destination`, a [local path](#conventions) whose
 directory exists; and `mode` (open, request only; required, with no default): `create` when

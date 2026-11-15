@@ -2118,50 +2118,81 @@ impl Session {
         self.phase
     }
 
-    /// Whether `call` may run now.
+    /// Admits a request and decodes it, in that order: the method name is admitted
+    /// ([`Session::admit_method`]) before its parameters are looked at, so a request this
+    /// connection may not make gets the same answer whatever its parameters. A server uses
+    /// this, not [`MethodCall::parse`] followed by [`Session::admit`].
     ///
     /// # Errors
     ///
-    /// `hello-required` for anything but `hello` before `hello` has succeeded (ADR-0009 R3,
-    /// ADR-0019 R5); `invalid-request` for a second `hello`, and for any request on a
-    /// subscribed connection; `method-not-found` for `item.import` and `item.export` when
-    /// `hello` did not advertise [`CAPABILITY_IMPORT_EXPORT`].
-    pub fn admit(&self, call: &MethodCall) -> Result<(), RpcError> {
-        match (self.phase, call) {
-            (Phase::AwaitingHello, MethodCall::Hello(_)) => Ok(()),
-            (Phase::AwaitingHello, other) => Err(RpcError::new(
+    /// As [`Session::admit_method`], then as [`MethodCall::parse`].
+    pub fn decode(&self, method: &str, params: Option<&Value>) -> Result<MethodCall, RpcError> {
+        self.admit_method(method)?;
+        MethodCall::parse(method, params)
+    }
+
+    /// Decodes a request; see [`Session::decode`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::decode`].
+    pub fn decode_request(&self, request: &Request) -> Result<MethodCall, RpcError> {
+        self.decode(&request.method, request.params.as_ref())
+    }
+
+    /// Whether a request for `method` may run now, judged by its name alone.
+    ///
+    /// # Errors
+    ///
+    /// `hello-required` for anything but `hello` before `hello` has succeeded, including a
+    /// method that does not exist (ADR-0009 R3, ADR-0019 R5); `invalid-request` for a second
+    /// `hello`, and for any request on a subscribed connection; `method-not-found` for
+    /// `item.import` and `item.export` when `hello` did not advertise
+    /// [`CAPABILITY_IMPORT_EXPORT`], exactly as for a method that does not exist. An unknown
+    /// method on a ready connection is admitted here and refused by [`MethodCall::parse`].
+    pub fn admit_method(&self, name: &str) -> Result<(), RpcError> {
+        let is_hello = name == method::HELLO;
+        match self.phase {
+            Phase::AwaitingHello if is_hello => Ok(()),
+            Phase::AwaitingHello => Err(RpcError::new(
                 ErrorCode::HelloRequired,
                 format!(
                     "{} refused: the first request on a connection must be hello",
-                    other.method()
+                    crate::error::truncate_to(name, 128)
                 ),
             )),
-            (Phase::Ready(_), MethodCall::Hello(_)) => Err(RpcError::new(
+            Phase::Ready(_) if is_hello => Err(RpcError::new(
                 ErrorCode::InvalidRequest,
                 "hello refused: this connection has already completed hello",
             )),
-            (Phase::Ready(_), MethodCall::ItemImport(_) | MethodCall::ItemExport(_))
-                if !self.import_export =>
-            {
+            Phase::Ready(_) if method::IMPORT_EXPORT.contains(&name) && !self.import_export => {
                 Err(RpcError::new(
                     ErrorCode::MethodNotFound,
                     format!(
-                        "method {:?} is not offered by this daemon: hello did not advertise \
-                         the capability {CAPABILITY_IMPORT_EXPORT}",
-                        call.method()
+                        "method {name:?} is not offered by this daemon: hello did not advertise \
+                         the capability {CAPABILITY_IMPORT_EXPORT}"
                     ),
                 ))
             }
-            (Phase::Ready(_), _) => Ok(()),
-            (Phase::Subscribed(_), other) => Err(RpcError::new(
+            Phase::Ready(_) => Ok(()),
+            Phase::Subscribed(_) => Err(RpcError::new(
                 ErrorCode::InvalidRequest,
                 format!(
                     "{} refused: this connection is subscribed and carries notifications only; \
                      open a second connection for requests",
-                    other.method()
+                    crate::error::truncate_to(name, 128)
                 ),
             )),
         }
+    }
+
+    /// Whether `call`, already decoded, may run now: [`Session::admit_method`] for its name.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::admit_method`].
+    pub fn admit(&self, call: &MethodCall) -> Result<(), RpcError> {
+        self.admit_method(call.method())
     }
 
     /// Runs `hello` for this connection: negotiates a version against `daemon_supported` and,
@@ -2997,6 +3028,79 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), Some(ErrorCode::UnsupportedVersion));
         assert_eq!(session.phase(), Phase::AwaitingHello);
+    }
+
+    /// ADR-0019 R5, ADR-0009 R3: admission by name runs before parameters are parsed, so
+    /// before `hello` every request but `hello` gets `hello-required`, whether its parameters
+    /// are malformed, absent or valid, and whether or not the method exists. A malformed
+    /// `hello` is still `invalid-params`.
+    #[test]
+    fn adr_0019_r5_malformed_requests_before_hello_are_hello_required() {
+        let session = Session::new();
+        let cases = [
+            (method::MOUNT_PAUSE, Some(json!({"duration_secs": 0}))),
+            (method::MOUNT_PAUSE, Some(json!(["positional"]))),
+            (method::ITEM_PIN, Some(json!({"paths": ["relative"]}))),
+            (method::ACCOUNT_LOGIN_FINISH, Some(json!({}))),
+            (method::ITEM_IMPORT, Some(json!({"source": "rel"}))),
+            (method::DAEMON_STATUS, None),
+            ("item.delete", Some(json!({"paths": 1}))),
+        ];
+        for (name, params) in &cases {
+            let err = session.decode(name, params.as_ref()).unwrap_err();
+            assert_eq!(err.kind(), Some(ErrorCode::HelloRequired), "{name}");
+            assert_eq!(session.phase(), Phase::AwaitingHello);
+        }
+        let err = session
+            .decode(method::HELLO, Some(&json!({"client_name": 1})))
+            .unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidParams));
+        assert!(
+            session
+                .decode(
+                    method::HELLO,
+                    Some(&json!({"client_name": "c", "protocol_versions": [1]}))
+                )
+                .is_ok()
+        );
+        // On a subscribed connection a malformed request is `invalid-request` too.
+        let mut subscribed = ready_session(&[]);
+        subscribed.subscribed();
+        let err = subscribed
+            .decode(method::MOUNT_PAUSE, Some(&json!({"duration_secs": 0})))
+            .unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidRequest));
+    }
+
+    /// With the capability withdrawn, `item.import` and `item.export` behave as if they did
+    /// not exist: `method-not-found`, with the same message, whatever their parameters.
+    #[test]
+    fn withdrawn_methods_are_not_found_whatever_their_parameters() {
+        let without = ready_session(&[]);
+        let with = ready_session(&[CAPABILITY_IMPORT_EXPORT]);
+        for name in method::IMPORT_EXPORT {
+            let valid = new_calls()
+                .into_iter()
+                .find(|c| c.method() == *name)
+                .unwrap()
+                .params()
+                .unwrap();
+            let reference = without.decode(name, valid.as_ref()).unwrap_err();
+            assert_eq!(reference.kind(), Some(ErrorCode::MethodNotFound), "{name}");
+            for bad in [
+                None,
+                Some(json!({})),
+                Some(json!({"source": "relative", "destination": "/m/a", "mode": "x"})),
+                Some(json!(["positional"])),
+            ] {
+                let err = without.decode(name, bad.as_ref()).unwrap_err();
+                assert_eq!(err, reference, "{name} {bad:?}");
+                // Offered, the same request is checked: `invalid-params`.
+                let err = with.decode(name, bad.as_ref()).unwrap_err();
+                assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{name} {bad:?}");
+            }
+            assert!(with.decode(name, valid.as_ref()).is_ok());
+        }
     }
 
     /// ADR-0009 R3 and ADR-0019 R5: a request other than hello before hello gets
