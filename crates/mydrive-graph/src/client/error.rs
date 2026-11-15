@@ -48,6 +48,92 @@ pub enum Operation {
         /// The item.
         item: ItemId,
     },
+    /// A simple upload replacing an existing file's content,
+    /// `PUT /drives/{drive}/items/{item}/content`.
+    UploadReplace {
+        /// The drive.
+        drive: DriveId,
+        /// The file whose content is replaced.
+        item: ItemId,
+    },
+    /// A simple upload creating a new file in a folder,
+    /// `PUT /drives/{drive}/items/{parent}:/{name}:/content`. The name is not kept: it is
+    /// the user's file name and stays out of errors and logs.
+    UploadNew {
+        /// The drive.
+        drive: DriveId,
+        /// The folder the file is created in.
+        parent: ItemId,
+    },
+    /// `POST /drives/{drive}/items/{parent}/children` creating a folder. The name is not
+    /// kept.
+    CreateFolder {
+        /// The drive.
+        drive: DriveId,
+        /// The folder the new folder is created in.
+        parent: ItemId,
+    },
+    /// `PATCH /drives/{drive}/items/{item}`: a rename, a move or a metadata change.
+    UpdateItem {
+        /// The drive.
+        drive: DriveId,
+        /// The item.
+        item: ItemId,
+    },
+    /// `DELETE /drives/{drive}/items/{item}`.
+    DeleteItem {
+        /// The drive.
+        drive: DriveId,
+        /// The item.
+        item: ItemId,
+    },
+    /// `POST /drives/{drive}/items/{item}/createUploadSession` for replacing an existing
+    /// file's content.
+    CreateUploadSessionReplace {
+        /// The drive.
+        drive: DriveId,
+        /// The file whose content is replaced.
+        item: ItemId,
+    },
+    /// `POST /drives/{drive}/items/{parent}:/{name}:/createUploadSession` for a new file.
+    /// The name is not kept.
+    CreateUploadSessionNew {
+        /// The drive.
+        drive: DriveId,
+        /// The folder the file is created in.
+        parent: ItemId,
+    },
+    /// Sending one fragment to an upload session. The upload URL is a credential and is
+    /// not kept.
+    UploadFragment {
+        /// The drive the session uploads to.
+        drive: DriveId,
+    },
+    /// Reading an upload session's status. The upload URL is not kept.
+    UploadSessionStatus {
+        /// The drive the session uploads to.
+        drive: DriveId,
+    },
+    /// Cancelling an upload session. The upload URL is not kept.
+    CancelUploadSession {
+        /// The drive the session uploads to.
+        drive: DriveId,
+    },
+    /// `GET /me`: the signed-in user.
+    GetMe,
+    /// `GET /me/drive`: the signed-in user's own drive.
+    GetMyDrive,
+    /// `GET /organization`: the signed-in user's organisation.
+    GetOrganization,
+    /// `GET /shares/{encoded}/driveItem`: resolving a sharing link. The link grants access
+    /// and is not kept.
+    ResolveShare,
+    /// Reading the details needed to name a drive's mount point, such as the site and
+    /// library names of a library.
+    GetDriveDetails {
+        /// The drive.
+        drive: DriveId,
+    },
 }
 
 impl fmt::Display for Operation {
@@ -63,6 +149,64 @@ impl fmt::Display for Operation {
             Self::Delta { drive } => write!(f, "fetching a delta page of drive {}", d(drive)),
             Self::Download { drive, item } => {
                 write!(f, "downloading item {} of drive {}", i(item), d(drive))
+            }
+            Self::UploadReplace { drive, item } => {
+                write!(
+                    f,
+                    "uploading content of item {} of drive {}",
+                    i(item),
+                    d(drive)
+                )
+            }
+            Self::UploadNew { drive, parent } => write!(
+                f,
+                "uploading a new file into folder {} of drive {}",
+                i(parent),
+                d(drive)
+            ),
+            Self::CreateFolder { drive, parent } => write!(
+                f,
+                "creating a folder in folder {} of drive {}",
+                i(parent),
+                d(drive)
+            ),
+            Self::UpdateItem { drive, item } => {
+                write!(f, "updating item {} of drive {}", i(item), d(drive))
+            }
+            Self::DeleteItem { drive, item } => {
+                write!(f, "deleting item {} of drive {}", i(item), d(drive))
+            }
+            Self::CreateUploadSessionReplace { drive, item } => write!(
+                f,
+                "creating an upload session for item {} of drive {}",
+                i(item),
+                d(drive)
+            ),
+            Self::CreateUploadSessionNew { drive, parent } => write!(
+                f,
+                "creating an upload session for a new file in folder {} of drive {}",
+                i(parent),
+                d(drive)
+            ),
+            Self::UploadFragment { drive } => write!(
+                f,
+                "sending a fragment to an upload session of drive {}",
+                d(drive)
+            ),
+            Self::UploadSessionStatus { drive } => write!(
+                f,
+                "reading the status of an upload session of drive {}",
+                d(drive)
+            ),
+            Self::CancelUploadSession { drive } => {
+                write!(f, "cancelling an upload session of drive {}", d(drive))
+            }
+            Self::GetMe => f.write_str("reading the signed-in user"),
+            Self::GetMyDrive => f.write_str("reading the signed-in user's drive"),
+            Self::GetOrganization => f.write_str("reading the signed-in user's organisation"),
+            Self::ResolveShare => f.write_str("resolving a sharing link"),
+            Self::GetDriveDetails { drive } => {
+                write!(f, "reading the details of drive {}", d(drive))
             }
         }
     }
@@ -353,5 +497,74 @@ impl fmt::Display for GraphError {
 impl std::error::Error for GraphError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.0.kind)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The operations added for M1 (WP-014) show drive and item IDs only in their `shown`
+    /// form, as the read operations do: a hostile ID cannot put a control character or an
+    /// overlong string into an error message or a log line.
+    #[test]
+    fn m1_operations_show_ids_only_in_shown_form() {
+        let hostile = format!("id\n\u{1b}[31m{}", "x".repeat(500));
+        let drive = DriveId::new(hostile.clone()).unwrap();
+        let item = ItemId::new(hostile).unwrap();
+        let parent = item.clone();
+        let operations = [
+            Operation::UploadReplace {
+                drive: drive.clone(),
+                item: item.clone(),
+            },
+            Operation::UploadNew {
+                drive: drive.clone(),
+                parent: parent.clone(),
+            },
+            Operation::CreateFolder {
+                drive: drive.clone(),
+                parent: parent.clone(),
+            },
+            Operation::UpdateItem {
+                drive: drive.clone(),
+                item: item.clone(),
+            },
+            Operation::DeleteItem {
+                drive: drive.clone(),
+                item: item.clone(),
+            },
+            Operation::CreateUploadSessionReplace {
+                drive: drive.clone(),
+                item,
+            },
+            Operation::CreateUploadSessionNew {
+                drive: drive.clone(),
+                parent,
+            },
+            Operation::UploadFragment {
+                drive: drive.clone(),
+            },
+            Operation::UploadSessionStatus {
+                drive: drive.clone(),
+            },
+            Operation::CancelUploadSession {
+                drive: drive.clone(),
+            },
+            Operation::GetMe,
+            Operation::GetMyDrive,
+            Operation::GetOrganization,
+            Operation::ResolveShare,
+            Operation::GetDriveDetails { drive },
+        ];
+        for operation in operations {
+            for text in [operation.to_string(), format!("{operation:?}")] {
+                assert!(
+                    text.chars().all(|c| c == ' ' || c.is_ascii_graphic()),
+                    "{text:?}"
+                );
+                assert!(!text.contains(&"x".repeat(129)), "{text}");
+            }
+        }
     }
 }

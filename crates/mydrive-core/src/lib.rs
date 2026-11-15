@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod clock;
+pub mod conflict;
 pub mod hash;
 pub mod ids;
 pub mod names;

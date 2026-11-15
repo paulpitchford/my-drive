@@ -39,9 +39,17 @@
 //!   engine compares them (ADR-0011 R4) and verifies the hash once the file is whole.
 //!
 //! Nothing here logs a token, a URL or a response body.
+//!
+//! **Layout.** The M1 calls are added in their own files beside this one, each filled by
+//! the work package its documentation names: `write` (WP-025), `session` (WP-026),
+//! `identity` and `discover` (WP-027).
 
+mod discover;
 mod download;
 mod error;
+mod identity;
+mod session;
+mod write;
 
 use std::fmt;
 use std::sync::Arc;
