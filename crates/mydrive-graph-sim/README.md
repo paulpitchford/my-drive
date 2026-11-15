@@ -33,6 +33,16 @@ the tree and the delta change log but make no request. Dropping it stops the ser
 
 ## Switches
 
+Per simulator, in `IdentityOptions` (`set_identity_options`); sources in
+[`docs/identity.md`](docs/identity.md).
+
+| Switch | Default | Why this default |
+|---|---|---|
+| `old_refresh_token` | `Refused` | WP-023 sets it: only the newest refresh token works, which catches a client that does not store the rolled one. The identity platform documents that the old one is not revoked on use; `Accepted` models that. |
+| `id_token` | `WithOpenidScope` | Documented: the token endpoint returns an `id_token` only when `openid` was requested. `Always` returns one on every success. |
+| `personal_organization` | `Forbidden` | What `/organization` answers for a personal account is unverified; `403` is harder (it looks like a policy block). `Empty` answers an empty list. |
+| `share_without_prefer` | `Refused` | What `/shares` does with no `Prefer` header for a caller without access is unverified; refusing is harder. `Peek` answers as `redeemSharingLinkIfNecessary` does. |
+
 Per drive, in `DriveOptions` (`add_drive_with`, `set_options`).
 
 | Switch | Default | Why this default |
@@ -57,6 +67,7 @@ routes and its part of the `GraphSim` control API.
 | Feature | Document | Source file |
 |---|---|---|
 | Server and auth: the two origins, bearer tokens, error bodies | [`docs/server.md`](docs/server.md) | `src/server.rs`, `src/auth.rs` |
+| Identity, the fake authority and discovery: accounts, tenants, sign-in, `/me`, sharing links, sites, blocked and read-only libraries | [`docs/identity.md`](docs/identity.md) | `src/identity.rs`, `src/authority.rs`, `src/discovery.rs` |
 | Drives and items: drive and item JSON, IDs, eTags, get-item and list-children | [`docs/items.md`](docs/items.md) | `src/items.rs` |
 | Delta: token-less enumeration, tokens, repeats, deletes | [`docs/delta.md`](docs/delta.md) | `src/delta.rs` |
 | Content download: redirect and direct modes, ranges | [`docs/content.md`](docs/content.md) | `src/content.rs` |

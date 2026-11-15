@@ -1,9 +1,15 @@
-//! The HTTP side: the shared state, the two origins' routers and the response helpers
+//! The HTTP side: the shared state, the three origins' routers and the response helpers
 //! every feature uses.
 //!
 //! Each origin's router is composed from per-feature routers, so a feature adds its routes
 //! in its own file. The middleware lives with its feature: the request log in `log`,
-//! scripted faults in `fault`, the bearer-token check in `auth`.
+//! scripted faults in `fault`, the bearer-token check in `auth`, the blocked and read-only
+//! library check in `discovery`.
+//!
+//! **Locks.** `Shared` holds two: the drives' [`State`] and the identity registry
+//! ([`Directory`]). No code holds both at once: a handler that needs both takes one,
+//! drops it, then takes the other, and neither is held across an `.await`. So there is no
+//! lock order to keep.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -14,27 +20,43 @@ use axum::response::{IntoResponse, Response};
 use mydrive_core::ids::{DriveId, ItemId};
 use serde_json::Value;
 
+use crate::identity::Directory;
 use crate::json::error_json;
 use crate::log::Origin;
 use crate::model::{Drive, State};
-use crate::{auth, content, delta, discovery, fault, identity, items, log, session, write};
+use crate::{
+    auth, authority, content, delta, discovery, fault, identity, items, log, session, write,
+};
 
 /// State shared by the handlers and the control API.
 #[derive(Debug)]
 pub(crate) struct Shared {
     state: Mutex<State>,
+    /// Accounts, tenants, the authority's codes and tokens, sites, libraries and links.
+    /// Never locked while `state` is (see the module documentation).
+    directory: Mutex<Directory>,
     /// `http://127.0.0.1:<port>/v1.0`, the Graph base URL.
     pub(crate) graph_base: String,
     /// `http://127.0.0.1:<port>`, the pre-authenticated download origin.
     pub(crate) download_base: String,
+    /// `http://127.0.0.1:<port>`, the fake authority's origin.
+    pub(crate) authority_base: String,
 }
 
 impl Shared {
-    pub(crate) fn new(state: State, graph_base: String, download_base: String) -> Self {
+    pub(crate) fn new(
+        state: State,
+        directory: Directory,
+        graph_base: String,
+        download_base: String,
+        authority_base: String,
+    ) -> Self {
         Self {
             state: Mutex::new(state),
+            directory: Mutex::new(directory),
             graph_base,
             download_base,
+            authority_base,
         }
     }
 
@@ -42,6 +64,14 @@ impl Shared {
     /// path) leaves it usable: every mutation is applied whole or not at all.
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the identity registry. Never call it while holding [`Shared::lock`]'s guard,
+    /// or the reverse. Poisoning is handled as for [`Shared::lock`].
+    pub(crate) fn directory(&self) -> MutexGuard<'_, Directory> {
+        self.directory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -61,6 +91,12 @@ pub(crate) fn graph_router(shared: Arc<Shared>) -> Router {
         .merge(identity::routes())
         .merge(discovery::routes())
         .fallback(no_route)
+        // Innermost: the blocked and read-only check sees only requests the bearer check
+        // let through, and covers every route, including write routes added later.
+        .layer(from_fn_with_state(
+            shared.clone(),
+            discovery::library_policy,
+        ))
         .layer(from_fn_with_state(shared.clone(), auth::require_bearer))
         .layer(from_fn_with_state(ctx.clone(), fault::apply_fault))
         .layer(from_fn_with_state(ctx, log::log_request))
@@ -73,6 +109,18 @@ pub(crate) fn download_router(shared: Arc<Shared>) -> Router {
     Router::new()
         .merge(content::download_routes())
         .fallback(no_route)
+        .layer(from_fn_with_state(ctx.clone(), fault::apply_fault))
+        .layer(from_fn_with_state(ctx, log::log_request))
+        .with_state(shared)
+}
+
+/// The router for the fake sign-in authority. It checks no bearer token; the log masks
+/// what it must (see `log`).
+pub(crate) fn authority_router(shared: Arc<Shared>) -> Router {
+    let ctx: Ctx = (shared.clone(), Origin::Authority);
+    Router::new()
+        .merge(authority::routes())
+        .fallback(authority::no_route)
         .layer(from_fn_with_state(ctx.clone(), fault::apply_fault))
         .layer(from_fn_with_state(ctx, log::log_request))
         .with_state(shared)
