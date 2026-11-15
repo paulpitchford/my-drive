@@ -121,7 +121,7 @@ There are 31 packages, WP-014 to WP-044. "Adversarial" marks the ones other code
 - In scope, in `methods.rs`, `values.rs`, `error.rs`, `paging.rs` and `docs/protocol/README.md`:
   - `account.login.start` (mode browser or headless; returns attempt ID and authorise URL), `account.login.finish` (optionally a pasted URL; returns `AccountInfo` and a proposed default mount; creates nothing), `account.logout`.
   - `mount.add.preview` (target is a drive ID, a link or the account's own drive; returns names, item count if known, read-only flag, proposed mount point and a confirmation token), `mount.add.confirm`, `mount.remove`.
-  - `sync.pause` and `sync.resume` (decision D12).
+  - `mount.pause` and `mount.resume` (decision D12; ADR-0009 has no `sync.*` group).
   - `item.import` and `item.export`, behind a capability string (decision D5).
   - Additive fields: `AccountInfo.username` and `display_name`; `MountInfo.items` and `drive_type`.
 - Out of scope: `activity.*`; any server code.
