@@ -18,7 +18,7 @@ Request scheduler, how interactive hydration is served before background sync, a
 | 2 Interactive command | Link preview and redeem (F09), sign-in follow-up (F01), free-up-space confirmation (F06), `mydrive status` lookups that need Graph | A user is waiting at a prompt |
 | 3 Read-ahead | Read-ahead chunks (F03) | Dropped when the file is closed |
 | 4 Upload | Content uploads, creates, moves, deletes (F04, F12) | |
-| 5 Delta | Notification-triggered and polling delta (F05) | Cheap: 1 resource unit with a token |
+| 5 Delta | Delta runs started by the mount's wake-up source: polling in M1 (F05) | Cheap: 1 resource unit with a token |
 | 6 Background download | Pinned and `mydrive hydrate` downloads (F06), initial enumeration (F02) | |
 | 7 Housekeeping | Thumbnail seeding (F03), safety-net polls, blocked-mount probes | |
 
@@ -67,7 +67,7 @@ flowchart TD
     C -->|no| Q["queue"]
     B -->|no| D{"in-flight requests below the tenant's concurrency limit?"}
     D -->|no| Q
-    D -->|yes| E["dispatch highest class first; within a class, round-robin across mounts"]
+    D -->|yes| E["dispatch highest class first, within a class round-robin across mounts"]
     Q --> D
     E --> R{"response"}
     R -->|"429 or 503 with Retry-After"| H["hold the whole tenant until Retry-After, requeue the request"]

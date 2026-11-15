@@ -56,7 +56,7 @@ journeys give the outcome.
 
 | ID | Title | Persona | Milestone | Related flows | ACs |
 |---|---|---|---|---|---|
-| [J01](J01-first-run-sign-in.md) | First run and sign-in | Sam | M2 (UI variant M4) | F01, F02, F13 | 9 |
+| [J01](J01-first-run-sign-in.md) | First run and sign-in | Sam | M2 (UI variant M4) | F01, F02, F13 | 11 |
 | [J02](J02-browse-without-downloading.md) | Browse without downloading | Sam | M2 | F02, F03, F11, F13 | 7 |
 | [J03](J03-open-an-online-only-file.md) | Open an online-only file | Sam | M2 | F03, F08, F10, F13 | 10 |
 | [J04](J04-edit-and-save.md) | Edit and save | Sam, Priya | M2 | F04, F07, F10, F13 | 10 |
@@ -69,13 +69,13 @@ journeys give the outcome.
 | [J11](J11-add-a-sharepoint-library.md) | Add a SharePoint library | Priya | M4 (CLI by link or drive ID from M2) | F09, F02, F01, F10 | 10 |
 | [J12](J12-read-only-library.md) | Read-only library | Priya | M2 | F09, F04, F11, F13 | 8 |
 | [J13](J13-library-blocked-by-policy.md) | Library blocked by organisation policy | Priya | M2 | F09, F08, F10, F11, F13 | 8 |
-| [J14](J14-headless-and-cli-only.md) | Headless and CLI only | Sam | M2 | F01, F02, F06, F11 | 9 |
+| [J14](J14-headless-and-cli-only.md) | Headless and CLI only | Sam | M2 | F01, F02, F06, F11 | 10 |
 | [J15](J15-pause-resume-sign-out-remove-mount.md) | Pause, resume, sign out and remove a mount | Priya | M2 | F08, F10, F12, F01, F02 | 10 |
 | [J16](J16-crash-and-reboot-recovery.md) | Crash and reboot recovery | Sam | M2 | F04, F08, F03, F12, F13 | 9 |
 | [J17](J17-file-manager-on-omarchy.md) | File manager on Omarchy | Sam | M3 | F11, F06, F03, F13 | 8 |
 | [J18](J18-crawler-touches-the-mount.md) | A crawler touches the mount | Sam | M2 (Files thumbnails M3) | F03, F10, F11, F13 | 9 |
 
-Total: 161 acceptance criteria.
+Total: 164 acceptance criteria.
 
 The milestone is the one at which the journey's acceptance criteria must pass. Steps that
 need a later milestone (notifications and tray in M3, the settings window in M4, Nautilus

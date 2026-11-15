@@ -33,10 +33,13 @@ sequenceDiagram
     IPC-->>Adapter: chosen version
     Adapter->>IPC: connection 2, status.subscribe for the mount
     IPC-->>Adapter: subscribed, connection 2 now carries notifications only
-    Adapter->>IPC: connection 1, item.status with the folder path
-    IPC->>Store: read state of every child
-    Store-->>IPC: axes and modifiers
-    IPC-->>Adapter: one entry per child, display status and modifiers
+    loop until a page carries no next_cursor
+        Adapter->>IPC: connection 1, item.status with the folder path and the cursor
+        IPC->>Engine: list children after the cursor
+        Engine->>Store: children in name order after the cursor's name
+        Engine-->>IPC: one page, display status, modifiers and axes per child
+        IPC-->>Adapter: the page, with next_cursor while more remain
+    end
     Adapter->>Host: draw emblems from cache
     User->>Host: Always Keep on This Device on a file
     Host->>Adapter: menu action
@@ -67,6 +70,8 @@ sequenceDiagram
     Files->>Plugin: details hook for the path
     Plugin->>CLI: mydrive status --json PATH, with timeout
     CLI->>IPC: hello, item.status
+    IPC->>Engine: item status for the path
+    Engine-->>IPC: status entry from the store
     IPC-->>CLI: status entry
     CLI-->>Plugin: JSON with display status and modifiers
     Plugin-->>Files: details rows, status and reason
@@ -95,9 +100,14 @@ sequenceDiagram
 2. Steps 7 and 8: the subscription covers the mounts or folders the adapter names; from then on the
    daemon pushes JSON-RPC notifications for state changes. Adapters never poll per file
    (ADR-0014 R3).
-3. Steps 9 to 12: `item.status` with one directory path returns every child in one response
-   (ADR-0009 R7). It is answered from the State store only: the daemon does not stat, open or read
-   anything under the mount point, so a status query can never hydrate.
+3. Steps 9 to 13: `item.status` with one directory path returns its children in name order, a
+   page at a time: the adapter repeats the call with the cursor until a result has no
+   `next_cursor`, and treats the listing as complete only then (ADR-0019 R1, R3; ADR-0020 R1,
+   R2). That is one call sequence per directory, never one call per file. The daemon maps the
+   call to the engine facade, and the engine answers from its listing of the State store
+   (ADR-0023); the daemon never opens the store itself. Neither the daemon nor the engine stats,
+   opens or reads anything under the mount point or in the backing directory, so a status query
+   can never hydrate.
 4. Each entry carries the display status computed by the one derivation function in
    `mydrive-core` (ADR-0008 R2) in its wire form (`online-only`, `local`, `pinned`, `syncing`,
    `error`, `blocked`), the modifiers (`read-only`, `shortcut`), and the underlying axes in wire
@@ -105,7 +115,7 @@ sequenceDiagram
    themselves (ADR-0014 R5).
 5. Paths in requests and results are absolute paths under a mount point; a backing-directory path
    is rejected (ADR-0009 R8). A path outside every mount returns a "not managed" entry.
-6. Steps 14 to 24: commands go out on the request connection (`item.pin`, `item.unpin`,
+6. Steps 15 to 25: commands go out on the request connection (`item.pin`, `item.unpin`,
    `item.dehydrate`, `item.hydrate`); their effects come back as notifications on the subscription
    connection.
 7. The adapter answers the host from its cache and never blocks the host's UI thread. Every call
@@ -143,8 +153,11 @@ sequenceDiagram
 
 ## Invariants
 
-- A status query never touches the mount point and never causes a download.
-- An adapter never polls the daemon once per file per repaint (ADR-0014 R3, ADR-0009 R7).
+- A status query never touches the mount point or the backing directory and never causes a
+  download; the daemon answers it only from the engine's listing (ADR-0023).
+- An adapter never polls the daemon once per file per repaint (ADR-0014 R3, ADR-0019).
+- An adapter never treats a listing as complete before a page without `next_cursor`
+  (ADR-0019 R3).
 - A subscription connection carries notifications only.
 - Adapters never derive display status from the axes (ADR-0014 R5).
 - Adapters hold no state beyond a cache and contain no sync logic (ADR-0014).
@@ -161,10 +174,15 @@ New:
    connects, says `hello` and asks for status. Whether that is fast enough on Omarchy needs
    measuring; a small persistent helper would conflict with Files never running plugin code
    persistently.
+2. **Listing a directory page by page.** ADR-0020 expects the store's index on (parent, name) to
+   serve keyset listing; the store as built has an index on parent only and returns all children
+   at once, with no child-by-name lookup. The engine's listing needs a store query for "children
+   in name order after this name" before `item.status` on a directory can meet ADR-0020 R1 and R2.
 
 ## Related
 
 - Journeys: J02, J06, J07, J17.
-- ADRs: 0008 (R2), 0009 (R1, R3 to R5, R7, R8), 0014 (R1 to R6).
+- ADRs: 0008 (R2), 0009 (R1, R3 to R5, R8), 0014 (R1 to R6), 0019 (R1, R3), 0020 (R1, R2),
+  0023 (R1, R2).
 - Gates: G4.
 - Flows: F06 (actions), F13 (display status).
