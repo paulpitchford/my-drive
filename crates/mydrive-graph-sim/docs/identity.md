@@ -178,7 +178,10 @@ nothing else that the log records.
 - **ID tokens.** Anything shaped like a JWT (`eyJ...` with two dots) is replaced whole with
   `<redacted>`.
 - **Authority origin only.** The `authorization` header is logged as `<scheme> <redacted>`
-  whatever it holds. The values of the query parameters `code`, `code_verifier`,
+  whatever follows the scheme, when the scheme (the part before the first space) is a
+  plain word of ASCII letters such as `Bearer`. Otherwise, or when there is no space, the
+  whole value is logged as `<redacted>`, so a secret sent in the scheme position is not
+  logged either. The values of the query parameters `code`, `code_verifier`,
   `refresh_token`, `access_token`, `id_token`, `client_secret`, `client_assertion`,
   `assertion` and `password` are logged as `<redacted>`. A client that puts a secret in an
   authority URL would otherwise leak it to the log.
@@ -190,11 +193,16 @@ nothing else that the log records.
   token request's form body, it is never logged. Sent anywhere else, it is logged as sent:
   in a header, in the path, in a query on the Graph or download origin, or in an authority
   query under a parameter name other than `code_verifier`. Only the authority's
-  `code_verifier` query parameter is masked, by name.
+  `code_verifier` query parameter is masked, by name. With `code_challenge_method=plain`,
+  or with no method (which means `plain`), the `code_challenge` in the authorise query is
+  the verifier itself, and it is logged in full: a test that uses `plain` puts its
+  verifier in the log.
 - **Not masked.** The fixed per-instance token (`sim-token-<port>`) and tokens added with
   `add_token` are logged in full as before, because existing tests compare them. So are
-  `state` and `code_challenge` in the authorise query: neither is a credential, and a test
-  may want to check that the challenge is S256.
+  `state` and `code_challenge` in the authorise query. `state` is not a credential. An
+  `S256` challenge is a hash the verifier cannot be recovered from, and a test may want to
+  check that the challenge is S256; a `plain` challenge, or one sent without a method, is
+  the verifier and therefore a credential, logged in full all the same (see above).
 
 Masking is by shape, so a token a test adds with `add_token` that happens to start with an
 issued prefix would be masked too. The same goes for any value shaped like a JWT, even one

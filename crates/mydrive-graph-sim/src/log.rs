@@ -216,12 +216,20 @@ fn mask_component(raw: &str, plus_is_space: bool) -> Cow<'_, str> {
     Cow::Borrowed(raw)
 }
 
+/// Whether the part of an `authorization` value before the first space is a plain scheme
+/// word (`Bearer`, `Basic`, `DPoP`): ASCII letters only, so it cannot hold a secret.
+fn is_plain_scheme(scheme: &str) -> bool {
+    !scheme.is_empty() && scheme.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
 /// A header value as the log records it.
 fn logged_header(origin: Origin, name: &str, value: &str) -> String {
     if origin == Origin::Authority && name == "authorization" {
+        // The scheme is kept only when it is a plain word: a client could send a secret
+        // in the scheme position, and that must not reach the log either.
         return match value.split_once(' ') {
-            Some((scheme, _)) => format!("{scheme} {REDACTED}"),
-            None => REDACTED.to_owned(),
+            Some((scheme, _)) if is_plain_scheme(scheme) => format!("{scheme} {REDACTED}"),
+            _ => REDACTED.to_owned(),
         };
     }
     mask_component(value, false).into_owned()
@@ -413,6 +421,33 @@ mod tests {
         assert_eq!(
             logged_header(Origin::Graph, "authorization", "Bearer sim%2Dtoken-1"),
             "Bearer sim%2Dtoken-1"
+        );
+    }
+
+    /// AC7: on the authority's origin an issued secret in the scheme position of the
+    /// `authorization` header is not logged, plain or percent-encoded, with or without a
+    /// space after it; only a plain scheme word is kept.
+    #[test]
+    fn authority_authorization_masks_a_secret_in_the_scheme_position() {
+        for value in [
+            "sim-rt-1-2.SecretXYZ x",
+            "sim-rt-1-2%2ESecretXYZ x",
+            "sim-rt-1-2.SecretXYZ",
+            "sim-rt-1-2%2ESecretXYZ",
+            "eyJhbGc.eyJzdWIi.sig x",
+            "Bearer-ish x",
+            " x",
+        ] {
+            let logged = logged_header(Origin::Authority, "authorization", value);
+            assert_eq!(logged, REDACTED, "{value}");
+        }
+        assert_eq!(
+            logged_header(Origin::Authority, "authorization", "Basic sim-rt-1-2.Secret"),
+            "Basic <redacted>"
+        );
+        assert_eq!(
+            logged_header(Origin::Authority, "authorization", "DPoP x"),
+            "DPoP <redacted>"
         );
     }
 }
