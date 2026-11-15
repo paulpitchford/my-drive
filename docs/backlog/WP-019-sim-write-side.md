@@ -7,7 +7,9 @@
 - **Gates:** —
 - **Owned paths:** `crates/mydrive-graph-sim/src/model.rs`, `src/write.rs`,
   `crates/mydrive-graph-sim/tests/write_*.rs`, `crates/mydrive-graph-sim/docs/write.md`,
-  `crates/mydrive-graph/tests/sim_write_*.rs`
+  `crates/mydrive-graph/tests/sim_write_*.rs`; additions only to the switch table and index
+  in `crates/mydrive-graph-sim/README.md` and to the defaults test in
+  `crates/mydrive-graph-sim/tests/self_tests.rs`
 - **ADRs:** ADR-0017, ADR-0012, ADR-0011
 - **Flows / journeys:** F04, F07, F12
 
@@ -72,7 +74,10 @@ in this wave). State for writes goes in `model.rs`, which you own. Declare new p
 (switches, modes) in `write.rs` and export them by adding exactly one line to `lib.rs`,
 `pub use write::{...};`, directly below the existing `pub use model::{...};`. That one line
 is the only edit you may make to `lib.rs`, which WP-023 otherwise owns in this wave; it was
-tried as a prepared glob in WP-014 and cannot pass the lints while empty. Refusing writes on a
+tried as a prepared glob in WP-014 and cannot pass the lints while empty. AC8's defaults test is the existing one in
+`tests/self_tests.rs`, which reads the switch table in the README: add your switches to
+both, and add a row for `docs/write.md` to the README's index; change nothing else in either
+file. Refusing writes on a
 read-only library is WP-023's, done before a request reaches your handlers.
 
 Follow the simulator's rule: the default is what Microsoft documents; where that is unknown,

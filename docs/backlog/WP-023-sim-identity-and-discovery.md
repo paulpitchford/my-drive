@@ -8,7 +8,9 @@
 - **Owned paths:** `crates/mydrive-graph-sim/src/identity.rs`, `src/authority.rs`,
   `src/discovery.rs`, `src/lib.rs`, `src/server.rs`,
   `crates/mydrive-graph-sim/tests/identity_*.rs`, `tests/discovery_*.rs`,
-  `crates/mydrive-graph-sim/docs/identity.md`, `crates/mydrive-graph/tests/sim_identity_*.rs`
+  `crates/mydrive-graph-sim/docs/identity.md`, `crates/mydrive-graph/tests/sim_identity_*.rs`;
+  additions only to the switch table and index in `crates/mydrive-graph-sim/README.md` and
+  to the defaults test in `crates/mydrive-graph-sim/tests/self_tests.rs`
 - **ADRs:** ADR-0010, ADR-0015, ADR-0017
 - **Flows / journeys:** F01, F09, J01, J11, J13
 
@@ -76,6 +78,11 @@ Blocked and read-only libraries are checked in `server.rs`, in a layer in front 
 drive route, so that WP-019's write handlers (built in parallel) need no change: a read-only
 library refuses any request whose method writes. Say in `docs/identity.md` where the layer
 sits relative to the token check and the fault layer, and why.
+
+Any switch you add goes in the README's switch table and the existing defaults test in
+`tests/self_tests.rs`, and `docs/identity.md` gets a row in the README's index. WP-019 adds
+rows to the same table and test in this wave: add yours without reordering or rewording
+existing rows, so the two merge cleanly.
 
 Existing tokens: the simulator today accepts one fixed bearer token per instance. Tokens the
 authority issues must be accepted by the Graph origin too, and the fixed token must keep
