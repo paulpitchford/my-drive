@@ -23,7 +23,7 @@ recorded as ADRs before any package depending on them is written.
 | D2 | How delta is applied | **Accept (ADR).** Every page is staged durably and last occurrences are applied when the delta link arrives. Resolves the contradiction between F02 and F05. |
 | D3 | Mount and account state | **Accept.** Store facts, derive state; never write `Blocked` into every item. |
 | D4 | Does login create the mount | **Accept.** No. The CLI shows the signed-in account and asks (Q27). F01 and J01 to be amended. |
-| D5 | What "download" and "upload" mean in M1 | **Accept, owner to confirm.** `item.hydrate` plus `item.import` / `item.export` behind a capability, so M1 delivers its stated outcome without the filesystem. |
+| D5 | What "download" and "upload" mean in M1 | **Accept; confirmed by the owner on 2026-11-15.** `item.hydrate` plus `item.import` / `item.export` behind a capability, so M1 delivers its stated outcome without the filesystem. |
 | D6 | Local delete propagation | **Accept.** Deferred to M2 with the mass-delete guard; the schema carries the `delete` kind and `held` flag now. |
 | D7 | Uploads to existing items | **Accept.** Always an upload session, where `If-Match` is documented, until a real-account experiment shows the simple upload honours it. Needs the new gate below. |
 | D8 | Teams resolution | **Accept.** Out of M1; link and drive ID only. |
@@ -48,7 +48,7 @@ recorded as ADRs before any package depending on them is written.
    account and write permission, which the existing experiment package (WP-011) deliberately
    excludes. The owner decides whether and where.
 3. **The app registration (Q22)**, without which nothing can sign in to a real account.
-4. **Confirm D5**, since it defines what M1 lets a user do.
+4. **Confirm D5**, since it defines what M1 lets a user do. Confirmed on 2026-11-15.
 
 ## Size
 

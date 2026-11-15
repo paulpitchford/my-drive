@@ -1,6 +1,6 @@
 # WP-014: M1 shared-file preparation
 
-- **Status:** ready
+- **Status:** done
 - **Milestone:** M1
 - **Wave:** 5
 - **Depends on:** —
