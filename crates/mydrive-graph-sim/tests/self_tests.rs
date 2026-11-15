@@ -485,6 +485,8 @@ mod self_tests {
     /// list exactly these switches with exactly these defaults.
     #[test]
     fn drive_option_defaults_match_the_table_and_the_readme() {
+        use mydrive_graph_sim::{ConflictBehavior, ReplaceStatus, RewriteMode};
+
         let DriveOptions {
             download,
             range,
@@ -496,6 +498,14 @@ mod self_tests {
             personal_folder_ctag,
             content_etag_header,
             hash_empty_files,
+            simple_replace_honours_if_match,
+            rename_sets_modified,
+            quota_bytes,
+            simple_upload_max_bytes,
+            rewrite,
+            rewrite_extensions,
+            folder_conflict_default,
+            replace_status,
         } = DriveOptions::default();
         assert_eq!(download, DownloadMode::Redirect);
         assert_eq!(range, RangeMode::Honoured);
@@ -507,6 +517,19 @@ mod self_tests {
         assert!(!personal_folder_ctag);
         assert!(!content_etag_header);
         assert!(!hash_empty_files);
+        assert!(!simple_replace_honours_if_match);
+        assert!(!rename_sets_modified);
+        assert_eq!(quota_bytes, 1 << 40);
+        assert_eq!(simple_upload_max_bytes, 250_000_000);
+        assert_eq!(rewrite, RewriteMode::Later);
+        assert_eq!(
+            rewrite_extensions,
+            [
+                "doc", "docx", "xls", "xlsx", "ppt", "pptx", "eml", "msg", "tif", "tiff"
+            ]
+        );
+        assert_eq!(folder_conflict_default, ConflictBehavior::Rename);
+        assert_eq!(replace_status, ReplaceStatus::Created);
 
         let actual: std::collections::BTreeMap<String, String> = [
             ("download", format!("`{download:?}`")),
@@ -522,6 +545,23 @@ mod self_tests {
             ("personal_folder_ctag", format!("`{personal_folder_ctag}`")),
             ("content_etag_header", format!("`{content_etag_header}`")),
             ("hash_empty_files", format!("`{hash_empty_files}`")),
+            (
+                "simple_replace_honours_if_match",
+                format!("`{simple_replace_honours_if_match}`"),
+            ),
+            ("rename_sets_modified", format!("`{rename_sets_modified}`")),
+            ("quota_bytes", format!("`{quota_bytes}`")),
+            (
+                "simple_upload_max_bytes",
+                format!("`{simple_upload_max_bytes}`"),
+            ),
+            ("rewrite", format!("`{rewrite:?}`")),
+            ("rewrite_extensions", format!("`{rewrite_extensions:?}`")),
+            (
+                "folder_conflict_default",
+                format!("`{folder_conflict_default:?}`"),
+            ),
+            ("replace_status", format!("`{replace_status:?}`")),
         ]
         .into_iter()
         .map(|(name, default)| (name.to_owned(), default))
