@@ -1,6 +1,6 @@
 # ADR-0012: Write path: durable local write first, asynchronous upload, two hashes per item
 
-- **Status:** Accepted
+- **Status:** Accepted; R5 extended by the overview's rulings (replacing a file always uses a session)
 - **Date:** 2026-11-14
 - **Depends on gates:** none
 

@@ -1,6 +1,6 @@
 # ADR-0021: Content files in the backing directory are keyed by a stable local ID
 
-- **Status:** Accepted
+- **Status:** Accepted (conflict-split wording corrected 2026-11-15, before any implementation)
 - **Date:** 2026-11-15
 - **Depends on gates:** none
 
@@ -38,8 +38,10 @@ sub-directory fan-out; the path is a pure function of `mount_id` and `local_id`.
   that has never been hydrated has no content file. There is no materialisation phase.
 - Folders have no on-disk representation in the backing directory.
 - Renames and moves change only the store.
-- A conflict split is one store transaction that points the content at the copy's row; no
-  file is renamed.
+- A conflict split is one store transaction and no file is renamed: the row that holds the
+  local bytes becomes the conflict copy (it keeps its `local_id` and its content file, takes
+  the copy's name and becomes a not-yet-uploaded item), and a new row with a new `local_id`
+  is created for the server's version under the original name.
 - A content file with no row is an orphan, found by the recovery scan and never interpreted
   as an item. A row whose content file is missing is handled by recovery: for a clean item it
   becomes a placeholder; for a dirty item it is an error state, and it never becomes a remote
