@@ -117,8 +117,9 @@ position must name its first parameter `item`, as the routes here do.
 - **`fileSystemInfo` and the item's own times are one pair.** Graph keeps
   `createdDateTime` and `lastModifiedDateTime` as the service saw them and `fileSystemInfo`
   as the client supplied them. The simulator stores one pair, so supplied times show in
-  both. A client that reads the top-level times where it should read `fileSystemInfo`
-  passes here and would not against Graph. Separating them needs a change in `src/json.rs`.
+  both. **A client that reads the top-level `createdDateTime` or `lastModifiedDateTime`
+  instead of `fileSystemInfo` would pass here but fail against Graph.** Separating them
+  needs a change in `src/json.rs` (a follow-up for the package that owns it).
 - **Folders' eTag, cTag and times** do not follow their contents (as in
   [`items.md`](items.md)); the driveItem resource says a folder's cTag changes "when content
   or metadata of any descendant ... is changed". HTTP writes and control-API changes agree

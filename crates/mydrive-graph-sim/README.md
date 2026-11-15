@@ -80,10 +80,9 @@ the fake authority and discovery (`src/identity.rs`, `src/authority.rs`,
 
 Planned for M1 simulator work packages (WP-007 out of scope):
 
-- Upload: simple `PUT .../content`, upload sessions (`createUploadSession`, 320 KiB
+- Upload: upload sessions (`createUploadSession`, 320 KiB
   fragments, `nextExpectedRanges`, `uploadUrl` with or without `Authorization`,
-  `deferCommit`), `If-Match`/`If-None-Match` and `412`, `@microsoft.graph.conflictBehavior`,
-  `409 nameAlreadyExists`, `507` quota.
+  `deferCommit`), `If-None-Match`.
 - `410 Gone` resync as delta behaviour (a token that expires on its own). The response
   itself, with `resyncChangesApplyDifferences` or `resyncChangesUploadDifferences` and a
   `Location` restart link, can be scripted with a status fault (see Faults above).
@@ -91,7 +90,6 @@ Planned for M1 simulator work packages (WP-007 out of scope):
   scripted 429/503 faults exist now.
 - Ancestor folders appearing in delta when a child changes, and the `deltaExcludeParent`
   header that suppresses them (its own M1 simulator work package).
-- SharePoint rewriting Office files after upload (size and hash change).
 - Sharing links, permissions, the `shared` facet, `remoteItem` and shortcuts.
 - `subscriptions/socketIo` change notifications.
 - A dropped connection before any response (ADR-0017 lists it; WP-007 does not). A
