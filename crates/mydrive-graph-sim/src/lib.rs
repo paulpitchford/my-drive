@@ -1,8 +1,9 @@
 //! Dev-only fake Microsoft Graph server for tests (ADR-0017).
 //!
-//! [`GraphSim::start`] binds two listeners on `127.0.0.1` with ephemeral ports: the Graph
-//! API origin ([`GraphSim::base_url`], ending `/v1.0`) and a separate origin for
-//! pre-authenticated download URLs. The returned handle is also the control API: tests
+//! [`GraphSim::start`] binds three listeners on `127.0.0.1` with ephemeral ports: the Graph
+//! API origin ([`GraphSim::base_url`], ending `/v1.0`), a separate origin for
+//! pre-authenticated download URLs, and a fake sign-in authority
+//! ([`GraphSim::authority_url`]). The returned handle is also the control API: tests
 //! build a tree, change it "as if another device did", switch per-drive behaviours, script
 //! faults and read the request log. Dropping the handle stops the server.
 //!
@@ -57,10 +58,25 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+pub use authority::{
+    ACCESS_TOKEN_LIFETIME_SECS, CODE_LIFETIME_SECS, IdTokenIssue, OldRefreshToken,
+    REFRESH_TOKEN_LIFETIME_SECS, ReusedCode,
+};
 pub use axum::http::{Method, StatusCode};
+pub use discovery::{
+    BLOCKED_MESSAGE, DEFAULT_POLICY_CODE, LibraryAccess, ShareWithoutPrefer, SiteId,
+    encode_sharing_url,
+};
 pub use error::SimError;
 pub use fault::{Fault, FaultAction};
-pub use log::{LOGGED_HEADERS, LoggedRequest, Origin};
+pub use identity::{
+    Account, AccountKind, CONSUMER_TENANT_ID, IdentityError, IdentityOptions, PersonalOrganization,
+    TenantId,
+};
+pub use log::{
+    ISSUED_SECRET_PREFIXES, LOGGED_HEADERS, LoggedRequest, MASKED_AUTHORITY_PARAMS, Origin,
+    REDACTED,
+};
 pub use model::{
     DeltaRepeats, DownloadMode, DriveOptions, DriveType, FolderDeletes, MAX_LOGGED_REQUESTS,
     RangeMode,
@@ -68,6 +84,7 @@ pub use model::{
 pub use write::{ConflictBehavior, ReplaceStatus, RewriteMode};
 
 use conn::{ConnTap, TapListener};
+use identity::Directory;
 use model::State;
 use server::Shared;
 
@@ -80,6 +97,7 @@ pub struct GraphSim {
     shared: Arc<Shared>,
     token: String,
     graph_addr: SocketAddr,
+    authority_addr: SocketAddr,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -104,7 +122,8 @@ async fn bind_loopback() -> Result<(TcpListener, SocketAddr), SimError> {
 impl GraphSim {
     /// Starts a simulator on the current Tokio runtime.
     ///
-    /// It has no drives yet and accepts one bearer token, [`GraphSim::token`].
+    /// It has no drives or accounts yet and accepts one bearer token, [`GraphSim::token`],
+    /// plus any access token its authority issues later.
     ///
     /// # Errors
     ///
@@ -112,14 +131,22 @@ impl GraphSim {
     pub async fn start() -> Result<Self, SimError> {
         let (graph_listener, graph_addr) = bind_loopback().await?;
         let (download_listener, download_addr) = bind_loopback().await?;
+        let (authority_listener, authority_addr) = bind_loopback().await?;
         let token = format!("sim-token-{}", graph_addr.port());
         let mut state = State::new(format!("k{}x", graph_addr.port()));
         state.tokens.insert(token.clone());
-        let shared = Arc::new(Shared::new(
-            state,
-            format!("http://{graph_addr}/v1.0"),
-            format!("http://{download_addr}"),
-        ));
+        let authority_base = format!("http://{authority_addr}");
+        let shared = Arc::new(
+            Shared::new(
+                state,
+                format!("http://{graph_addr}/v1.0"),
+                format!("http://{download_addr}"),
+            )
+            .with_authority(
+                Directory::new(graph_addr.port().to_string(), authority_base.clone()),
+                authority_base,
+            ),
+        );
         let graph = axum::serve(
             TapListener(graph_listener),
             server::graph_router(shared.clone()).into_make_service_with_connect_info::<ConnTap>(),
@@ -127,6 +154,11 @@ impl GraphSim {
         let download = axum::serve(
             TapListener(download_listener),
             server::download_router(shared.clone())
+                .into_make_service_with_connect_info::<ConnTap>(),
+        );
+        let authority = axum::serve(
+            TapListener(authority_listener),
+            server::authority_router(shared.clone())
                 .into_make_service_with_connect_info::<ConnTap>(),
         );
         // `serve` only returns on an accept error it cannot recover from; the simulator
@@ -138,11 +170,15 @@ impl GraphSim {
             tokio::spawn(async move {
                 let _ = download.await;
             }),
+            tokio::spawn(async move {
+                let _ = authority.await;
+            }),
         ];
         Ok(Self {
             shared,
             token,
             graph_addr,
+            authority_addr,
             tasks,
         })
     }
@@ -165,5 +201,11 @@ impl GraphSim {
     #[must_use]
     pub fn graph_addr(&self) -> SocketAddr {
         self.graph_addr
+    }
+
+    /// The socket address of the fake sign-in authority.
+    #[must_use]
+    pub fn authority_addr(&self) -> SocketAddr {
+        self.authority_addr
     }
 }

@@ -531,7 +531,44 @@ mod self_tests {
         assert_eq!(folder_conflict_default, ConflictBehavior::Rename);
         assert_eq!(replace_status, ReplaceStatus::Created);
 
+        // The identity switches (WP-023), per simulator in `IdentityOptions`.
+        let mydrive_graph_sim::IdentityOptions {
+            old_refresh_token,
+            id_token,
+            personal_organization,
+            share_without_prefer,
+            reused_code,
+        } = mydrive_graph_sim::IdentityOptions::default();
+        assert_eq!(
+            reused_code,
+            mydrive_graph_sim::ReusedCode::RevokeIssuedTokens
+        );
+        assert_eq!(
+            old_refresh_token,
+            mydrive_graph_sim::OldRefreshToken::Refused
+        );
+        assert_eq!(id_token, mydrive_graph_sim::IdTokenIssue::WithOpenidScope);
+        assert_eq!(
+            personal_organization,
+            mydrive_graph_sim::PersonalOrganization::Forbidden
+        );
+        assert_eq!(
+            share_without_prefer,
+            mydrive_graph_sim::ShareWithoutPrefer::Refused
+        );
+
         let actual: std::collections::BTreeMap<String, String> = [
+            ("old_refresh_token", format!("`{old_refresh_token:?}`")),
+            ("id_token", format!("`{id_token:?}`")),
+            (
+                "personal_organization",
+                format!("`{personal_organization:?}`"),
+            ),
+            (
+                "share_without_prefer",
+                format!("`{share_without_prefer:?}`"),
+            ),
+            ("reused_code", format!("`{reused_code:?}`")),
             ("download", format!("`{download:?}`")),
             ("range", format!("`{range:?}`")),
             ("delta_page_size", format!("`{delta_page_size}`")),
