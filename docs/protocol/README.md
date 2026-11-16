@@ -61,11 +61,30 @@ below are run against a fake daemon by `crates/mydrive-ipc/tests/readme_examples
   `not-in-a-mount`. File names under a mount are always valid UTF-8 (the VFS refuses any
   other name), so a path that is not valid UTF-8 is never under a mount: clients must never
   send one, and must not "repair" one into a different string.
+- **Local paths.** `item.import` and `item.export` name one path outside every mount, on
+  the local filesystem. It is spelled by exactly the rule for protocol paths above: absolute,
+  canonical (no `.` or `..` component, no empty component, no trailing slash other than `/`
+  itself), UTF-8 with no NUL byte, at most 4,096 bytes. A relative or non-canonical local path
+  (`report.pdf`, `~/report.pdf`, `/home/u/Downloads/`, `/home/u/a/../b`) is rejected with
+  `invalid-params`; the daemon never expands `~`, resolves `..` or adds a working directory.
+  **The rule is lexical, so it cannot see symbolic links.** The daemon resolves the path on
+  the local filesystem, following symbolic links in the directories that lead to it, and
+  refuses with `local-file-error` reason `inside-mount` a path whose resolved location is
+  under a mount point or the daemon's data directory. `item.import` reads the file the last
+  component names, following a symbolic link there to a regular file. `item.export` never
+  follows a symbolic link at the last component: with mode `create` the link counts as
+  existing, and with mode `replace` the link itself is replaced, not the file it points to.
+- **Durations and times** are integers in whole seconds: a duration is a field ending in
+  `_secs`, from 1 to 604,800 (7 days), and a point in time is seconds since the Unix epoch,
+  UTC (`paused_until`). Both are always below 2^53. A request with a duration outside that
+  range is refused with `invalid-params`: it is never read as "no end", nor cut to the limit.
 - **Large integers.** `seq`, `skipped_count` and `bytes_freed` are unsigned 64-bit
   integers, and a client may receive values above 2^53 (9007199254740992), beyond which a
   double-precision float cannot hold every integer exactly. A client whose JSON parser
   reads numbers as doubles (JavaScript's `JSON.parse`, for example) must read these fields
-  as 64-bit or arbitrary-precision integers, or it will compare and show wrong values.
+  as 64-bit or arbitrary-precision integers, or it will compare and show wrong values. The
+  counts `item_count`, `unsynced_files`, `kept_files`, `paused_mounts`, `resumed_mounts` and
+  `bytes_copied` are unsigned 64-bit integers too and are read the same way.
 - Optional fields are omitted when they have no value. **A client or daemon treats an
   absent field and a `null` one the same way**, for every optional field, including
   `params` itself.
@@ -77,7 +96,16 @@ below are run against a fake daemon by `crates/mydrive-ipc/tests/readme_examples
   message. Programs never parse messages.
 - **Messages are capped at 1 KiB**, measured in UTF-8 bytes before JSON escaping, and cut
   on a character boundary. This applies to every `message`, `blocked_message` and item
-  `message`.
+  `message`, and to the names given for display: `user_name`, `display_name`, `drive_name`
+  and `site_name`.
+- **Credentials never travel to a client** (ADR-0010 R6). No result, notification or error
+  carries an access token, refresh token, ID token, authorisation code, PKCE verifier, the
+  redirect address pasted into `account.login.finish`, or a sharing link given to
+  `mount.add.*`; see [Sign-in and credentials](#sign-in-and-credentials).
+- **A request is never guessed at.** An unknown value of a request field (a `mode`, a
+  `target`), a missing required field, or fields that do not fit together are refused with
+  `invalid-params`. The daemon never substitutes a default for a value it did not
+  understand.
 - Clients draw from `status` and `modifiers`. They never derive a status from the axes
   themselves; the axes are there for clients that want detail. **A folder's `status` is a
   summary of its contents computed by the daemon; clients display it as given.** The exact
@@ -89,6 +117,11 @@ below are run against a fake daemon by `crates/mydrive-ipc/tests/readme_examples
 value. *Open* sets may gain values in any daemon release; a client must accept an unknown
 value without failing the response and use the fallback below. Only the display status is
 closed: the state axes are open on the wire (ADR-0020).
+
+Sets marked *request only* appear only in requests. They are open because a later daemon may
+accept more values (a `device-code` login mode, a Teams channel as a mount target); a daemon
+refuses a value it does not know with `invalid-params` rather than guessing, and a client
+uses a new value only when the daemon advertises it.
 
 | Field | Set | Values | Client fallback for an unknown value |
 |---|---|---|---|
@@ -104,12 +137,22 @@ closed: the state axes are open on the wire (ADR-0020).
 | `account.state` | open | `signed-in`, `needs-sign-in` | Treat the account as not active; show the word |
 | `account.kind` | open | `personal`, `work` | Show the word |
 | `error.code` | open | the [error table](#errors) | Treat as a failure; show `message` |
-| `refused.data.reason` | open | `not-in-sync`, `pinned`, `in-use`, `remote-changed`, `insufficient-space` | Show `message` |
+| `refused.data.reason` | open | `not-in-sync`, `pinned`, `in-use`, `remote-changed`, `insufficient-space`, `already-exists`, `not-a-file`, `name-not-allowed`, `mount-point-not-empty`, `mount-point-overlaps`, `already-mounted`, `no-access`, `unsupported-target`, `unsynced-changes` | Show `message` |
 | `refused.data.sync` | open | `in-sync`, `pending-download`, `pending-upload`, `uploading`, `conflict`, `error`, `blocked` | Show the word |
 | `blocked-by-policy.data.reason` | open | `organisation-policy`, `tenant-refused` | Show `message` |
 | `read-only.data.reason` | open | `library-read-only`, `no-write-permission` | Show `message` |
-| `invalid-params.data.reason` | open | `restart-listing` | Treat as a failure; show `message` |
-| `hello.capabilities` | open | none in version 1 | Ignore it |
+| `invalid-params.data.reason` | open | `restart-listing`, `restart-preview` | Treat as a failure; show `message` |
+| `sign-in-failed.data.reason` | open | `attempt-not-found`, `attempt-expired`, `state-mismatch`, `not-a-redirect`, `authorization-error`, `code-rejected`, `no-secret-service`, `loopback-unavailable` | Treat the attempt as gone: start a new sign-in; show `message` |
+| `local-file-error.data.reason` | open | `not-found`, `not-a-file`, `permission-denied`, `already-exists`, `inside-mount`, `no-space`, `io-error` | Show `message` |
+| `mount.drive_type` | open | `personal`, `business`, `document-library` | Show the word |
+| `mount.add.preview.drive_type` | open | `personal`, `business`, `document-library` | Show the word |
+| `account.login.finish.proposed_mount.drive_type` | open | `personal`, `business`, `document-library` | Show the word |
+| `account.login.start.mode` | open | `browser`, `headless` | Request only: a daemon refuses a mode it does not know with `invalid-params` |
+| `mount.add.preview.target` | open | `own-drive`, `drive-id`, `sharing-link` | Request only: a daemon refuses a target it does not know with `invalid-params` |
+| `mount.add.confirm.target` | open | `own-drive`, `drive-id`, `sharing-link` | Request only: as for `mount.add.preview.target` |
+| `item.import.mode` | open | `create`, `replace` | Request only: a daemon refuses a mode it does not know with `invalid-params` |
+| `item.export.mode` | open | `create`, `replace` | Request only: as for `item.import.mode` |
+| `hello.capabilities` | open | `item-import-export` | Ignore it |
 
 ## Versioning
 
@@ -130,7 +173,8 @@ closed: the state axes are open on the wire (ADR-0020).
 ## Connections
 
 1. Connect and send `hello`. Any other request first gets `hello-required` and has no
-   effect. A second `hello` on the same connection gets `invalid-request`.
+   effect, whatever its parameters and whether or not the method exists: a request is
+   admitted by its method name before its parameters are checked. A second `hello` on the same connection gets `invalid-request`.
 2. Send requests and read responses. **Match each response to its request by `id`**:
    responses may arrive in a different order from the requests.
 3. The daemon sends no response to a notification (a message without `id`) from a client,
@@ -323,12 +367,22 @@ if __name__ == "__main__":
 | [`hello`](#hello) | Handshake: negotiate the protocol version and learn the limits |
 | [`daemon.status`](#daemonstatus) | Daemon version and readiness |
 | [`account.list`](#accountlist) | Accounts and their sign-in state |
+| [`account.login.start`](#accountloginstart) | Begin signing an account in |
+| [`account.login.finish`](#accountloginfinish) | Complete the sign-in; returns the account, creates no mount |
+| [`account.logout`](#accountlogout) | Sign an account out; local files stay |
 | [`mount.list`](#mountlist) | Mounts and their state |
+| [`mount.add.preview`](#mountaddpreview) | Show what adding a mount would mount; changes nothing |
+| [`mount.add.confirm`](#mountaddconfirm) | Add the mount a preview showed |
+| [`mount.remove`](#mountremove) | Stop syncing a mount; never deletes remote content |
+| [`mount.pause`](#mountpause) | Pause syncing, for every mount or one, for a time or until resumed |
+| [`mount.resume`](#mountresume) | Resume syncing |
 | [`item.status`](#itemstatus) | State of a batch of paths, or of a directory and every child |
 | [`item.pin`](#item-actions) | Always keep on this device |
 | [`item.unpin`](#item-actions) | Clear the pin, back to `inherit` |
 | [`item.hydrate`](#item-actions) | Download now without pinning |
 | [`item.dehydrate`](#item-actions) | Free up space |
+| [`item.import`](#itemimport) | Copy a local file into a mount (capability `item-import-export`) |
+| [`item.export`](#itemexport) | Copy a file out of a mount (capability `item-import-export`) |
 | [`status.subscribe`](#statussubscribe) | Turn this connection into a change stream |
 
 | Notification | Sent when |
@@ -339,8 +393,14 @@ if __name__ == "__main__":
 
 Parameters: `client_name` (string, for logs) and `protocol_versions` (the major versions the
 client supports). Result: `protocol_version` (the chosen major), `capabilities` (strings
-naming optional features; version 1 defines none, and clients ignore names they do not know)
-and `limits`:
+naming optional features; clients ignore names they do not know) and `limits`. Version 1
+defines one capability:
+
+- `item-import-export`: the daemon offers [`item.import`](#itemimport) and
+  [`item.export`](#itemexport). It may be withdrawn in a later release; without it both
+  methods get `method-not-found`, as if they did not exist.
+
+The limits:
 
 - `max_line_bytes`: the longest line in either direction, 1,048,576 in version 1;
 - `max_action_paths`: the most paths in one item action request, 100 in version 1;
@@ -362,7 +422,7 @@ line. New limits may be added as fields.
 
 <!-- example: response hello -->
 ```json
-{"jsonrpc": "2.0", "id": 1, "result": {"protocol_version": 1, "capabilities": [], "limits": {"max_line_bytes": 1048576, "max_action_paths": 100, "max_action_path_bytes": 524288, "max_status_paths": 10000, "max_status_path_bytes": 524288}}}
+{"jsonrpc": "2.0", "id": 1, "result": {"protocol_version": 1, "capabilities": ["item-import-export"], "limits": {"max_line_bytes": 1048576, "max_action_paths": 100, "max_action_path_bytes": 524288, "max_status_paths": 10000, "max_status_path_bytes": 524288}}}
 ```
 
 No version in common:
@@ -396,9 +456,12 @@ and `daemon.status` get `not-ready`.
 ### account.list
 
 Parameters: optional `cursor`. Result: `accounts`, in byte order of `account_id`, each with
-`account_id`, `kind` (`personal` or `work`, open), `tenant_id` (work accounts only) and
-`state` (`signed-in` or `needs-sign-in`, open); and `next_cursor` while more remain
-([pagination](#pagination)).
+`account_id`, `kind` (`personal` or `work`, open), `tenant_id` (work accounts only),
+`state` (`signed-in` or `needs-sign-in`, open), and, when known, `user_name` (the name the
+account signs in with, often an email address) and `display_name` (the person's name), both
+as Graph reports them, for display only and at most 1 KiB; and `next_cursor` while more
+remain ([pagination](#pagination)). `account_id` and `tenant_id` have no length limit in the
+protocol.
 
 <!-- example: request -->
 ```json
@@ -408,17 +471,273 @@ Parameters: optional `cursor`. Result: `accounts`, in byte order of `account_id`
 <!-- example: response account.list -->
 ```json
 {"jsonrpc": "2.0", "id": 3, "result": {"accounts": [
-  {"account_id": "acct-personal-1", "kind": "personal", "state": "signed-in"},
+  {"account_id": "acct-personal-1", "kind": "personal", "state": "signed-in", "user_name": "sam@example.com", "display_name": "Sam Example"},
   {"account_id": "acct-work-1", "kind": "work", "tenant_id": "00000000-0000-0000-0000-000000000001", "state": "needs-sign-in"}
 ]}}
 ```
+
+### Sign-in and credentials
+
+Signing in is two calls, because the user signs in in a browser between them
+([F01](../flows/F01-sign-in.md)). The daemon owns everything secret: the PKCE verifier, the
+`state` value, the loopback listener, the authorisation code and the tokens. **The only
+sign-in datum a client receives is the authorisation URL** (ADR-0010 R6). It carries the PKCE
+`code_challenge` with method `S256` and the `state`, never the verifier: the challenge is a
+SHA-256 digest of the verifier and the verifier cannot be recovered from it. The protocol
+types enforce what they can without knowing the authority. The URL must:
+
+- use `https://`, or `http://` only to a loopback host, and have no user information;
+- carry `code_challenge` (43 base64url characters) and `code_challenge_method=S256`, and no
+  parameter named `code`, `code_verifier`, `client_secret`, `client_assertion`, `assertion`,
+  `access_token`, `refresh_token`, `id_token`, `token` or `password`, in any case;
+- name each parameter once, in plain (not percent-encoded) characters;
+- contain no `;` anywhere, since parameters are told apart by `&` only and a `;` separator
+  could carry one past these checks;
+- be printable ASCII with no fragment, at most 4,096 bytes.
+
+These checks look at parameter **names**. No value is inspected except those of
+`code_challenge` and `code_challenge_method`, so a secret in the value of another parameter is
+not caught by the types; the daemon builds the URL from the challenge and `state` only.
+
+The attempt ID is at most 40 characters from `a-z`, `0-9` and `-`, and a confirmation token
+at most 40 from `a-z`, `0-9` and `.`: both too short to hold a verifier (at least 43
+characters), a code or a token.
+
+Two request values are treated as credentials and **never appear in any result, notification
+or error**: the redirect address pasted into `account.login.finish` (it holds the
+authorisation code) and a sharing link given to `mount.add.preview` or `mount.add.confirm`
+(whoever holds it may be able to open what it points to). For `account.login.finish`,
+`mount.add.preview` and `mount.add.confirm`, an `invalid-params` message says what shape was
+expected and repeats no value from the request. Sign-in errors are `sign-in-failed` with a
+reason code and a fixed message for each reason, built from nothing the client sent; the
+identity platform's own error text from a redirect is not passed on.
+
+**What the types check, and what they do not.** Only three values a client receives are
+checked by the protocol types so that they cannot hold a secret: `attempt_id` and
+`confirmation_token` (too short, in too small an alphabet) and `authorization_url` (the rules
+above). Everything else a result, notification or error carries is text within its own rule:
+identifiers (`account_id`, `tenant_id`, `drive_id`, `mount_id`), paths (`mount_point`, item
+paths, an export `destination`), values of open sets, the names `user_name`, `display_name`,
+`drive_name` and `site_name`, `blocked_message`, an item's `message`, and every error
+`message`. Names and messages are capped at 1 KiB and paths at 4,096 bytes, but none is
+filtered. The types cannot tell any of these from a secret. The daemon fills them only from
+Graph metadata and its own state, never from a token, code, verifier, pasted address or
+sharing link, and an error `message` never quotes one; that is the daemon's rule to keep and
+to test, not something these types enforce.
+
+### account.login.start
+
+Parameters: `mode`, `browser` or `headless` (open, request only; required). Result:
+`attempt_id` and `authorization_url`.
+
+- `browser`: the daemon listens on a loopback port for the redirect. The client opens
+  `authorization_url` in the user's browser (the CLI uses `xdg-open`, ADR-0010 R3) and then
+  calls `account.login.finish` without `redirect_url`.
+- `headless`: the URL uses the headless redirect URI. The client shows it, the user opens it
+  on any device and signs in, and the client passes the address the browser ended on to
+  `account.login.finish` as `redirect_url`.
+
+An attempt lasts 10 minutes and is then discarded (F01 step 3).
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 30, "method": "account.login.start", "params": {"mode": "browser"}}
+```
+
+<!-- example: response account.login.start -->
+```json
+{"jsonrpc": "2.0", "id": 30, "result": {"attempt_id": "attempt-7f3a", "authorization_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=00000000-0000-0000-0000-000000000000&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A53211&scope=Files.ReadWrite.All%20offline_access%20User.Read&state=ZXhhbXBsZS1zdGF0ZQ&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"}}
+```
+
+A mode this daemon does not know is refused, never replaced by a default:
+
+<!-- example: request rejected -->
+```json
+{"jsonrpc": "2.0", "id": 31, "method": "account.login.start", "params": {"mode": "device-code"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 31, "error": {"code": -32602, "message": "invalid params for account.login.start: unknown mode \"device-code\"; this daemon accepts browser, headless"}}
+```
+
+No loopback port could be opened:
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 32, "method": "account.login.start", "params": {"mode": "browser"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 32, "error": {"code": 1011, "message": "sign-in could not start: no loopback port could be opened for the browser redirect; sign in with headless mode instead", "data": {"reason": "loopback-unavailable"}}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | `mode` missing or unknown | Fix the request |
+| `sign-in-failed` | `loopback-unavailable`, or `no-secret-service` (the message names `mydrive doctor`) | Offer headless mode, or `mydrive doctor` |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
+
+### account.login.finish
+
+Parameters: `attempt_id`, and for a headless attempt `redirect_url`, the whole address the
+browser ended on, exactly as pasted (at most 8,192 bytes, no whitespace or control
+characters; the client may trim surrounding whitespace before sending, the daemon never
+does). For a browser attempt `redirect_url` is absent and the response arrives when the
+browser has been redirected and the sign-in is complete, or when the attempt ends: a client
+sends other requests on the same connection meanwhile and matches responses by `id`.
+Giving `redirect_url` for a browser attempt, or leaving it out for a headless one, is
+`invalid-params`.
+
+Result: `account`, the signed-in account in the shape of an [`account.list`](#accountlist)
+entry, with `user_name` so the client can show who signed in; and `proposed_mount`, absent
+when the account's own drive is already mounted: `drive_id`, `drive_type` (open) and
+`mount_point`, the default (`~/OneDrive`, or `~/OneDrive - <Org>` for a work account).
+**Sign-in never creates a mount** (overview "Rulings on details"): the client shows the
+account, asks, and only then calls [`mount.add.preview`](#mountaddpreview) with target
+`own-drive`. Signing in again as an account that is already signed in replaces its tokens
+and returns the same `account_id`.
+
+A failure is `sign-in-failed` with a reason that says whether the attempt is still pending:
+
+| Reason | Attempt | Meaning |
+|---|---|---|
+| `not-a-redirect` | pending | The pasted address is malformed or not a redirect to the attempt's URI: paste again |
+| `authorization-error` | pending | The identity platform reported an error in the redirect (for example consent refused): paste again or start again |
+| `state-mismatch` | cancelled | The redirect does not belong to this attempt (ADR-0010 R10) |
+| `attempt-not-found` | gone | No pending attempt has this ID |
+| `attempt-expired` | gone | The 10 minutes ran out |
+| `code-rejected` | gone | The identity platform refused the code, for example because it expired |
+| `no-secret-service` | gone | Nothing could be stored; nothing was persisted (ADR-0010 R7) |
+
+A tenant that refuses the app, or a policy that requires a compliant device, is
+`blocked-by-policy` with reason `tenant-refused` or `organisation-policy`; the attempt is gone.
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 33, "method": "account.login.finish", "params": {"attempt_id": "attempt-7f3b", "redirect_url": "https://login.microsoftonline.com/common/oauth2/nativeclient?code=M.C5_EXAMPLE.not-a-real-code&state=ZXhhbXBsZS1zdGF0ZQ"}}
+```
+
+<!-- example: response account.login.finish -->
+```json
+{"jsonrpc": "2.0", "id": 33, "result": {
+  "account": {"account_id": "acct-personal-1", "kind": "personal", "state": "signed-in", "user_name": "sam@example.com", "display_name": "Sam Example"},
+  "proposed_mount": {"drive_id": "0123456789abcdef", "drive_type": "personal", "mount_point": "/home/user/OneDrive"}
+}}
+```
+
+A pasted address whose `state` does not match:
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 34, "method": "account.login.finish", "params": {"attempt_id": "attempt-7f3b", "redirect_url": "https://login.microsoftonline.com/common/oauth2/nativeclient?code=M.C5_EXAMPLE.not-a-real-code&state=b3RoZXItc3RhdGU"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 34, "error": {"code": 1011, "message": "sign-in failed: the response does not belong to this attempt, so the attempt was cancelled; start a new sign-in", "data": {"reason": "state-mismatch"}}}
+```
+
+A pasted address with a line break in it is refused without repeating it:
+
+<!-- example: request rejected -->
+```json
+{"jsonrpc": "2.0", "id": 35, "method": "account.login.finish", "params": {"attempt_id": "attempt-7f3b", "redirect_url": "https://login.microsoftonline.com/common/oauth2/nativeclient?code=M.C5_EXAMPLE.not-a-real-code\n&state=ZXhhbXBsZS1zdGF0ZQ"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 35, "error": {"code": -32602, "message": "invalid params for account.login.finish: expected an object with attempt_id (an attempt ID) and, for a headless attempt, redirect_url (the pasted address); the values given are not repeated here because they may hold a credential or a sharing link"}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters, or `redirect_url` given or missing against the attempt's mode | Fix the request; the message repeats no value |
+| `sign-in-failed` | See the reasons above | Paste again when the attempt is pending; otherwise start a new sign-in |
+| `blocked-by-policy` | The organisation refuses the app or requires a compliant device | Show the message; an administrator must act |
+| `offline` | The identity platform or Graph cannot be reached | Retry; a pending attempt stays pending |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
+
+### account.logout
+
+Parameters: `account_id`, and optionally `dry_run` (`true` to report what signing out would
+find and change nothing; absent or `false` to sign out). There is no parameter that deletes
+anything: signing out removes the account's tokens from the Secret Service and never deletes
+local or remote content. The account's mounts stay configured; their local changes are kept
+and upload after the account signs in again (F01 "Sign-out" step 3).
+
+Signing out, unlike [`mount.remove`](#mountremove), is not refused over unsynced changes and
+has no `keep_unsynced`: nothing is lost by it. F12 step 11's confirmation exists because
+removal discards a mount's record of pending changes, so they could never upload; sign-out
+keeps the mounts, their pending changes and the content, and only stops them uploading until
+the account signs in again (F01 "Sign-out" steps 3 and 4, F12 step 14).
+
+Result: `account_id`, `signed_out` (`false` for a dry run) and `unsynced_files`, the files in
+the account's mounts with changes not yet on the server. A client calls with `dry_run` first
+and warns when `unsynced_files` is not zero.
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 36, "method": "account.logout", "params": {"account_id": "acct-work-1", "dry_run": true}}
+```
+
+<!-- example: response account.logout -->
+```json
+{"jsonrpc": "2.0", "id": 36, "result": {"account_id": "acct-work-1", "signed_out": false, "unsynced_files": 3}}
+```
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 37, "method": "account.logout", "params": {"account_id": "acct-work-1"}}
+```
+
+<!-- example: response account.logout -->
+```json
+{"jsonrpc": "2.0", "id": 37, "result": {"account_id": "acct-work-1", "signed_out": true, "unsynced_files": 3}}
+```
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 38, "method": "account.logout", "params": {"account_id": "acct-gone"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 38, "error": {"code": 1012, "message": "no account has the given account_id; list accounts with account.list"}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters | Fix the request |
+| `unknown-account` | No account has this ID | List accounts again |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
 
 ### mount.list
 
 Parameters: optional `cursor`. Result: `mounts`, in byte order of `mount_id`, each with
 `mount_id`, `account_id`, `drive_id` (lowercase), `mount_point`, `state` (open), `read_only`,
 and, only when `blocked`, `blocked_reason` (a code, open) and `blocked_message` (text for
-people, at most 1 KiB); and `next_cursor` while more remain ([pagination](#pagination)).
+people, at most 1 KiB); when known, `drive_type` (`personal`, `business` or
+`document-library`, open) and `item_count` (the items of the drive the daemon knows; while
+the mount is `resyncing` for its first enumeration, the items listed so far); `paused`,
+always present; `paused_until`, only while `paused` is true and the pause has an end; and
+`next_cursor` while more remain ([pagination](#pagination)).
+
+**Pause is separate from `state`.** `paused` is `true` whenever the mount is paused, whatever
+`state` shows. `state` shows `blocked` over `paused`, so a blocked mount that is also paused
+has `state` `blocked` and `paused` `true`; a client reads blocked from `state` and paused from
+`paused`, and tells all four combinations apart. `paused_until` is when the pause ends, in
+seconds since the Unix epoch (UTC), as in the [`mount.pause`](#mountpause) result; with
+`paused` true and no `paused_until`, the mount is paused until `mount.resume`. A mount with
+`paused_until` and `paused` `false` is malformed: the protocol types can neither build nor
+send one, and refuse one they receive.
 
 <!-- example: request -->
 ```json
@@ -428,7 +747,7 @@ people, at most 1 KiB); and `next_cursor` while more remain ([pagination](#pagin
 <!-- example: response mount.list -->
 ```json
 {"jsonrpc": "2.0", "id": 4, "result": {"mounts": [
-  {"mount_id": "example-site-documents", "account_id": "acct-work-1", "drive_id": "b!exampledriveid", "mount_point": "/home/user/Example/Site - Documents", "state": "blocked", "blocked_reason": "organisation-policy", "blocked_message": "The organisation does not allow access from unmanaged devices", "read_only": true}
+  {"mount_id": "example-site-documents", "account_id": "acct-work-1", "drive_id": "b!exampledriveid", "mount_point": "/home/user/Example/Site - Documents", "state": "blocked", "blocked_reason": "organisation-policy", "blocked_message": "The organisation does not allow access from unmanaged devices", "read_only": true, "paused": true}
 ], "next_cursor": "m1.6578616d706c652d736974652d646f63756d656e7473"}}
 ```
 
@@ -440,9 +759,316 @@ people, at most 1 KiB); and `next_cursor` while more remain ([pagination](#pagin
 <!-- example: response mount.list -->
 ```json
 {"jsonrpc": "2.0", "id": 5, "result": {"mounts": [
-  {"mount_id": "personal", "account_id": "acct-personal-1", "drive_id": "0123456789abcdef", "mount_point": "/home/user/OneDrive", "state": "active", "read_only": false}
+  {"mount_id": "example-team-files", "account_id": "acct-work-1", "drive_id": "b!teamdriveid", "mount_point": "/home/user/Example/Team - Files", "state": "paused", "read_only": false, "drive_type": "document-library", "item_count": 1900, "paused": true, "paused_until": 1794790800},
+  {"mount_id": "personal", "account_id": "acct-personal-1", "drive_id": "0123456789abcdef", "mount_point": "/home/user/OneDrive", "state": "active", "read_only": false, "drive_type": "personal", "item_count": 14000, "paused": false}
 ]}}
 ```
+
+### mount.add.preview
+
+Parameters, the **target**: `account_id`, the account whose access is used, and `target`
+(open, request only), one of:
+
+- `own-drive`: the account's own drive, with no other target field;
+- `drive-id`: a drive named by `drive_id`;
+- `sharing-link`: the drive a sharing link points into, named by `sharing_link` (an
+  `https://` address of at most 4,096 bytes with no whitespace or control characters). The
+  link is never repeated in any response.
+
+Any other combination (a target field that does not belong to `target`, or a missing one) is
+`invalid-params`. The preview never changes the user's access: a sharing link is resolved
+for this request only (ADR-0015 R2). In M1 a mount is always a drive's root, so a link to a
+folder inside a library previews the whole library.
+
+Result: `confirmation_token`; `account_id`; `drive_id`; `drive_type` (open); `drive_name`,
+the drive's name as Graph reports it (for a library, the library's name); `site_name`, for a
+library; `item_count`, when known; `read_only`; and `mount_point`, the proposed mount point.
+Nothing is created. Names are for display and at most 1 KiB.
+
+The token is opaque, at most 40 characters, and valid for 10 minutes, for
+`mount.add.confirm` with **the same target parameters** until one confirmation adds the
+mount. It does not encode the target
+readably. The daemon keeps a bounded number of previews waiting; an old preview may be
+forgotten, and its token is then refused like an expired one.
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 39, "method": "mount.add.preview", "params": {"account_id": "acct-work-1", "target": "sharing-link", "sharing_link": "https://example.sharepoint.com/:f:/s/Finance/EjK3pQ2-example-only"}}
+```
+
+<!-- example: response mount.add.preview -->
+```json
+{"jsonrpc": "2.0", "id": 39, "result": {"confirmation_token": "c1.0000000000000007.5e1d09a2c4b7f813", "account_id": "acct-work-1", "drive_id": "b!financedriveid", "drive_type": "document-library", "drive_name": "Documents", "site_name": "Finance", "item_count": 8400, "read_only": false, "mount_point": "/home/user/Example/Finance - Documents"}}
+```
+
+A link to a folder in another person's OneDrive:
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 40, "method": "mount.add.preview", "params": {"account_id": "acct-work-1", "target": "sharing-link", "sharing_link": "https://example-my.sharepoint.com/:f:/p/someone/EaB-example-only"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 40, "error": {"code": 1004, "message": "this link points to a shared folder in another person's OneDrive, which cannot be mounted yet", "data": {"reason": "unsupported-target"}}}
+```
+
+A target this daemon does not know is refused, and the message repeats no value:
+
+<!-- example: request rejected -->
+```json
+{"jsonrpc": "2.0", "id": 41, "method": "mount.add.preview", "params": {"account_id": "acct-work-1", "target": "teams-channel", "team_id": "t1"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 41, "error": {"code": -32602, "message": "invalid params for mount.add.preview: expected an object with account_id, and target own-drive alone, drive-id with drive_id, or sharing-link with sharing_link (an https:// address); the values given are not repeated here because they may hold a credential or a sharing link"}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters, an unknown `target`, or target fields that do not fit it | Fix the request; the message repeats no value |
+| `unknown-account` | No account has this ID | List accounts again |
+| `needs-sign-in` | The account must sign in again | Offer `account.login.start` |
+| `blocked-by-policy` | Organisation policy refuses access to the drive, or the tenant refuses the app | Show the message; nothing was mounted |
+| `refused` | `no-access` (the account cannot open this link or drive), `unsupported-target` (for example a shared folder in another person's OneDrive), `already-mounted` (`data.mount_id` names the mount) | Show the message; nothing changed |
+| `offline` | Graph cannot be reached | Retry |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
+
+### mount.add.confirm
+
+Parameters: the preview's target parameters, unchanged (`account_id`, `target`, and
+`drive_id` or `sharing_link`); `confirmation_token`; and optionally `mount_point`, an
+absolute, canonical path to use instead of the proposed one. Only now is a sharing link
+redeemed durably (ADR-0015 R2) and the mount created.
+
+Result: `mount`, the new mount in the shape of a [`mount.list`](#mountlist) entry. Its state is
+`resyncing` until its first full delta has been applied (overview "First enumeration").
+
+A token is **used up only when the mount has been added**. A confirmation that fails with
+`offline`, `needs-sign-in`, or a `refused` the user can correct (`mount-point-not-empty`,
+`mount-point-overlaps`) leaves the token valid until it expires, so the client can retry with
+the same token, or with another `mount_point`. While one confirmation of a token is in
+progress, another confirmation of the same token is refused, so one preview never adds two
+mounts. A token that is unknown, used up, being confirmed by another request, expired,
+forgotten, or offered with other target parameters is `invalid-params` with `data.reason`
+`restart-preview`: call `mount.add.preview` again. Offering a token with the wrong target
+does not use it up. The mount point must not exist, or be an empty directory, and must not be
+inside or contain another mount or the daemon's data directory.
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 42, "method": "mount.add.confirm", "params": {"account_id": "acct-work-1", "target": "sharing-link", "sharing_link": "https://example.sharepoint.com/:f:/s/Finance/EjK3pQ2-example-only", "confirmation_token": "c1.0000000000000007.5e1d09a2c4b7f813"}}
+```
+
+<!-- example: response mount.add.confirm -->
+```json
+{"jsonrpc": "2.0", "id": 42, "result": {"mount": {"mount_id": "example-finance-documents", "account_id": "acct-work-1", "drive_id": "b!financedriveid", "mount_point": "/home/user/Example/Finance - Documents", "state": "resyncing", "read_only": false, "drive_type": "document-library", "item_count": 0, "paused": false}}}
+```
+
+The same token again:
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 43, "method": "mount.add.confirm", "params": {"account_id": "acct-work-1", "target": "sharing-link", "sharing_link": "https://example.sharepoint.com/:f:/s/Finance/EjK3pQ2-example-only", "confirmation_token": "c1.0000000000000007.5e1d09a2c4b7f813"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 43, "error": {"code": -32602, "message": "invalid params for mount.add.confirm: the confirmation token is unknown, already used, expired, or was issued for other parameters; call mount.add.preview again", "data": {"reason": "restart-preview"}}}
+```
+
+The mount point is a directory that is not empty:
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 44, "method": "mount.add.confirm", "params": {"account_id": "acct-personal-1", "target": "own-drive", "confirmation_token": "c1.0000000000000008.0b44c1d7a9e2f356"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 44, "error": {"code": 1004, "message": "/home/user/OneDrive is not empty; choose another mount point", "data": {"reason": "mount-point-not-empty"}}}
+```
+
+The drive is already mounted:
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 45, "error": {"code": 1004, "message": "this drive is already mounted at /home/user/OneDrive", "data": {"reason": "already-mounted", "mount_id": "personal"}}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters; with `data.reason` `restart-preview`, a token that cannot be used | Fix the request, or preview again |
+| `unknown-account` | No account has this ID | List accounts again |
+| `needs-sign-in` | The account must sign in again; the token stays valid | Offer `account.login.start`, then retry with the same token while it is valid |
+| `blocked-by-policy` | Organisation policy refuses access | Show the message; nothing was mounted |
+| `refused` | `mount-point-not-empty`, `mount-point-overlaps` (the token stays valid), `already-mounted` (with `data.mount_id`), `no-access` | Show the message; nothing was mounted. For a mount point, retry with another `mount_point` and the same token |
+| `offline` | Graph cannot be reached; the token stays valid | Retry with the same token while it is valid |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
+
+### mount.remove
+
+Parameters: `mount_id`; optionally `dry_run` (`true` to report and change nothing); and
+optionally `keep_unsynced` (`true` when the user has confirmed that files with changes not yet
+on the server will stay only on this computer). There is no parameter that deletes remote
+content: **removing a mount never deletes anything on the server** (ADR-0015 R8, J15). Each
+fully local file is kept in the mount point, which becomes a plain directory (ADR-0021);
+placeholders are not kept.
+
+**A mount with unsynced changes is not removed without confirmation** (F12 step 11). If any
+file of the mount has changes not yet on the server and `keep_unsynced` is absent, `null` or
+`false`, the request is `refused` with reason `unsynced-changes` and nothing changes.
+`data.unsynced_files` is how many such files there are and `data.paths` names some of them:
+at most 20, taking at most 65,536 bytes together, in their JSON encoding. The client shows
+them, says that those changes will never reach the server, and asks; only on the user's yes
+does it repeat the request with `keep_unsynced: true`. Removal then treats those files like
+every other local file and never uploads them. A `dry_run` never refuses: it reports.
+
+Result: `mount_id`; `removed` (`false` for a dry run); `mount_point`, where the local copies
+are kept; `kept_files`, the fully local files kept there; and `unsynced_files`, the files whose
+changes are not yet on the server (for a dry run, how many a removal without `keep_unsynced`
+would refuse over; after a removal, how many stay only on this computer).
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 46, "method": "mount.remove", "params": {"mount_id": "example-site-documents", "dry_run": true}}
+```
+
+<!-- example: response mount.remove -->
+```json
+{"jsonrpc": "2.0", "id": 46, "result": {"mount_id": "example-site-documents", "removed": false, "mount_point": "/home/user/Example/Site - Documents", "kept_files": 140, "unsynced_files": 2}}
+```
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 47, "method": "mount.remove", "params": {"mount_id": "example-site-documents"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 47, "error": {"code": 1004, "message": "mount example-site-documents was not removed: 2 file(s) have changes not yet on the server; remove it with keep_unsynced to keep those files only on this computer", "data": {"reason": "unsynced-changes", "unsynced_files": 2, "paths": ["/home/user/Example/Site - Documents/Q4 Plan/roadmap.docx", "/home/user/Example/Site - Documents/notes.md"]}}}
+```
+
+After the user confirms:
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 60, "method": "mount.remove", "params": {"mount_id": "example-site-documents", "keep_unsynced": true}}
+```
+
+<!-- example: response mount.remove -->
+```json
+{"jsonrpc": "2.0", "id": 60, "result": {"mount_id": "example-site-documents", "removed": true, "mount_point": "/home/user/Example/Site - Documents", "kept_files": 140, "unsynced_files": 2}}
+```
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 48, "method": "mount.remove", "params": {"mount_id": "no-such-mount"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 48, "error": {"code": 1013, "message": "no mount has the ID no-such-mount"}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters | Fix the request |
+| `unknown-mount` | No mount has this ID | List mounts again |
+| `refused` | `unsynced-changes`, with `data.unsynced_files` and `data.paths`, when `keep_unsynced` is not `true` | Show the files and ask; repeat with `keep_unsynced: true` only on the user's yes |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
+
+### mount.pause
+
+Parameters, both optional: `mount_id`, the mount to pause (absent for every mount), and
+`duration_secs`, how long, from 1 to 604,800 seconds (7 days); absent to pause until
+`mount.resume`. **A `duration_secs` of 0 or over 604,800 is refused with `invalid-params`,
+and nothing is paused**; it is never read as a pause with no end. While paused, a mount sends
+no uploads or deletes and runs no delta; reading and hydrating still work, and local changes
+are kept for later (J15).
+
+An already paused mount:
+
+- **A request naming the mount replaces its pause**, whether the new one ends sooner or
+  later, or has no end.
+- **A request for every mount never shortens or ends an existing pause.** A mount paused
+  until `mount.resume` stays so; a mount whose pause ends later than the requested end keeps
+  its end; otherwise the mount takes the requested pause.
+
+Result: `paused_mounts`, how many mounts are paused when the call returns (1 for a request
+naming a mount, every mount for a request for all of them), and `paused_until`, when the pause
+this request asked for ends, in seconds since the Unix epoch (UTC), absent when it asked for
+a pause with no end. [`mount.list`](#mountlist) shows each paused mount's own `paused_until`,
+which may be later, or absent, for a mount that kept a longer pause.
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 49, "method": "mount.pause", "params": {"duration_secs": 7200}}
+```
+
+<!-- example: response mount.pause -->
+```json
+{"jsonrpc": "2.0", "id": 49, "result": {"paused_mounts": 4, "paused_until": 1794790800}}
+```
+
+<!-- example: request rejected -->
+```json
+{"jsonrpc": "2.0", "id": 50, "method": "mount.pause", "params": {"duration_secs": 0}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 50, "error": {"code": -32602, "message": "invalid params for mount.pause: duration_secs is 0; give 1 to 604800 seconds, or leave it out to pause until resumed"}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters, or `duration_secs` out of range | Fix the request |
+| `unknown-mount` | No mount has this ID | List mounts again |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
+
+### mount.resume
+
+Parameters: optional `mount_id`, the mount to resume (absent for every mount). Result:
+`resumed_mounts`, how many paused mounts this request resumed. Resuming a mount that is not
+paused does nothing and is not an error.
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 51, "method": "mount.resume", "params": {}}
+```
+
+<!-- example: response mount.resume -->
+```json
+{"jsonrpc": "2.0", "id": 51, "result": {"resumed_mounts": 4}}
+```
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 52, "method": "mount.resume", "params": {"mount_id": "no-such-mount"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 52, "error": {"code": 1013, "message": "no mount has the ID no-such-mount"}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters | Fix the request |
+| `unknown-mount` | No mount has this ID | List mounts again |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
 
 ### item.status
 
@@ -648,6 +1274,146 @@ sample shows two of the 6,999 skipped files.
 ]}}
 ```
 
+### item.import
+
+Offered only while `hello` advertises `item-import-export`; otherwise `method-not-found`,
+whatever the parameters, exactly as for a method that does not exist.
+
+Parameters: `source`, a [local path](#conventions) to a regular file; `destination`, the
+file's path in a mount, whose parent folder must exist; and `mode` (open, request only;
+required, with no default):
+
+- `create`: the destination must not exist (`refused`, `already-exists`, if it does);
+- `replace`: the destination must be an existing file (`unknown-path` if there is none,
+  `refused` `not-a-file` for a folder). **A file with changes not yet on the server is never
+  replaced**: that is `refused` with reason `not-in-sync` and `data.sync`, and nothing
+  changes.
+
+The content is copied into the mount and the change is recorded durably before the response
+is sent; the upload follows in the background and is reported by `status.changed` (F04
+step 18). Result: `path` (the destination), `item` (its state, normally sync
+`pending-upload`) and `bytes_copied`.
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 53, "method": "item.import", "params": {"source": "/home/user/Downloads/report.pdf", "destination": "/home/user/OneDrive/Documents/report.pdf", "mode": "create"}}
+```
+
+<!-- example: response item.import -->
+```json
+{"jsonrpc": "2.0", "id": 53, "result": {"path": "/home/user/OneDrive/Documents/report.pdf", "item": {"status": "syncing", "modifiers": [], "hydration": "full", "pin": "inherit", "effective_pin": "unpinned", "sync": "pending-upload"}, "bytes_copied": 482113}}
+```
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 54, "method": "item.import", "params": {"source": "/home/user/Downloads/missing.pdf", "destination": "/home/user/OneDrive/Documents/missing.pdf", "mode": "create"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 54, "error": {"code": 1014, "message": "cannot read /home/user/Downloads/missing.pdf: no such file", "data": {"reason": "not-found"}}}
+```
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 55, "method": "item.import", "params": {"source": "/home/user/Downloads/notes.md", "destination": "/home/user/OneDrive/Documents/notes.md", "mode": "replace"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 55, "error": {"code": 1004, "message": "/home/user/OneDrive/Documents/notes.md has changes not yet uploaded and was not replaced", "data": {"reason": "not-in-sync", "sync": "pending-upload"}}}
+```
+
+A source that is not an absolute, canonical path:
+
+<!-- example: request rejected -->
+```json
+{"jsonrpc": "2.0", "id": 56, "method": "item.import", "params": {"source": "~/Downloads/report.pdf", "destination": "/home/user/OneDrive/Documents/report.pdf", "mode": "create"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 56, "error": {"code": -32602, "message": "invalid params for item.import: path \"~/Downloads/report.pdf\" is not a valid protocol path: it is not absolute"}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters, a path that is not absolute and canonical, or an unknown `mode` | Fix the request |
+| `method-not-found` | `hello` did not advertise `item-import-export` | Do not offer import |
+| `not-in-a-mount` | `destination` is outside every mount | Fix the destination |
+| `unknown-path` | The destination's folder, or the file to replace, does not exist | Fix the destination |
+| `local-file-error` | The source cannot be used: `not-found`, `not-a-file`, `permission-denied`, `inside-mount`, `io-error` | Show the message |
+| `refused` | `already-exists`, `not-a-file`, `not-in-sync` (never replaced), `name-not-allowed`, `insufficient-space` | Show the message; nothing changed |
+| `read-only` | The mount or folder is read-only | Show the message |
+| `blocked-by-policy` | Organisation policy refuses access | Show the message |
+| `needs-sign-in` | Replacing needs the server and the account must sign in again | Offer `account.login.start` |
+| `offline` | Replacing needs the server and the daemon is offline | Retry later |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
+
+### item.export
+
+Offered only while `hello` advertises `item-import-export`; otherwise `method-not-found`,
+whatever the parameters, exactly as for a method that does not exist.
+
+Parameters: `source`, a file in a mount; `destination`, a [local path](#conventions) whose
+directory exists; and `mode` (open, request only; required, with no default): `create` when
+nothing may exist at the destination (`local-file-error`, `already-exists`, if something
+does), or `replace` to replace what is there. The daemon hydrates the file first if it is not
+local (F03), then writes a new file beside the destination and renames it into place, so a
+failed export never leaves a partly written file at the destination. Nothing in the mount
+changes, and the item's pin is not touched.
+
+Result: `path` (the source), `destination` and `bytes_copied`.
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 57, "method": "item.export", "params": {"source": "/home/user/OneDrive/Documents/budget.xlsx", "destination": "/home/user/Desktop/budget.xlsx", "mode": "create"}}
+```
+
+<!-- example: response item.export -->
+```json
+{"jsonrpc": "2.0", "id": 57, "result": {"path": "/home/user/OneDrive/Documents/budget.xlsx", "destination": "/home/user/Desktop/budget.xlsx", "bytes_copied": 91337}}
+```
+
+From a daemon that does not advertise `item-import-export`:
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 58, "method": "item.export", "params": {"source": "/home/user/OneDrive/Documents/budget.xlsx", "destination": "/home/user/Desktop/budget.xlsx", "mode": "create"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 58, "error": {"code": -32601, "message": "method \"item.export\" is not offered by this daemon: hello did not advertise the capability item-import-export"}}
+```
+
+<!-- example: request -->
+```json
+{"jsonrpc": "2.0", "id": 59, "method": "item.export", "params": {"source": "/home/user/OneDrive/Documents/budget.xlsx", "destination": "/home/user/Desktop/budget.xlsx", "mode": "create"}}
+```
+
+<!-- example: error -->
+```json
+{"jsonrpc": "2.0", "id": 59, "error": {"code": 1014, "message": "/home/user/Desktop/budget.xlsx already exists; export with mode replace to replace it", "data": {"reason": "already-exists"}}}
+```
+
+| Error | When | What the client does |
+|---|---|---|
+| `invalid-params` | Malformed parameters, a path that is not absolute and canonical, or an unknown `mode` | Fix the request |
+| `method-not-found` | `hello` did not advertise `item-import-export` | Do not offer export |
+| `not-in-a-mount` | `source` is outside every mount | Fix the source |
+| `unknown-path` | No item at `source` | Fix the source |
+| `local-file-error` | The destination cannot be written: `not-found` (its directory), `already-exists`, `not-a-file`, `permission-denied`, `inside-mount`, `no-space`, `io-error` | Show the message |
+| `refused` | `not-a-file` (the source is a folder), `remote-changed`, `insufficient-space` | Show the message |
+| `blocked-by-policy` | Organisation policy refuses access | Show the message |
+| `needs-sign-in` | The file must be downloaded and the account must sign in again | Offer `account.login.start` |
+| `offline` | The file must be downloaded and the daemon is offline | Retry later |
+| `hello-required` | Before `hello` | Fix the client |
+| `not-ready` | The daemon is starting | Retry shortly |
+| `internal` | A daemon fault | Report it |
+
 ### status.subscribe
 
 Parameters: `paths`, the mount points or folders to watch; empty, absent or `null` means
@@ -724,19 +1490,58 @@ also tolerate a `data` of a shape they do not expect.
 |---|---|---|---|---|
 | -32700 | `parse-error` | The line was not UTF-8 or not one JSON document | | top level |
 | -32600 | `invalid-request` | Not a valid JSON-RPC message (including a batch array or an unacceptable `id`); line over 1 MiB; second `hello`; request on a subscribed connection | | top level |
-| -32601 | `method-not-found` | No such method in this version | | top level |
-| -32602 | `invalid-params` | Parameters malformed, including any relative or non-canonical path, a cursor not issued for these parameters, a file given as `directory`, or a request over the `hello` limits | `reason` for a cursor | top level |
+| -32601 | `method-not-found` | No such method in this version, or `item.import` or `item.export` while `hello` did not advertise `item-import-export` | | top level |
+| -32602 | `invalid-params` | Parameters malformed, including any relative or non-canonical path, a cursor not issued for these parameters, a confirmation token that cannot be used, a file given as `directory`, an unknown request value, or a request over the `hello` limits | `reason` for a cursor or a confirmation token | top level |
 | -32603 | `internal` | A daemon fault | | both |
 | 1001 | `not-ready` | The daemon is still starting; retry later | | top level |
 | 1002 | `unknown-path` | Under a mount point, but no such item | | both |
 | 1003 | `not-in-a-mount` | Not under any mount point | | both |
-| 1004 | `refused` | Understood and refused; nothing changed | `reason`, and `sync` for `not-in-sync` | per path |
+| 1004 | `refused` | Understood and refused; nothing changed | `reason`, `sync` for `not-in-sync`, `mount_id` for `already-mounted`, `unsynced_files` and `paths` for `unsynced-changes` | both |
 | 1005 | `needs-sign-in` | The account must sign in again | | both |
 | 1006 | `blocked-by-policy` | Organisation policy refuses access | `reason` | both |
-| 1007 | `read-only` | The item or its mount is read-only | `reason` | per path |
+| 1007 | `read-only` | The item or its mount is read-only | `reason` | both |
 | 1008 | `offline` | The request needs the server and the daemon is offline | | both |
 | 1009 | `unsupported-version` | `hello` offered no supported version | `supported_versions` | top level |
 | 1010 | `hello-required` | A request other than `hello` before `hello` completed; a client bug, retrying does not help | | top level |
+| 1011 | `sign-in-failed` | A sign-in could not start or finish; the message is fixed per reason and never repeats a request value | `reason` | top level |
+| 1012 | `unknown-account` | No account has this `account_id` | | top level |
+| 1013 | `unknown-mount` | No mount has this `mount_id` | | top level |
+| 1014 | `local-file-error` | A local path given to `item.import` or `item.export` could not be used | `reason` | top level |
+
+### Where each error can appear
+
+For each method, the codes it can return at the top level and per path. Any request can also
+get `parse-error` and `invalid-request` (envelope problems, a second `hello`, a request on a
+subscribed connection) and `method-not-found` for a method that does not exist; those are not
+repeated below.
+
+| Method | Top level | Per path |
+|---|---|---|
+| `hello` | `invalid-params`, `unsupported-version`, `internal` | — |
+| `daemon.status` | `invalid-params`, `hello-required`, `internal` | — |
+| `account.list` | `invalid-params`, `hello-required`, `not-ready`, `internal` | — |
+| `account.login.start` | `invalid-params`, `sign-in-failed`, `hello-required`, `not-ready`, `internal` | — |
+| `account.login.finish` | `invalid-params`, `sign-in-failed`, `blocked-by-policy`, `offline`, `hello-required`, `not-ready`, `internal` | — |
+| `account.logout` | `invalid-params`, `unknown-account`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.list` | `invalid-params`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.add.preview` | `invalid-params`, `unknown-account`, `needs-sign-in`, `blocked-by-policy`, `refused`, `offline`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.add.confirm` | `invalid-params`, `unknown-account`, `needs-sign-in`, `blocked-by-policy`, `refused`, `offline`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.remove` | `invalid-params`, `unknown-mount`, `refused`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.pause` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
+| `mount.resume` | `invalid-params`, `unknown-mount`, `hello-required`, `not-ready`, `internal` | — |
+| `item.status` | `invalid-params`, `not-in-a-mount`, `unknown-path`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `internal` |
+| `item.pin` | `invalid-params`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `refused`, `needs-sign-in`, `blocked-by-policy`, `read-only`, `offline`, `internal` |
+| `item.unpin` | `invalid-params`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `refused`, `needs-sign-in`, `blocked-by-policy`, `read-only`, `offline`, `internal` |
+| `item.hydrate` | `invalid-params`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `refused`, `needs-sign-in`, `blocked-by-policy`, `read-only`, `offline`, `internal` |
+| `item.dehydrate` | `invalid-params`, `hello-required`, `not-ready`, `internal` | `not-in-a-mount`, `unknown-path`, `refused`, `needs-sign-in`, `blocked-by-policy`, `read-only`, `offline`, `internal` |
+| `item.import` | `invalid-params`, `method-not-found`, `not-in-a-mount`, `unknown-path`, `local-file-error`, `refused`, `read-only`, `blocked-by-policy`, `needs-sign-in`, `offline`, `hello-required`, `not-ready`, `internal` | — |
+| `item.export` | `invalid-params`, `method-not-found`, `not-in-a-mount`, `unknown-path`, `local-file-error`, `refused`, `blocked-by-policy`, `needs-sign-in`, `offline`, `hello-required`, `not-ready`, `internal` | — |
+| `status.subscribe` | `invalid-params`, `hello-required`, `not-ready`, `internal` | — |
+
+The codes are the outcome a client acts on. A CLI maps them to its exit status: success to
+0; a top-level error to a failure; a result whose per-path entries hold errors to "partly
+done"; and a connection that cannot be made to "daemon not running". With `--json` it prints
+the `result` object on success and the `error` object on failure.
 
 An unknown method:
 

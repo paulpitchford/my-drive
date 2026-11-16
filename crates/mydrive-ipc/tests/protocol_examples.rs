@@ -10,12 +10,17 @@ use mydrive_ipc::envelope::{ErrorResponse, Message, Notification, Request, Succe
 use mydrive_ipc::error::{ErrorCode, RpcError};
 use mydrive_ipc::methods::{
     AccountInfo, AccountListResult, DaemonStatusResult, HelloParams, HelloResult, ItemActionResult,
-    ItemInfo, ItemPathsParams, ItemStatusParams, ItemStatusResult, ListParams, MethodCall,
-    MountInfo, MountListResult, NoParams, StatusChangedParams, StatusSubscribeParams,
-    StatusSubscribeResult, method,
+    ItemExportParams, ItemExportResult, ItemImportParams, ItemImportResult, ItemInfo,
+    ItemPathsParams, ItemStatusParams, ItemStatusResult, ListParams, LoginFinishParams,
+    LoginFinishResult, LoginStartParams, LoginStartResult, LogoutParams, LogoutResult, MethodCall,
+    MountAddConfirmParams, MountAddConfirmResult, MountAddPreviewParams, MountAddPreviewResult,
+    MountInfo, MountListResult, MountPauseParams, MountPauseResult, MountRemoveParams,
+    MountRemoveResult, MountResumeParams, MountResumeResult, NoParams, ProposedMount,
+    StatusChangedParams, StatusSubscribeParams, StatusSubscribeResult, method,
 };
 use mydrive_ipc::values::{
-    BlockedReason, InvalidParamsReason, ReadOnlyReason, RefusalReason, VALUE_SETS,
+    BlockedReason, InvalidParamsReason, LocalFileReason, LoginMode, MountTargetKind,
+    ReadOnlyReason, RefusalReason, SignInFailure, TransferMode, VALUE_SETS,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -182,6 +187,16 @@ fn params_round_trip(method_name: &str, params: Option<&Value>, what: &str) -> O
             round_trip::<ItemPathsParams>(params, what)
         }
         method::STATUS_SUBSCRIBE => round_trip::<StatusSubscribeParams>(params, what),
+        method::ACCOUNT_LOGIN_START => round_trip::<LoginStartParams>(params, what),
+        method::ACCOUNT_LOGIN_FINISH => round_trip::<LoginFinishParams>(params, what),
+        method::ACCOUNT_LOGOUT => round_trip::<LogoutParams>(params, what),
+        method::MOUNT_ADD_PREVIEW => round_trip::<MountAddPreviewParams>(params, what),
+        method::MOUNT_ADD_CONFIRM => round_trip::<MountAddConfirmParams>(params, what),
+        method::MOUNT_REMOVE => round_trip::<MountRemoveParams>(params, what),
+        method::MOUNT_PAUSE => round_trip::<MountPauseParams>(params, what),
+        method::MOUNT_RESUME => round_trip::<MountResumeParams>(params, what),
+        method::ITEM_IMPORT => round_trip::<ItemImportParams>(params, what),
+        method::ITEM_EXPORT => round_trip::<ItemExportParams>(params, what),
         other => panic!("{what}: no params type for {other}"),
     })
 }
@@ -199,6 +214,16 @@ fn result_round_trip(method_name: &str, result: &Value, what: &str) -> Value {
             round_trip::<ItemActionResult>(result, what)
         }
         method::STATUS_SUBSCRIBE => round_trip::<StatusSubscribeResult>(result, what),
+        method::ACCOUNT_LOGIN_START => round_trip::<LoginStartResult>(result, what),
+        method::ACCOUNT_LOGIN_FINISH => round_trip::<LoginFinishResult>(result, what),
+        method::ACCOUNT_LOGOUT => round_trip::<LogoutResult>(result, what),
+        method::MOUNT_ADD_PREVIEW => round_trip::<MountAddPreviewResult>(result, what),
+        method::MOUNT_ADD_CONFIRM => round_trip::<MountAddConfirmResult>(result, what),
+        method::MOUNT_REMOVE => round_trip::<MountRemoveResult>(result, what),
+        method::MOUNT_PAUSE => round_trip::<MountPauseResult>(result, what),
+        method::MOUNT_RESUME => round_trip::<MountResumeResult>(result, what),
+        method::ITEM_IMPORT => round_trip::<ItemImportResult>(result, what),
+        method::ITEM_EXPORT => round_trip::<ItemExportResult>(result, what),
         other => panic!("{what}: no result type for {other}"),
     }
 }
@@ -305,6 +330,19 @@ fn check_reason_codes(error: &RpcError, what: &str) {
                     "{what}"
                 );
             }
+        }
+        Some(ErrorCode::SignInFailed) => {
+            assert!(known(error.reason_code(), SignInFailure::KNOWN), "{what}");
+            // The message is the fixed one for its reason.
+            let reason = error.sign_in_failure().expect("a sign-in reason");
+            assert_eq!(
+                error.message,
+                RpcError::sign_in_failed(&reason).message,
+                "{what}"
+            );
+        }
+        Some(ErrorCode::LocalFileError) => {
+            assert!(known(error.reason_code(), LocalFileReason::KNOWN), "{what}");
         }
         _ => {}
     }
@@ -792,7 +830,7 @@ fn accepts_unknown(field: &str) -> bool {
     });
     let mount = json!({
         "mount_id": "m", "account_id": "a", "drive_id": "d", "mount_point": "/m",
-        "state": "active", "read_only": false
+        "state": "active", "read_only": false, "paused": false
     });
     let account = json!({"account_id": "a", "kind": "personal", "state": "signed-in"});
     let unknown = Value::String(UNKNOWN.into());
@@ -834,6 +872,42 @@ fn accepts_unknown(field: &str) -> bool {
         "refused.data.sync" => error_with(ErrorCode::Refused, json!({"sync": UNKNOWN}))
             .sync()
             .is_some_and(|s| s.as_str() == UNKNOWN),
+        "sign-in-failed.data.reason" => {
+            error_with(ErrorCode::SignInFailed, reason).sign_in_failure()
+                == Some(SignInFailure::Other(UNKNOWN.into()))
+        }
+        "local-file-error.data.reason" => {
+            error_with(ErrorCode::LocalFileError, reason).local_file_reason()
+                == Some(LocalFileReason::Other(UNKNOWN.into()))
+        }
+        "mount.drive_type" => probe::<MountInfo>(mount, "drive_type", unknown),
+        "mount.add.preview.drive_type" => probe::<MountAddPreviewResult>(
+            json!({"confirmation_token": "c1.0.0", "account_id": "a", "drive_id": "d",
+                   "drive_type": "personal", "drive_name": "n", "read_only": false,
+                   "mount_point": "/m"}),
+            "drive_type",
+            unknown,
+        ),
+        "account.login.finish.proposed_mount.drive_type" => probe::<ProposedMount>(
+            json!({"drive_id": "d", "drive_type": "personal", "mount_point": "/m"}),
+            "drive_type",
+            unknown,
+        ),
+        // Request-only sets: the value type keeps an unknown value (the set is open), and the
+        // request that carries it is refused, never defaulted (checked by
+        // `request_only_sets_refuse_unknown_values`).
+        "account.login.start.mode" => {
+            serde_json::from_value::<LoginMode>(unknown).ok()
+                == Some(LoginMode::Other(UNKNOWN.into()))
+        }
+        "mount.add.preview.target" | "mount.add.confirm.target" => {
+            serde_json::from_value::<MountTargetKind>(unknown).ok()
+                == Some(MountTargetKind::Other(UNKNOWN.into()))
+        }
+        "item.import.mode" | "item.export.mode" => {
+            serde_json::from_value::<TransferMode>(unknown).ok()
+                == Some(TransferMode::Other(UNKNOWN.into()))
+        }
         "hello.capabilities" => probe::<HelloResult>(
             json!({"protocol_version": 1, "capabilities": [],
                    "limits": {"max_line_bytes": 1, "max_action_paths": 1,
@@ -979,4 +1053,285 @@ fn value_set_marking_matches_the_types() {
         ["DisplayStatus"],
         "ADR-0020: only the display status is closed"
     );
+}
+
+/// Request-only sets are open (a later daemon may accept more values), but a request with a
+/// value this daemon does not know is refused with `invalid-params`, never given a default.
+#[test]
+fn request_only_sets_refuse_unknown_values() {
+    let cases = [
+        (method::ACCOUNT_LOGIN_START, json!({"mode": UNKNOWN})),
+        (
+            method::MOUNT_ADD_PREVIEW,
+            json!({"account_id": "a", "target": UNKNOWN}),
+        ),
+        (
+            method::MOUNT_ADD_CONFIRM,
+            json!({"account_id": "a", "target": UNKNOWN, "confirmation_token": "c1.0.0"}),
+        ),
+        (
+            method::ITEM_IMPORT,
+            json!({"source": "/a", "destination": "/m/a", "mode": UNKNOWN}),
+        ),
+        (
+            method::ITEM_EXPORT,
+            json!({"source": "/m/a", "destination": "/a", "mode": UNKNOWN}),
+        ),
+    ];
+    for (m, params) in cases {
+        let err = MethodCall::parse(m, Some(&params)).unwrap_err();
+        assert_eq!(err.kind(), Some(ErrorCode::InvalidParams), "{m}");
+    }
+    let text = catalogue_text();
+    for field in [
+        "account.login.start.mode",
+        "mount.add.preview.target",
+        "item.import.mode",
+    ] {
+        let row = text
+            .lines()
+            .find(|l| l.starts_with(&format!("| `{field}` |")))
+            .unwrap_or_else(|| panic!("no value-set row for {field}"));
+        assert!(row.contains("Request only"), "{row}");
+        assert!(row.contains("`invalid-params`"), "{row}");
+    }
+}
+
+/// The methods WP-016 added.
+const NEW_METHODS: &[&str] = &[
+    method::ACCOUNT_LOGIN_START,
+    method::ACCOUNT_LOGIN_FINISH,
+    method::ACCOUNT_LOGOUT,
+    method::MOUNT_ADD_PREVIEW,
+    method::MOUNT_ADD_CONFIRM,
+    method::MOUNT_REMOVE,
+    method::MOUNT_PAUSE,
+    method::MOUNT_RESUME,
+    method::ITEM_IMPORT,
+    method::ITEM_EXPORT,
+];
+
+/// The code names in one table cell: each `` `name` `` in it.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn code_names(cell: &str) -> BTreeSet<String> {
+    cell.split(',')
+        .map(|c| c.trim().trim_matches('`').to_owned())
+        .filter(|c| !c.is_empty() && c != "—")
+        .collect()
+}
+
+/// The "Where each error can appear" table: method to (top-level codes, per-path codes).
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn where_table(
+    text: &str,
+) -> std::collections::BTreeMap<String, (BTreeSet<String>, BTreeSet<String>)> {
+    let section = text
+        .split("\n### Where each error can appear")
+        .nth(1)
+        .and_then(|s| s.split("\n## ").next())
+        .expect("a Where each error can appear section");
+    let mut rows = std::collections::BTreeMap::new();
+    for line in section.lines().filter(|l| l.starts_with("| `")) {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        let name = cells[1].trim_matches('`').to_owned();
+        let row = (code_names(cells[2]), code_names(cells[3]));
+        assert!(
+            rows.insert(name.clone(), row).is_none(),
+            "{name} listed twice"
+        );
+    }
+    rows
+}
+
+/// The codes in a method section's own "Error | When | What the client does" table.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn section_error_codes(text: &str, method_name: &str) -> BTreeSet<String> {
+    let section = text
+        .split(&format!("\n### {method_name}\n"))
+        .nth(1)
+        .and_then(|s| s.split("\n### ").next())
+        .unwrap_or_else(|| panic!("no section for {method_name}"));
+    let mut in_table = false;
+    let mut codes = BTreeSet::new();
+    for line in section.lines() {
+        if line.starts_with("| Error | When | What the client does |") {
+            in_table = true;
+            continue;
+        }
+        if in_table {
+            if !line.starts_with('|') {
+                break;
+            }
+            let cell = line.split('|').nth(1).unwrap_or("").trim();
+            if !cell.starts_with("---") {
+                codes.insert(cell.trim_matches('`').to_owned());
+            }
+        }
+    }
+    codes
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn code_by_name(name: &str) -> ErrorCode {
+    *ErrorCode::ALL
+        .iter()
+        .find(|c| c.name() == name)
+        .unwrap_or_else(|| panic!("{name:?} is not an error code"))
+}
+
+/// WP-016 AC2: every method has a row in the "Where each error can appear" table; every code
+/// a row lists exists and may appear where the error table's "Where" column says; and each
+/// new method's own error table lists exactly the codes of its row, with what a client does
+/// about each.
+#[test]
+fn every_method_says_where_each_error_can_appear() {
+    let text = catalogue_text();
+    let rows = where_table(&text);
+    let methods: BTreeSet<String> = method::ALL.iter().map(|m| (*m).to_owned()).collect();
+    let listed: BTreeSet<String> = rows.keys().cloned().collect();
+    assert_eq!(listed, methods, "the Where table differs from method::ALL");
+    let places = error_table_places(&text);
+    for (name, (top, per_path)) in &rows {
+        for code in top {
+            let place = places.get(&code_by_name(code).code()).map(String::as_str);
+            assert!(
+                matches!(place, Some("top level" | "both")),
+                "{name}: {code} at the top level, but the error table says {place:?}"
+            );
+        }
+        for code in per_path {
+            let place = places.get(&code_by_name(code).code()).map(String::as_str);
+            assert!(
+                matches!(place, Some("per path" | "both")),
+                "{name}: {code} per path, but the error table says {place:?}"
+            );
+        }
+    }
+    for name in NEW_METHODS {
+        let (top, per_path) = &rows[*name];
+        let all: BTreeSet<String> = top.union(per_path).cloned().collect();
+        assert_eq!(
+            section_error_codes(&text, name),
+            all,
+            "{name}: its error table and its Where row differ"
+        );
+    }
+}
+
+/// WP-016 AC2: every new method has a request example, a response example and at least one
+/// error example (an error whose `id` is that of one of its request examples), and each
+/// error example's code is one its Where row lists at the top level.
+#[test]
+fn every_new_method_has_an_error_example() {
+    let text = catalogue_text();
+    let rows = where_table(&text);
+    let mut method_of_id = std::collections::BTreeMap::new();
+    let mut errors_of = std::collections::BTreeMap::<String, Vec<i64>>::new();
+    for example in catalogue() {
+        let message = Message::from_value(example.value.clone()).unwrap();
+        match message {
+            Message::Request(req) => {
+                method_of_id.insert(serde_json::to_string(&req.id).unwrap(), req.method);
+            }
+            Message::Error(resp) => {
+                let Some(id) = resp.id else { continue };
+                let key = serde_json::to_string(&id).unwrap();
+                if let Some(m) = method_of_id.get(&key) {
+                    errors_of
+                        .entry(m.clone())
+                        .or_default()
+                        .push(resp.error.code);
+                }
+            }
+            _ => {}
+        }
+    }
+    for name in NEW_METHODS {
+        let codes = errors_of
+            .get(*name)
+            .unwrap_or_else(|| panic!("{name} has no error example"));
+        let (top, _) = &rows[*name];
+        for code in codes {
+            let code_name = ErrorCode::from_code(*code)
+                .unwrap_or_else(|| panic!("{name}: example code {code} is unknown"))
+                .name();
+            assert!(
+                top.contains(code_name),
+                "{name}: example error {code_name} not in its row"
+            );
+        }
+    }
+}
+
+/// WP-016 AC8 and the lead's points: the catalogue states what a canonical local path is, by
+/// the protocol path rule, and what the protocol says about symbolic links; that durations
+/// and times are whole seconds; and that the authorisation URL carries the challenge and
+/// `state` but never the verifier.
+#[test]
+fn local_paths_times_and_credentials_are_documented() {
+    let text = catalogue_text();
+    let flat = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("**", "");
+    for needle in [
+        "It is spelled by exactly the rule for protocol paths above",
+        "is rejected with `invalid-params`; the daemon never expands `~`",
+        "The rule is lexical, so it cannot see symbolic links.",
+        "The daemon resolves the path on the local filesystem",
+        "reason `inside-mount`",
+        "`item.export` never follows a symbolic link at the last component",
+        "Durations and times are integers in whole seconds",
+        "The only sign-in datum a client receives is the authorisation URL",
+        "carries the PKCE `code_challenge` with method `S256` and the `state`, never the verifier",
+        "never appear in any result, notification or error",
+        "A request is never guessed at.",
+        "Sign-in never creates a mount",
+        "removing a mount never deletes anything on the server",
+        "A mount with unsynced changes is not removed without confirmation",
+        "A token is used up only when the mount has been added.",
+        "it is never read as \"no end\", nor cut to the limit",
+        "A `duration_secs` of 0 or over 604,800 is refused with `invalid-params`, and nothing is paused",
+        "A request naming the mount replaces its pause",
+        "A request for every mount never shortens or ends an existing pause.",
+        "how many mounts are paused when the call returns",
+        "A `dry_run` never refuses",
+        "is not refused over unsynced changes and has no `keep_unsynced`",
+        "A file with changes not yet on the server is never replaced",
+    ] {
+        assert!(flat.contains(needle), "the catalogue must say {needle:?}");
+    }
+}
+
+/// The new error codes and value sets reach the catalogue examples with known reasons:
+/// a `refused` at the top level, a `sign-in-failed`, a `local-file-error` and a
+/// `restart-preview`.
+#[test]
+fn new_reasons_have_examples() {
+    let mut seen = BTreeSet::new();
+    for example in catalogue() {
+        if let Ok(Message::Error(resp)) = Message::from_value(example.value.clone())
+            && let Some(reason) = resp.error.reason_code()
+        {
+            seen.insert((resp.error.code, reason));
+        }
+    }
+    for (code, reason) in [
+        (1011, "state-mismatch"),
+        (1011, "loopback-unavailable"),
+        (1014, "not-found"),
+        (1014, "already-exists"),
+        (1004, "already-mounted"),
+        (1004, "mount-point-not-empty"),
+        (1004, "unsupported-target"),
+        (1004, "not-in-sync"),
+        (1004, "unsynced-changes"),
+        (-32602, "restart-preview"),
+    ] {
+        assert!(
+            seen.contains(&(code, reason.to_owned())),
+            "no top-level example of {code} with reason {reason}"
+        );
+    }
 }

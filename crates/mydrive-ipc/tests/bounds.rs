@@ -12,21 +12,31 @@ use mydrive_core::ids::{AccountId, DriveId, MountId, TenantId};
 use mydrive_core::state::{EffectivePin, Hydration, ItemState, Modifiers, Pin, Sync};
 use mydrive_ipc::codec::{MAX_LINE_BYTES, encode_line};
 use mydrive_ipc::envelope::{ErrorResponse, Id, MAX_ID_BYTES, Notification, SuccessResponse};
-use mydrive_ipc::error::{ErrorCode, RpcError};
+use mydrive_ipc::error::{
+    ErrorCode, MAX_UNSYNCED_SAMPLE_BYTES, MAX_UNSYNCED_SAMPLE_PATHS, RpcError,
+};
 use mydrive_ipc::methods::{
-    AccountInfo, ActionOutcome, DaemonStatusResult, HelloParams, ItemInfo, ItemPathsParams,
-    ItemStatusEntry, ItemStatusParams, ItemStatusTarget, ListParams, MAX_ACTION_PATH_BYTES,
-    MAX_ACTION_PATHS, MAX_STATUS_PATH_BYTES, MAX_STATUS_PATHS, MethodCall, MountInfo,
-    SUPPORTED_VERSIONS, Session, SkippedItem, StatusSubscribeParams, StatusSubscribeResult,
-    encoded_path_bytes, method,
+    AccountInfo, ActionOutcome, AttemptId, AuthorizationUrl, ConfirmationToken, DaemonStatusResult,
+    HelloParams, ItemExportParams, ItemExportResult, ItemImportParams, ItemImportResult, ItemInfo,
+    ItemPathsParams, ItemStatusEntry, ItemStatusParams, ItemStatusTarget, ListParams, LocalPath,
+    LoginFinishParams, LoginFinishResult, LoginStartParams, LoginStartResult, LogoutParams,
+    LogoutResult, MAX_ACTION_PATH_BYTES, MAX_ACTION_PATHS, MAX_ATTEMPT_ID_BYTES,
+    MAX_AUTHORIZATION_URL_BYTES, MAX_PASTED_URL_BYTES, MAX_PAUSE_SECS, MAX_SHARING_LINK_BYTES,
+    MAX_STATUS_PATH_BYTES, MAX_STATUS_PATHS, MethodCall, MountAddConfirmParams,
+    MountAddConfirmResult, MountAddPreviewParams, MountAddPreviewResult, MountInfo,
+    MountPauseParams, MountPauseResult, MountRemoveParams, MountRemoveResult, MountResumeParams,
+    MountResumeResult, MountSource, MountTarget, PastedRedirect, PauseEnd, ProposedMount,
+    SUPPORTED_VERSIONS, Session, SharingLink, SkippedItem, StatusSubscribeParams,
+    StatusSubscribeResult, encoded_path_bytes, method,
 };
 use mydrive_ipc::paging::{
-    ActionReport, KeysetSource, account_page, action_result, batch_page, directory_page,
-    mount_page, status_changed_notifications,
+    ActionReport, ConfirmationLedger, KeysetSource, account_page, action_result, batch_page,
+    directory_page, fit_result, mount_page, status_changed_notifications,
 };
 use mydrive_ipc::path::{MAX_PATH_BYTES, ProtocolPath};
 use mydrive_ipc::values::{
-    AccountKind, AccountState, BlockedReason, ItemReason, MountState, RefusalReason,
+    AccountKind, AccountState, BlockedReason, DriveType, ItemReason, LocalFileReason, LoginMode,
+    MountState, RefusalReason, SignInFailure, TransferMode,
 };
 use serde::Serialize;
 
@@ -169,6 +179,8 @@ fn worst_account_list() {
             kind: AccountKind::Other("\"".repeat(200)),
             tenant_id: Some(TenantId::new("\u{1}".repeat(200)).unwrap()),
             state: AccountState::Other("\"".repeat(200)),
+            user_name: Some("\u{1}".repeat(2_000)),
+            display_name: Some("\u{1}".repeat(2_000)),
         })
         .collect();
     let mut source = VecSource {
@@ -199,6 +211,9 @@ fn worst_mount_list() {
             blocked_reason: Some(BlockedReason::Other("\"".repeat(200))),
             blocked_message: Some("\u{1}".repeat(100_000)),
             read_only: true,
+            drive_type: Some(DriveType::Other("\"".repeat(200))),
+            item_count: Some(u64::MAX),
+            pause: Some(PauseEnd::At(u64::MAX)),
         })
         .collect();
     let mut source = VecSource {
@@ -372,6 +387,325 @@ fn worst_status_changed() {
     }
 }
 
+/// A request that must parse, encoded with the longest ID, must fit.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn assert_request_fits(call: &MethodCall, what: &str) {
+    let req = call.to_request(worst_id()).unwrap();
+    assert_fits(&req, &format!("{what} request"));
+    assert_eq!(&MethodCall::from_request(&req).unwrap(), call, "{what}");
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn assert_result_fits(result: &impl Serialize, what: &str) {
+    assert_fits(
+        &SuccessResponse::new(worst_id(), result).unwrap(),
+        &format!("{what} result"),
+    );
+}
+
+/// An identifier far longer than Graph ever sends, of characters JSON escapes six-fold.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn long_id() -> String {
+    "\u{1}".repeat(4_000)
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_account() -> AccountInfo {
+    AccountInfo {
+        account_id: AccountId::new(long_id()).unwrap(),
+        kind: AccountKind::Other("\"".repeat(200)),
+        tenant_id: Some(TenantId::new(long_id()).unwrap()),
+        state: AccountState::Other("\"".repeat(200)),
+        user_name: Some("\u{1}".repeat(50_000)),
+        display_name: Some("\u{1}".repeat(50_000)),
+    }
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_mount_info() -> MountInfo {
+    MountInfo {
+        mount_id: MountId::new("m".repeat(64)).unwrap(),
+        account_id: AccountId::new(long_id()).unwrap(),
+        drive_id: DriveId::new("\"".repeat(4_000)).unwrap(),
+        mount_point: long_path("mp", '"'),
+        state: MountState::Other("\"".repeat(200)),
+        blocked_reason: Some(BlockedReason::Other("\"".repeat(200))),
+        blocked_message: Some("\u{1}".repeat(100_000)),
+        read_only: true,
+        drive_type: Some(DriveType::Other("\"".repeat(200))),
+        item_count: Some(u64::MAX),
+        pause: Some(PauseEnd::At(u64::MAX)),
+    }
+}
+
+/// Every error a sign-in can produce fits, for every reason.
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn sign_in_errors_fit() {
+    for reason in SignInFailure::KNOWN
+        .iter()
+        .map(|r| SignInFailure::from_wire(r))
+        .chain([SignInFailure::Other("\"".repeat(10_000))])
+    {
+        let err = RpcError::sign_in_failed(&reason);
+        assert_fits(&ErrorResponse::new(Some(worst_id()), err), "sign-in error");
+    }
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_login_start() {
+    assert_request_fits(
+        &MethodCall::AccountLoginStart(LoginStartParams {
+            mode: LoginMode::Headless,
+        }),
+        method::ACCOUNT_LOGIN_START,
+    );
+    // The longest URL the type admits.
+    let head = "https://login.example/authorize?code_challenge_method=S256&\
+                code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&state=";
+    let url = format!(
+        "{head}{}",
+        "s".repeat(MAX_AUTHORIZATION_URL_BYTES - head.len())
+    );
+    let result = LoginStartResult {
+        attempt_id: AttemptId::new("a".repeat(MAX_ATTEMPT_ID_BYTES)).unwrap(),
+        authorization_url: AuthorizationUrl::new(url).unwrap(),
+    };
+    assert_result_fits(&result, method::ACCOUNT_LOGIN_START);
+    sign_in_errors_fit();
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_login_finish() {
+    // The longest pasted address, of a character JSON escapes.
+    assert_request_fits(
+        &MethodCall::AccountLoginFinish(LoginFinishParams {
+            attempt_id: AttemptId::new("a".repeat(MAX_ATTEMPT_ID_BYTES)).unwrap(),
+            redirect_url: Some(PastedRedirect::new("\"".repeat(MAX_PASTED_URL_BYTES)).unwrap()),
+        }),
+        method::ACCOUNT_LOGIN_FINISH,
+    );
+    let result = LoginFinishResult {
+        account: worst_account(),
+        proposed_mount: Some(ProposedMount {
+            drive_id: DriveId::new("\"".repeat(4_000)).unwrap(),
+            drive_type: DriveType::Other("\"".repeat(200)),
+            mount_point: long_path("pm", '"'),
+        }),
+    };
+    let result = fit_result(&worst_id(), result).unwrap();
+    assert_result_fits(&result, method::ACCOUNT_LOGIN_FINISH);
+    // An identifier too long for any line is refused with an error that fits.
+    let mut huge = result;
+    huge.account.account_id = AccountId::new("\"".repeat(MAX_LINE_BYTES)).unwrap();
+    let err = fit_result(&worst_id(), huge).unwrap_err();
+    assert_fits(
+        &ErrorResponse::new(Some(worst_id()), err),
+        "oversize result error",
+    );
+    sign_in_errors_fit();
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_logout() {
+    assert_request_fits(
+        &MethodCall::AccountLogout(LogoutParams {
+            account_id: AccountId::new(long_id()).unwrap(),
+            dry_run: true,
+        }),
+        method::ACCOUNT_LOGOUT,
+    );
+    let result = LogoutResult {
+        account_id: AccountId::new(long_id()).unwrap(),
+        signed_out: true,
+        unsynced_files: u64::MAX,
+    };
+    assert_result_fits(&result, method::ACCOUNT_LOGOUT);
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_link() -> SharingLink {
+    let head = "https://";
+    SharingLink::new(format!(
+        "{head}{}",
+        "\"".repeat(MAX_SHARING_LINK_BYTES - head.len())
+    ))
+    .unwrap()
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_target() -> MountTarget {
+    MountTarget {
+        account_id: AccountId::new(long_id()).unwrap(),
+        source: MountSource::SharingLink(worst_link()),
+    }
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_mount_add_preview() {
+    assert_request_fits(
+        &MethodCall::MountAddPreview(MountAddPreviewParams {
+            target: worst_target(),
+        }),
+        method::MOUNT_ADD_PREVIEW,
+    );
+    let mut ledger = ConfirmationLedger::new();
+    let token = ledger.issue(&worst_target(), (), 0).unwrap();
+    let result = MountAddPreviewResult {
+        confirmation_token: token,
+        account_id: AccountId::new(long_id()).unwrap(),
+        drive_id: DriveId::new("\"".repeat(4_000)).unwrap(),
+        drive_type: DriveType::Other("\"".repeat(200)),
+        drive_name: "\u{1}".repeat(100_000),
+        site_name: Some("\u{1}".repeat(100_000)),
+        item_count: Some(u64::MAX),
+        read_only: true,
+        mount_point: long_path("pv", '"'),
+    };
+    let result = fit_result(&worst_id(), result).unwrap();
+    assert_result_fits(&result, method::MOUNT_ADD_PREVIEW);
+    let err = RpcError::already_mounted(
+        &MountId::new("m".repeat(64)).unwrap(),
+        "\u{1}".repeat(9_000),
+    );
+    assert_fits(
+        &ErrorResponse::new(Some(worst_id()), err),
+        "already-mounted",
+    );
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_mount_add_confirm() {
+    let mut ledger = ConfirmationLedger::new();
+    let token = ledger.issue(&worst_target(), (), 0).unwrap();
+    assert_request_fits(
+        &MethodCall::MountAddConfirm(MountAddConfirmParams {
+            target: worst_target(),
+            confirmation_token: token.clone(),
+            mount_point: Some(long_path("mp", '"')),
+        }),
+        method::MOUNT_ADD_CONFIRM,
+    );
+    let result = MountAddConfirmResult {
+        mount: worst_mount_info(),
+    };
+    let result = fit_result(&worst_id(), result).unwrap();
+    assert_result_fits(&result, method::MOUNT_ADD_CONFIRM);
+    let claim = ledger.claim(&token, &worst_target(), 1).unwrap();
+    let _ = ledger.consume(claim, worst_mount_info());
+    let err = ledger.claim(&token, &worst_target(), 1).unwrap_err();
+    assert_fits(
+        &ErrorResponse::new(Some(worst_id()), err),
+        "restart-preview",
+    );
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_mount_remove() {
+    assert_request_fits(
+        &MethodCall::MountRemove(MountRemoveParams {
+            mount_id: MountId::new("m".repeat(64)).unwrap(),
+            dry_run: true,
+            keep_unsynced: true,
+        }),
+        method::MOUNT_REMOVE,
+    );
+    let result = MountRemoveResult {
+        mount_id: MountId::new("m".repeat(64)).unwrap(),
+        removed: true,
+        mount_point: long_path("rm", '"'),
+        kept_files: u64::MAX,
+        unsynced_files: u64::MAX,
+    };
+    assert_result_fits(&result, method::MOUNT_REMOVE);
+    // The refusal over unsynced changes, offered far more and far longer paths than it may
+    // name, of a character JSON escapes six-fold: the sample is cut to its bounds and fits.
+    let sample: Vec<ProtocolPath> = (0..10_000)
+        .map(|i| long_path(&format!("u{i}"), '\u{1}'))
+        .collect();
+    let err = RpcError::unsynced_changes(&MountId::new("m".repeat(64)).unwrap(), u64::MAX, sample);
+    let named = err.unsynced_paths().unwrap();
+    assert!(!named.is_empty() && named.len() <= MAX_UNSYNCED_SAMPLE_PATHS);
+    assert!(encoded_path_bytes(&named) <= MAX_UNSYNCED_SAMPLE_BYTES);
+    assert_eq!(err.unsynced_files(), Some(u64::MAX));
+    assert_fits(
+        &ErrorResponse::new(Some(worst_id()), err),
+        "unsynced-changes",
+    );
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_mount_pause_resume() {
+    assert_request_fits(
+        &MethodCall::MountPause(MountPauseParams {
+            mount_id: Some(MountId::new("m".repeat(64)).unwrap()),
+            duration_secs: Some(MAX_PAUSE_SECS),
+        }),
+        method::MOUNT_PAUSE,
+    );
+    assert_request_fits(
+        &MethodCall::MountResume(MountResumeParams {
+            mount_id: Some(MountId::new("m".repeat(64)).unwrap()),
+        }),
+        method::MOUNT_RESUME,
+    );
+    assert_result_fits(
+        &MountPauseResult {
+            paused_mounts: u64::MAX,
+            paused_until: Some(u64::MAX),
+        },
+        method::MOUNT_PAUSE,
+    );
+    assert_result_fits(
+        &MountResumeResult {
+            resumed_mounts: u64::MAX,
+        },
+        method::MOUNT_RESUME,
+    );
+}
+
+#[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
+fn worst_import_export() {
+    let local = LocalPath::new(long_path("local", '"').as_str()).unwrap();
+    assert_request_fits(
+        &MethodCall::ItemImport(ItemImportParams {
+            source: local.clone(),
+            destination: long_path("dest", '"'),
+            mode: TransferMode::Replace,
+        }),
+        method::ITEM_IMPORT,
+    );
+    assert_request_fits(
+        &MethodCall::ItemExport(ItemExportParams {
+            source: long_path("src", '"'),
+            destination: local.clone(),
+            mode: TransferMode::Replace,
+        }),
+        method::ITEM_EXPORT,
+    );
+    assert_result_fits(
+        &ItemImportResult {
+            path: long_path("dest", '"'),
+            item: worst_item(),
+            bytes_copied: u64::MAX,
+        },
+        method::ITEM_IMPORT,
+    );
+    assert_result_fits(
+        &ItemExportResult {
+            path: long_path("src", '"'),
+            destination: local,
+            bytes_copied: u64::MAX,
+        },
+        method::ITEM_EXPORT,
+    );
+    let mut err = RpcError::local_file_error(&LocalFileReason::IoError, "x");
+    err.message = "\u{1}".repeat(50_000);
+    assert_fits(
+        &ErrorResponse::new(Some(worst_id()), err),
+        "local-file-error",
+    );
+}
+
 /// The name of a request variant. The match has no wildcard, so adding a variant to
 /// `MethodCall` does not compile until it is named here and given a sample below.
 #[cfg(test)] // helpers count as test code for clippy's allow-unwrap-in-tests
@@ -387,6 +721,16 @@ fn variant_name(call: &MethodCall) -> &'static str {
         MethodCall::ItemHydrate(_) => "ItemHydrate",
         MethodCall::ItemDehydrate(_) => "ItemDehydrate",
         MethodCall::StatusSubscribe(_) => "StatusSubscribe",
+        MethodCall::AccountLoginStart(_) => "AccountLoginStart",
+        MethodCall::AccountLoginFinish(_) => "AccountLoginFinish",
+        MethodCall::AccountLogout(_) => "AccountLogout",
+        MethodCall::MountAddPreview(_) => "MountAddPreview",
+        MethodCall::MountAddConfirm(_) => "MountAddConfirm",
+        MethodCall::MountRemove(_) => "MountRemove",
+        MethodCall::MountPause(_) => "MountPause",
+        MethodCall::MountResume(_) => "MountResume",
+        MethodCall::ItemImport(_) => "ItemImport",
+        MethodCall::ItemExport(_) => "ItemExport",
     }
 }
 
@@ -413,6 +757,48 @@ fn one_call_per_variant() -> Vec<MethodCall> {
         MethodCall::ItemHydrate(paths()),
         MethodCall::ItemDehydrate(paths()),
         MethodCall::StatusSubscribe(StatusSubscribeParams::default()),
+        MethodCall::AccountLoginStart(LoginStartParams {
+            mode: LoginMode::Browser,
+        }),
+        MethodCall::AccountLoginFinish(LoginFinishParams {
+            attempt_id: AttemptId::new("a").unwrap(),
+            redirect_url: None,
+        }),
+        MethodCall::AccountLogout(LogoutParams {
+            account_id: AccountId::new("a").unwrap(),
+            dry_run: false,
+        }),
+        MethodCall::MountAddPreview(MountAddPreviewParams {
+            target: MountTarget {
+                account_id: AccountId::new("a").unwrap(),
+                source: MountSource::OwnDrive,
+            },
+        }),
+        MethodCall::MountAddConfirm(MountAddConfirmParams {
+            target: MountTarget {
+                account_id: AccountId::new("a").unwrap(),
+                source: MountSource::OwnDrive,
+            },
+            confirmation_token: ConfirmationToken::new("c1.0.0").unwrap(),
+            mount_point: None,
+        }),
+        MethodCall::MountRemove(MountRemoveParams {
+            mount_id: MountId::new("m").unwrap(),
+            dry_run: false,
+            keep_unsynced: false,
+        }),
+        MethodCall::MountPause(MountPauseParams::default()),
+        MethodCall::MountResume(MountResumeParams::default()),
+        MethodCall::ItemImport(ItemImportParams {
+            source: LocalPath::new("/a").unwrap(),
+            destination: ProtocolPath::new("/m/a").unwrap(),
+            mode: TransferMode::Create,
+        }),
+        MethodCall::ItemExport(ItemExportParams {
+            source: ProtocolPath::new("/m/a").unwrap(),
+            destination: LocalPath::new("/a").unwrap(),
+            mode: TransferMode::Replace,
+        }),
     ]
 }
 
@@ -483,6 +869,14 @@ fn every_method_and_notification_is_bounded() {
                 worst_action(name);
             }
             method::STATUS_SUBSCRIBE => worst_subscribe(),
+            method::ACCOUNT_LOGIN_START => worst_login_start(),
+            method::ACCOUNT_LOGIN_FINISH => worst_login_finish(),
+            method::ACCOUNT_LOGOUT => worst_logout(),
+            method::MOUNT_ADD_PREVIEW => worst_mount_add_preview(),
+            method::MOUNT_ADD_CONFIRM => worst_mount_add_confirm(),
+            method::MOUNT_REMOVE => worst_mount_remove(),
+            method::MOUNT_PAUSE | method::MOUNT_RESUME => worst_mount_pause_resume(),
+            method::ITEM_IMPORT | method::ITEM_EXPORT => worst_import_export(),
             method::STATUS_CHANGED => worst_status_changed(),
             other => panic!("{other} has no worst-case bound; add one before adding the method"),
         }
